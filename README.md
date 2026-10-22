@@ -20,7 +20,7 @@ no seu computador. O nome é uma brincadeira com *Notion*: **não** vira **sim**
 - **Colar Markdown** de qualquer lugar: um documento inteiro vira títulos, listas,
   tarefas, citações, código e divisores. Também dá para importar arquivos `.md`
   arrastando para a janela.
-- **Menu `/`** com busca por comandos (aceita `h1`, `todo`, `tabela`…), navegação por
+- **Menu `/`** com busca por comandos (aceita `h1`, `todo`, `código`…), navegação por
   teclado e prévia da sintaxe.
 - **Menu de bloco**: transformar, duplicar, copiar, mover e excluir, pelo botão `⋮⋮`
   que aparece na margem esquerda. O botão `+` insere um bloco logo abaixo.
@@ -163,8 +163,8 @@ e busca sem acentos.
 O binário de release também foi aberto com o **MCP do REA** (ferramenta de engenharia
 reversa), que o identificou como `format=elf`, `kind=executable`, `architecture=x86_64`
 e registrou o SHA-256 do artefato. O provedor Ghidra ficou disponível na sessão para
-análise mais profunda; a checagem de runtime usada aqui foi a de que o processo não
-abre conexões de rede.
+análise mais profunda. O código não inclui cliente HTTP/TLS: links externos são
+abertos pelo navegador do sistema.
 
 ## Limitações conhecidas
 
