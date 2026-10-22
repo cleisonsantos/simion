@@ -535,60 +535,66 @@ impl App {
                     .size(12.0)
                     .color(p.muted),
             );
-            ui.add_space(10.0);
-            shortcut_group(
-                ui,
-                "Essencial",
-                &[
-                    ("Ctrl K", "Buscar em todas as páginas"),
-                    ("Ctrl N", "Nova subpágina"),
-                    ("Ctrl S", "Salvar agora"),
-                    ("Ctrl \\", "Mostrar ou ocultar a barra lateral"),
-                    ("Ctrl /", "Esta lista de atalhos"),
-                ],
-                &p,
-            );
-            ui.add_space(8.0);
-            shortcut_group(
-                ui,
-                "Edição",
-                &[
-                    ("Ctrl Z", "Desfazer"),
-                    ("Ctrl ⇧ Z", "Refazer"),
-                    ("Ctrl B", "Negrito"),
-                    ("Ctrl I", "Itálico"),
-                    ("Ctrl E", "Código inline"),
-                    ("Ctrl ⇧ S", "Riscado"),
-                    ("Ctrl ⇧ K", "Inserir link"),
-                ],
-                &p,
-            );
-            ui.add_space(8.0);
-            shortcut_group(
-                ui,
-                "Blocos",
-                &[
-                    ("/", "Menu de comandos"),
-                    ("Tab", "Aumentar recuo"),
-                    ("Shift Tab", "Diminuir recuo"),
-                    ("Alt ↑ ↓", "Mover bloco"),
-                    ("Ctrl Alt 1-3", "Transformar em título"),
-                    ("Ctrl Alt 0", "Voltar a texto"),
-                ],
-                &p,
-            );
-            ui.add_space(8.0);
-            shortcut_group(
-                ui,
-                "Navegação",
-                &[
-                    ("↑ ↓", "Mover entre blocos"),
-                    ("Ctrl ⇧ M", "Ver Markdown da página"),
-                    ("Ctrl + -", "Zoom"),
-                    ("Ctrl 0", "Zoom padrão"),
-                ],
-                &p,
-            );
+            ui.add_space(6.0);
+            ScrollArea::vertical()
+                .max_height((ctx.content_rect().height() * 0.6).clamp(220.0, 520.0))
+                .auto_shrink([false, true])
+                .id_salt("simion-shortcuts-scroll")
+                .show(ui, |ui| {
+                    shortcut_group(
+                        ui,
+                        "Essencial",
+                        &[
+                            ("Ctrl K", "Buscar em todas as páginas"),
+                            ("Ctrl N", "Nova subpágina"),
+                            ("Ctrl S", "Salvar agora"),
+                            ("Ctrl \\", "Mostrar ou ocultar a barra lateral"),
+                            ("Ctrl /", "Esta lista de atalhos"),
+                        ],
+                        &p,
+                    );
+                    ui.add_space(8.0);
+                    shortcut_group(
+                        ui,
+                        "Edição",
+                        &[
+                            ("Ctrl Z", "Desfazer"),
+                            ("Ctrl ⇧ Z", "Refazer"),
+                            ("Ctrl B", "Negrito"),
+                            ("Ctrl I", "Itálico"),
+                            ("Ctrl E", "Código inline"),
+                            ("Ctrl ⇧ S", "Riscado"),
+                            ("Ctrl ⇧ K", "Inserir link"),
+                        ],
+                        &p,
+                    );
+                    ui.add_space(8.0);
+                    shortcut_group(
+                        ui,
+                        "Blocos",
+                        &[
+                            ("/", "Menu de comandos"),
+                            ("Tab", "Aumentar recuo"),
+                            ("Shift Tab", "Diminuir recuo"),
+                            ("Alt ↑ ↓", "Mover bloco"),
+                            ("Ctrl Alt 1-3", "Transformar em título"),
+                            ("Ctrl Alt 0", "Voltar a texto"),
+                        ],
+                        &p,
+                    );
+                    ui.add_space(8.0);
+                    shortcut_group(
+                        ui,
+                        "Navegação",
+                        &[
+                            ("↑ ↓", "Mover entre blocos"),
+                            ("Ctrl ⇧ M", "Ver Markdown da página"),
+                            ("Ctrl + -", "Zoom"),
+                            ("Ctrl 0", "Zoom padrão"),
+                        ],
+                        &p,
+                    );
+                });
             ui.add_space(12.0);
             ui.horizontal(|ui| {
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
