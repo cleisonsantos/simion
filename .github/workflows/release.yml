@@ -1,0 +1,204 @@
+name: Build & Release
+
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  linux:
+    name: Linux (deb, rpm, AppImage, tar.xz)
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: System dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            build-essential pkg-config \
+            libxkbcommon-dev libwayland-dev libx11-dev libxi-dev \
+            libxrandr-dev libxcursor-dev libxinerama-dev libgl1-mesa-dev
+
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build
+        run: cargo build --release --locked
+
+      - name: Version
+        id: version
+        shell: bash
+        run: |
+          if [[ "${GITHUB_REF}" == refs/tags/* ]]; then
+            VERSION="${GITHUB_REF_NAME#v}"
+          else
+            VERSION="$(grep -m1 '^version = ' Cargo.toml | cut -d'"' -f2)"
+          fi
+          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+
+      - name: Build deb and rpm
+        shell: bash
+        run: |
+          curl -fsSL -o /tmp/nfpm.tar.gz \
+            https://github.com/goreleaser/nfpm/releases/download/v2.48.0/nfpm_2.48.0_Linux_x86_64.tar.gz
+          tar -xzf /tmp/nfpm.tar.gz -C /tmp nfpm
+          chmod +x /tmp/nfpm
+          mkdir -p dist
+          VERSION="${{ steps.version.outputs.version }}"
+          for pair in "deb amd64" "rpm x86_64"; do
+            set -- $pair
+            sed -e "s|\${VERSION}|${VERSION}|g" -e "s|\${ARCH}|$2|g" \
+              packaging/nfpm.yaml > "/tmp/nfpm-$1.yaml"
+            /tmp/nfpm package -f "/tmp/nfpm-$1.yaml" -p "$1" -t dist
+          done
+
+      - name: AppImage
+        shell: bash
+        run: |
+          curl -fsSL -o /tmp/appimagetool \
+            https://github.com/AppImage/appimagetool/releases/download/continuous/appimagetool-x86_64.AppImage
+          chmod +x /tmp/appimagetool
+          PATH="/tmp:${PATH}" APPIMAGE_EXTRACT_AND_RUN=1 \
+            bash packaging/make-appimage.sh "${{ steps.version.outputs.version }}"
+
+      - name: Tarball
+        shell: bash
+        run: bash packaging/make-tarball.sh "${{ steps.version.outputs.version }}"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: linux
+          path: dist/*
+          if-no-files-found: error
+
+  windows:
+    name: Windows (MSI, zip)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build
+        run: cargo build --release --locked
+
+      - name: Version
+        id: version
+        shell: bash
+        run: |
+          if [[ "${GITHUB_REF}" == refs/tags/* ]]; then
+            VERSION="${GITHUB_REF_NAME#v}"
+          else
+            VERSION="$(grep -m1 '^version = ' Cargo.toml | cut -d'"' -f2)"
+          fi
+          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+
+      - name: Install WiX and cargo-wix
+        shell: pwsh
+        run: |
+          choco install wixtoolset --no-progress -y
+          $wix = Get-ChildItem "${env:ProgramFiles(x86)}\WiX Toolset*" -Directory -ErrorAction SilentlyContinue |
+            Select-Object -First 1
+          if (-not $wix) {
+            $wix = Get-ChildItem "$env:ProgramFiles\WiX Toolset*" -Directory -ErrorAction SilentlyContinue |
+              Select-Object -First 1
+          }
+          if ($wix) {
+            "$($wix.FullName)\bin" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+          } else {
+            Write-Error "WiX Toolset não encontrado"
+            exit 1
+          }
+          cargo install cargo-wix --locked
+
+      - name: Build MSI and zip
+        shell: pwsh
+        run: |
+          cargo wix init --force
+          cargo wix --no-build --nocapture
+          New-Item -ItemType Directory -Force -Path dist | Out-Null
+          $msi = Get-ChildItem target\wix\*.msi |
+            Sort-Object LastWriteTime -Descending |
+            Select-Object -First 1
+          if (-not $msi) { Write-Error "MSI não encontrado"; exit 1 }
+          Copy-Item $msi.FullName "dist\Simion-${{ steps.version.outputs.version }}-x64.msi"
+          Compress-Archive -Force `
+            -Path target\release\simion.exe, README.md, LICENSE, assets\branding\simion.ico `
+            -DestinationPath "dist\simion_${{ steps.version.outputs.version }}_windows_x64.zip"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: windows
+          path: dist/*
+          if-no-files-found: error
+
+  macos:
+    name: macOS (DMG universal)
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-darwin,x86_64-apple-darwin
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build universal
+        run: |
+          cargo build --release --locked --target aarch64-apple-darwin
+          cargo build --release --locked --target x86_64-apple-darwin
+          mkdir -p build
+          lipo -create \
+            -output build/Simion \
+            target/aarch64-apple-darwin/release/simion \
+            target/x86_64-apple-darwin/release/simion
+          file build/Simion
+
+      - name: Version
+        id: version
+        shell: bash
+        run: |
+          if [[ "${GITHUB_REF}" == refs/tags/* ]]; then
+            VERSION="${GITHUB_REF_NAME#v}"
+          else
+            VERSION="$(grep -m1 '^version = ' Cargo.toml | cut -d'"' -f2)"
+          fi
+          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+
+      - name: DMG and app zip
+        run: bash packaging/macos/make-dmg.sh "${{ steps.version.outputs.version }}"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: macos
+          path: dist/*
+          if-no-files-found: error
+
+  release:
+    name: GitHub Release
+    if: startsWith(github.ref, 'refs/tags/')
+    needs: [linux, windows, macos]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Publish release
+        uses: softprops/action-gh-release@v2
+        with:
+          name: Simion ${{ github.ref_name }}
+          files: dist/*
+          generate_release_notes: true
+          draft: false
+          prerelease: false

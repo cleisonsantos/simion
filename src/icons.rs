@@ -1,8 +1,6 @@
 //! Hand-drawn vector icons (crisp at any scale, no icon-font needed).
 
-use eframe::egui::{Align2, Color32, FontId, Painter, Pos2, Rect, Shape, Stroke, StrokeKind, vec2};
-
-use crate::theme::{FONT_SEMIBOLD, family};
+use eframe::egui::{Color32, Painter, Pos2, Rect, Shape, Stroke, StrokeKind, vec2};
 
 fn geometry(rect: Rect) -> (Pos2, f32) {
     let s = rect.width().min(rect.height());
@@ -248,15 +246,70 @@ pub fn keyboard(p: &Painter, rect: Rect, color: Color32, w: f32) {
 }
 
 /// The Simion mark: a rounded square with a white S.
-pub fn logo(p: &Painter, rect: Rect, accent: Color32) {
+pub const BRAND: Color32 = Color32::from_rgb(0x0F, 0x83, 0x6B);
+pub const BRAND_CREAM: Color32 = Color32::from_rgb(0xF8, 0xF5, 0xEA);
+pub const BRAND_MINT: Color32 = Color32::from_rgb(0xA7, 0xF3, 0xD0);
+
+/// The Simion mark: a jade rounded square with a cream S and a mint note dot.
+pub fn logo(p: &Painter, rect: Rect) {
     let (c, s) = geometry(rect);
     let r = Rect::from_center_size(c, vec2(s * 0.94, s * 0.94));
-    p.rect_filled(r, (s * 0.26).round() as u8, accent);
-    p.text(
-        c + vec2(0.0, s * 0.015),
-        Align2::CENTER_CENTER,
-        "S",
-        FontId::new(s * 0.62, family(FONT_SEMIBOLD)),
-        Color32::from_rgb(0xFB, 0xFB, 0xFF),
+    p.rect_filled(r, (s * 0.26).round() as u8, BRAND);
+
+    // A quiet top highlight, like the sheen on the app icon.
+    let sheen = Rect::from_min_size(
+        r.min + vec2(0.0, r.height() * 0.04),
+        vec2(r.width(), r.height() * 0.42),
     );
+    p.rect_filled(
+        sheen,
+        (s * 0.22).round() as u8,
+        Color32::from_white_alpha(10),
+    );
+
+    let path = s_path(r);
+    let stroke = (r.width() * 0.104).max(1.4);
+    p.add(Shape::line(path.clone(), Stroke::new(stroke, BRAND_CREAM)));
+    if let (Some(first), Some(last)) = (path.first(), path.last()) {
+        p.circle_filled(*first, stroke / 2.0, BRAND_CREAM);
+        p.circle_filled(*last, stroke / 2.0, BRAND_CREAM);
+    }
+    p.circle_filled(
+        r.min + vec2(r.width() * 0.78, r.height() * 0.78),
+        r.width() * 0.044,
+        BRAND_MINT,
+    );
+}
+
+fn s_path(rect: Rect) -> Vec<Pos2> {
+    let at = |x: f32, y: f32| rect.min + vec2(x, y) * rect.width();
+    let mut points = Vec::with_capacity(50);
+    cubic(
+        at(0.70, 0.30),
+        at(0.40, 0.18),
+        at(0.28, 0.34),
+        at(0.48, 0.47),
+        &mut points,
+    );
+    cubic(
+        at(0.48, 0.47),
+        at(0.68, 0.58),
+        at(0.63, 0.78),
+        at(0.30, 0.72),
+        &mut points,
+    );
+    points
+}
+
+fn cubic(p0: Pos2, p1: Pos2, p2: Pos2, p3: Pos2, out: &mut Vec<Pos2>) {
+    const STEPS: usize = 18;
+    for i in 0..=STEPS {
+        let t = i as f32 / STEPS as f32;
+        let u = 1.0 - t;
+        let point = p0.to_vec2() * (u * u * u)
+            + p1.to_vec2() * (3.0 * u * u * t)
+            + p2.to_vec2() * (3.0 * u * t * t)
+            + p3.to_vec2() * (t * t * t);
+        out.push(point.to_pos2());
+    }
 }

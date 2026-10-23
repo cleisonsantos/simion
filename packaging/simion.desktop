@@ -1,0 +1,12 @@
+[Desktop Entry]
+Type=Application
+Name=Simion
+GenericName=Notes
+Comment=Local, lightweight block-based notes
+Comment[pt_BR]=Anotações locais, leves e em blocos
+Exec=simion
+Icon=simion
+Terminal=false
+Categories=Office;Utility;
+Keywords=notes;notion;markdown;local;sqlite;blocks;
+StartupWMClass=simion

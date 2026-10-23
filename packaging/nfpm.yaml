@@ -1,0 +1,41 @@
+name: simion
+arch: ${ARCH}
+platform: linux
+version: ${VERSION}
+section: utils
+priority: optional
+maintainer: Cleison Santos <cleisonsantos@users.noreply.github.com>
+description: |
+  Simion é um caderno de blocos local, leve e bonito, inspirado no Notion.
+  Editor de blocos com Markdown, tarefas, citações, código, busca local,
+  hierarquia de páginas e armazenamento SQLite — tudo offline.
+vendor: Simion
+homepage: https://github.com/cleisonsantos/simion
+license: MIT
+overrides:
+  deb:
+    depends:
+      - libc6
+      - libgl1
+      - libx11-6
+      - libxkbcommon0
+      - libwayland-client0
+      - libxrandr2
+      - libxi6
+      - libxcursor1
+      - libxinerama1
+contents:
+  - src: target/release/simion
+    dst: /usr/bin/simion
+  - src: packaging/simion.desktop
+    dst: /usr/share/applications/simion.desktop
+  - src: assets/branding/simion-512.png
+    dst: /usr/share/icons/hicolor/512x512/apps/simion.png
+  - src: assets/branding/simion-128.png
+    dst: /usr/share/icons/hicolor/128x128/apps/simion.png
+  - src: assets/branding/simion-64.png
+    dst: /usr/share/icons/hicolor/64x64/apps/simion.png
+  - src: README.md
+    dst: /usr/share/doc/simion/README.md
+  - src: LICENSE
+    dst: /usr/share/doc/simion/LICENSE

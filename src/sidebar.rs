@@ -31,11 +31,17 @@ impl App {
 
         // Header.
         ui.horizontal(|ui| {
-            ui.spacing_mut().item_spacing.x = 8.0;
+            ui.spacing_mut().item_spacing.x = 0.0;
             let (rect, _) = ui.allocate_exact_size(Vec2::splat(24.0), Sense::hover());
-            icons::logo(ui.painter(), rect, p.accent);
+            icons::logo(ui.painter(), rect);
+            ui.add_space(8.0);
             ui.label(
-                RichText::new("Simion")
+                RichText::new("S")
+                    .font(FontId::new(15.0, family(FONT_SEMIBOLD)))
+                    .color(icons::BRAND),
+            );
+            ui.label(
+                RichText::new("imion")
                     .font(FontId::new(15.0, family(FONT_SEMIBOLD)))
                     .color(p.text),
             );

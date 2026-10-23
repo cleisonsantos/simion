@@ -13,7 +13,7 @@ pub fn app_icon() -> IconData {
     let radius = s * 0.235;
     // The S is a thick cubic Bézier stroke.
     let curve = s_curve_points(s);
-    let stroke = s * 0.052;
+    let stroke = s * 0.104;
 
     let ss = 2; // 2x2 supersampling
     for py in 0..n {
@@ -21,6 +21,7 @@ pub fn app_icon() -> IconData {
             let mut coverage = 0.0f32;
             let mut color_acc = [0.0f32; 3];
             let mut ink_acc = 0.0f32;
+            let mut dot_acc = 0.0f32;
             for sy in 0..ss {
                 for sx in 0..ss {
                     let x = px as f32 + (sx as f32 + 0.5) / ss as f32;
@@ -31,7 +32,7 @@ pub fn app_icon() -> IconData {
                     coverage += 1.0;
                     // Diagonal indigo → violet gradient.
                     let t = (x / s * 0.45 + y / s * 0.55).clamp(0.0, 1.0);
-                    let base = mix([0x5B, 0x5B, 0xF0], [0x8B, 0x5C, 0xF6], t);
+                    let base = mix([0x0A, 0x5C, 0x4A], [0x17, 0xAE, 0x8B], t);
                     color_acc[0] += base[0];
                     color_acc[1] += base[1];
                     color_acc[2] += base[2];
@@ -43,6 +44,15 @@ pub fn app_icon() -> IconData {
                         stroke * 0.5 - distance,
                     );
                     ink_acc += ink;
+                    let dot_dx = x - s * 0.79;
+                    let dot_dy = y - s * 0.79;
+                    let dot = 1.0
+                        - smoothstep(
+                            s * 0.044 - 0.8,
+                            s * 0.044 + 0.8,
+                            (dot_dx * dot_dx + dot_dy * dot_dy).sqrt(),
+                        );
+                    dot_acc += dot;
                 }
             }
             if coverage == 0.0 {
@@ -55,10 +65,16 @@ pub fn app_icon() -> IconData {
                 color_acc[2] / coverage,
             ];
             let ink = (ink_acc / coverage).clamp(0.0, 1.0);
-            let final_color = [
-                base[0] + (251.0 - base[0]) * ink,
-                base[1] + (251.0 - base[1]) * ink,
-                base[2] + (255.0 - base[2]) * ink,
+            let mut final_color = [
+                base[0] + (0xF8 as f32 - base[0]) * ink,
+                base[1] + (0xF5 as f32 - base[1]) * ink,
+                base[2] + (0xEA as f32 - base[2]) * ink,
+            ];
+            let dot = (dot_acc / coverage).clamp(0.0, 1.0);
+            final_color = [
+                final_color[0] + (0xA7 as f32 - final_color[0]) * dot,
+                final_color[1] + (0xF3 as f32 - final_color[1]) * dot,
+                final_color[2] + (0xD0 as f32 - final_color[2]) * dot,
             ];
             let alpha = (coverage / samples * 255.0).round() as u8;
             let index = (py * n + px) * 4;

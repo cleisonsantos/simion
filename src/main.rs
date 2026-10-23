@@ -18,6 +18,23 @@ use std::sync::Arc;
 use eframe::egui;
 
 fn main() -> eframe::Result {
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    if args.iter().any(|arg| arg == "--version" || arg == "-V") {
+        println!("Simion {}", env!("CARGO_PKG_VERSION"));
+        return Ok(());
+    }
+    if args.iter().any(|arg| arg == "--help" || arg == "-h") {
+        println!(
+            "Simion {} — um caderno de blocos local.\n\n\
+             Uso:\n  simion              abre o caderno\n  simion --version    mostra a versão\n  simion --help       mostra esta ajuda\n\n\
+             Dados: {}\n\
+             Projeto: https://github.com/cleisonsantos/simion",
+            env!("CARGO_PKG_VERSION"),
+            store::data_dir().join("simion.db").display()
+        );
+        return Ok(());
+    }
+
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_title("Simion")

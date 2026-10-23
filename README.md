@@ -1,4 +1,10 @@
+<p align="center">
+  <img src="assets/branding/simion-256.png" width="128" alt="Logo do Simion">
+</p>
+
 # Simion
+
+[![Build & Release](https://github.com/cleisonsantos/simion/actions/workflows/release.yml/badge.svg)](https://github.com/cleisonsantos/simion/actions/workflows/release.yml)
 
 **Um caderno de blocos local, leve e bonito — um clone do Notion feito em Rust.**
 
@@ -7,6 +13,30 @@ sem Electron, sem webview, sem conta e sem nuvem. Tudo vive em um único arquivo
 no seu computador. O nome é uma brincadeira com *Notion*: **não** vira **sim**.
 
 ![Simion no tema claro](docs/screenshot-light.png)
+
+## Baixar e instalar
+
+As builds são geradas pelo **GitHub Actions** a cada release:
+
+| Plataforma | Arquivo | Instalação |
+| --- | --- | --- |
+| Linux (qualquer distro) | `Simion-<versão>-x86_64.AppImage` | `chmod +x` e execute |
+| Debian / Ubuntu | `simion_<versão>_amd64.deb` | `sudo apt install ./simion_<versão>_amd64.deb` |
+| Fedora / RHEL / openSUSE | `simion-<versão>-1.x86_64.rpm` | `sudo dnf install ./simion-<versão>-1.x86_64.rpm` |
+| Linux portátil | `simion_<versão>_linux_x86_64.tar.xz` | extraia e rode `./install.sh` |
+| Windows | `Simion-<versão>-x64.msi` | execute o instalador |
+| Windows portátil | `simion_<versão>_windows_x64.zip` | extraia e rode `simion.exe` |
+| macOS (Intel + Apple Silicon) | `Simion-<versão>-universal.dmg` | abra e arraste para *Applications* |
+
+Os arquivos ficam em [**Releases**](https://github.com/cleisonsantos/simion/releases).
+
+- As builds **não são assinadas** (não há certificado comercial). No Windows o
+  SmartScreen pode pedir confirmação; no macOS use **botão direito → Abrir** ou
+  `xattr -dr com.apple.quarantine /Applications/Simion.app`.
+- O AppImage e os pacotes usam o OpenGL + X11/Wayland do sistema, como qualquer app
+  desktop nativo.
+- `simion --version` mostra a versão. Ao abrir normalmente, o terminal fica silencioso:
+  o Simion é um app GUI e a janela é a saída.
 
 ## O que já funciona
 
@@ -68,7 +98,7 @@ no seu computador. O nome é uma brincadeira com *Notion*: **não** vira **sim**
 
 ## Rodando
 
-Pré-requisitos: **Rust estável** (edition 2024), um compilador C (o SQLite é compilado
+Pré-requisitos: **Rust 1.95+** (edition 2024), um compilador C (o SQLite é compilado
 junto) e os drivers gráficos da plataforma (OpenGL + X11 ou Wayland).
 
 ```bash
@@ -86,7 +116,9 @@ Em Debian/Ubuntu, as dependências de sistema típicas são:
 
 ```bash
 sudo apt install build-essential pkg-config \
-  libxkbcommon-dev libwayland-dev libx11-dev libxi-dev libgl1-mesa-dev
+  libxkbcommon-dev libwayland-dev libx11-dev libxi-dev \
+  libxrandr-dev libxcursor-dev libxinerama-dev \
+  libgl1-mesa-dev libegl1-mesa-dev libgles2-mesa-dev
 ```
 
 O app também roda em macOS e Windows (eframe/winit/glow); a interface foi desenhada
@@ -132,6 +164,10 @@ src/
   icon.rs       Ícone da janela gerado em runtime
   theme.rs      Paleta, tipografia e estilo do egui
   model.rs      Páginas, blocos e tipos
+packaging/      .desktop, nfpm (deb/rpm), AppImage, DMG e instalador portátil
+.github/        workflow de build e release para Linux, Windows e macOS
+build.rs        ícone e metadados do .exe no Windows
+assets/branding/ Logo (SVG, PNG, ICO)
 ```
 
 Decisões que valem a pena conhecer:
@@ -147,7 +183,7 @@ Decisões que valem a pena conhecer:
 - **Histórico agrupado** por tempo (checkpoints a cada ~0,9 s de digitação), com
   snapshots forçados em operações estruturais.
 - **Sem nuvem**: o processo não abre conexões de rede.
-- **Binário enxuto**: cerca de 13 MB no release, sem Electron, sem webview e sem
+- **Binário enxuto**: cerca de 14 MB no release, sem Electron, sem webview e sem
   runtime JavaScript.
 
 ### Testes
@@ -165,6 +201,20 @@ reversa), que o identificou como `format=elf`, `kind=executable`, `architecture=
 e registrou o SHA-256 do artefato. O provedor Ghidra ficou disponível na sessão para
 análise mais profunda. O código não inclui cliente HTTP/TLS: links externos são
 abertos pelo navegador do sistema.
+
+### Builds e distribuição
+
+Cada tag `v*` dispara o workflow `.github/workflows/release.yml`, que roda em runners
+nativos e publica os artefatos no GitHub Releases:
+
+- **Linux:** `.deb` e `.rpm` via [nfpm](https://nfpm.goreleaser.com/), AppImage via
+  `appimagetool`, e `.tar.xz` com um `install.sh` que instala em `~/.local`.
+- **Windows:** MSI via WiX/cargo-wix e `.zip` portátil. O `.exe` recebe o ícone e os
+  metadados via `build.rs` + `winresource`.
+- **macOS:** binário universal (arm64 + x86_64) em um `.app` assinado ad-hoc, DMG e ZIP.
+
+Os binários não são assinados com certificado comercial nem notarizados; isso é
+documentado na seção de downloads.
 
 ## Limitações conhecidas
 
