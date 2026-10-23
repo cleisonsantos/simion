@@ -115,7 +115,7 @@ jobs:
           if ($wix) {
             "$($wix.FullName)\bin" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
           } else {
-            Write-Error "WiX Toolset não encontrado"
+            Write-Error "WiX Toolset not found"
             exit 1
           }
           cargo install cargo-wix --locked
@@ -129,7 +129,7 @@ jobs:
           $msi = Get-ChildItem target\wix\*.msi |
             Sort-Object LastWriteTime -Descending |
             Select-Object -First 1
-          if (-not $msi) { Write-Error "MSI não encontrado"; exit 1 }
+          if (-not $msi) { Write-Error "MSI not found"; exit 1 }
           Copy-Item $msi.FullName "dist\Simion-${{ steps.version.outputs.version }}-x64.msi"
           Compress-Archive -Force `
             -Path target\release\simion.exe, README.md, LICENSE, assets\branding\simion.ico `
