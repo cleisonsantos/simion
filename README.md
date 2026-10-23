@@ -36,9 +36,13 @@ Os arquivos ficam em [**Releases**](https://github.com/cleisonsantos/simion/rele
   SmartScreen pode pedir confirmação; no macOS use **botão direito → Abrir** ou
   `xattr -dr com.apple.quarantine /Applications/Simion.app`.
 - O AppImage e os pacotes usam o OpenGL + X11/Wayland do sistema, como qualquer app
-  desktop nativo.
+  desktop nativo. Em distros sem FUSE2, rode o AppImage com
+  `--appimage-extract-and-run`.
+- As builds Linux são feitas no Ubuntu 22.04 e exigem **glibc 2.35+**
+  (Debian 12+, Ubuntu 22.04+, Fedora 37+). Para distros mais antigas, compile do código.
 - `simion --version` mostra a versão. Ao abrir normalmente, o terminal fica silencioso:
-  o Simion é um app GUI e a janela é a saída.
+  o Simion é um app GUI e a janela é a saída. Se nada aparecer, confira se você está
+  em uma sessão gráfica (`DISPLAY`/`WAYLAND_DISPLAY`).
 
 ## O que já funciona
 
@@ -105,7 +109,12 @@ junto) e os drivers gráficos da plataforma (OpenGL + X11 ou Wayland).
 
 ```bash
 cargo run --release
+# ou, para conferir a instalação:
+./target/release/simion --version
 ```
+
+O Simion é um app GUI: executar `simion` pelo terminal não imprime nada, apenas abre a
+janela. O `--version` existe justamente para dar uma saída de terminal.
 
 Para gerar o binário final:
 
