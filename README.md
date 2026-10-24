@@ -12,7 +12,7 @@
 
 Simion é um aplicativo desktop de anotações com a sensação de edição do Notion, mas
 sem Electron, sem webview, sem conta e sem nuvem. Tudo vive em um único arquivo SQLite
-no seu computador. O nome é uma brincadeira com *Notion*: **não** vira **sim**.
+no seu computador.
 
 ![Simion no tema claro](docs/screenshot-light.png)
 
