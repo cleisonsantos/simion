@@ -110,8 +110,9 @@ jobs:
           # template gerado por `init` não cria atalho nem pacotes de UI (#1).
           dotnet tool install --global wix --version 6.*
           "$env:USERPROFILE\.dotnet\tools" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
-          "$env:USERPROFILE\.dotnet\tools\wix.exe" extension add -g WixToolset.UI.wixext/6.0.2
-          cargo install cargo-wix --locked
+          # O call operator (&) é obrigatório: um caminho entre aspas não pode
+          # receber argumentos ("...wix.exe" extension add -> ParserError).
+          & "$env:USERPROFILE\.dotnet\tools\wix.exe" extension add -g WixToolset.UI.wixext/6.0.2
 
       - name: Build MSI and zip
         shell: pwsh
@@ -132,16 +133,19 @@ jobs:
       - name: Verificar conteúdo do MSI
         shell: pwsh
         run: |
-          # Prova, no próprio runner, que o atalho e o ícone entraram no pacote.
+          # Prova, no próprio runner, que o atalho entrou no pacote. No WiX 6
+          # não existe mais `dark.exe`: o decompilador é `wix msi decompile`.
           $msi = "dist\Simion-${{ steps.version.outputs.version }}-x64.msi"
-          $tables = & dark.exe -x (Join-Path $env:RUNNER_TEMP "wixdump") $msi 2>&1
-          $shortcuts = Select-String -Path (Join-Path $env:RUNNER_TEMP "wixdump\*.wxs") -Pattern "Shortcut" |
-            Where-Object { $_.Line -match "Simion" }
+          $dump = Join-Path $env:RUNNER_TEMP "wixdump"
+          New-Item -ItemType Directory -Force -Path $dump | Out-Null
+          wix msi decompile $msi -o (Join-Path $dump "msi.wxs")
+          $shortcuts = Select-String -Path (Join-Path $dump "msi.wxs") -Pattern "Shortcut"
           if (-not $shortcuts) {
-            Write-Error "O MSI nao contem atalho do Simion: a issue #1 regrediu"
+            Write-Error "O MSI nao contem nenhum atalho: a issue #1 regrediu"
             exit 1
           }
-          Write-Host "Atalho presente no MSI:" ($shortcuts | ForEach-Object { $_.Line.Trim() })
+          Write-Host "Atalhos no MSI:"
+          $shortcuts | ForEach-Object { $_.Line.Trim() }
 
       - uses: actions/upload-artifact@v4
         with:
