@@ -54,7 +54,7 @@
         <Icon Id="ProductICO" SourceFile="assets\branding\simion.ico"/>
         <Property Id="ARPPRODUCTICON" Value="ProductICO"/>
         <Property Id="ARPNOREPAIR" Value="1"/>
-        <Property Id="ARPNOMODIFY" Value="1"/>
+        <!-- ARPNOMODIFY vem da WixUI_InstallDir: declarar aqui gera WIX0091. -->
         <Property Id="ARPCOMMENTS" Value="Caderno de blocos local — Markdown, tarefas e SQLite, tudo offline."/>
         <Property Id="ARPHELPLINK" Value="https://github.com/cleisonsantos/simion"/>
         <Property Id="ARPPUBLISHER" Value="Simion"/>
