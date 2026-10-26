@@ -12,6 +12,9 @@ homepage = "https://github.com/cleisonsantos/simion"
 [dependencies]
 anyhow = "1.0.104"
 eframe = { version = "0.37.0", default-features = false, features = ["glow", "default_fonts", "wayland", "x11", "clipboard"] }
+# Decodifica o PNG da marca para o icone da janela (ver src/icon.rs, #2).
+# `png` ja esta na arvore via eframe; declarar aqui evita depender de reexport.
+png = { version = "0.18", default-features = false }
 rusqlite = { version = "0.40.2", features = ["bundled", "functions"] }
 
 [profile.release]

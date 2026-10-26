@@ -1,0 +1,147 @@
+<!--
+  Instalador WiX 4 do Simion (Windows).
+
+  Este arquivo existe porque o template default gerado por `cargo wix init`
+  NÃO cria atalho no Menu Iniciar, não instala ícone de aplicativo e não
+  oferece escolha de diretório. Versionar o .wxs garante que cada release
+  carregue estas correções (ver issues #1 e #2 do repositório).
+
+  Build (no job windows do CI):
+    cargo wix -I wix/main.wxs   (acrescente a flag de log verboso se precisar)
+  Variáveis do cargo-wix usadas: $(var.CargoTargetBinDir), $(var.Version).
+-->
+
+<?if $(sys.BUILDARCH) = x64 or $(sys.BUILDARCH) = arm64 ?>
+    <?define PlatformProgramFilesFolder = "ProgramFiles64Folder" ?>
+<?else?>
+    <?define PlatformProgramFilesFolder = "ProgramFilesFolder" ?>
+<?endif?>
+
+<Wix xmlns="http://wixtoolset.org/schemas/v4/wxs"
+     xmlns:ui="http://wixtoolset.org/schemas/v4/wxs/ui">
+
+    <!-- A extensão WixToolset.UI.wixext fornece os diálogos (WixUI_InstallDir). -->
+    <Package
+        Name="Simion"
+        UpgradeCode="7C1E9B54-3A6D-4E2F-9B18-5D3C2A8F0BE1"
+        Manufacturer="Simion"
+        Language="1046"
+        Codepage="1252"
+        Version="$(var.Version)"
+        InstallerVersion="500"
+        Scope="perMachine">
+
+        <SummaryInformation
+            Keywords="Installer"
+            Manufacturer="Simion"
+            Description="Simion — caderno de blocos local"/>
+
+        <!-- Upgrade: remove a versão anterior em vez de acumular entradas. -->
+        <MajorUpgrade
+            Schedule="afterInstallInitialize"
+            DowngradeErrorMessage="Uma versão mais nova do Simion já está instalada. O instalador vai fechar."/>
+
+        <MediaTemplate EmbedCab="yes"/>
+
+        <!--
+          Escolha do diretório: sem WIXUI_INSTALLDIR o instalador instala em
+          Program Files\Simion sem perguntar nada.
+        -->
+        <Property Id="WIXUI_INSTALLDIR" Value="INSTALLFOLDER"/>
+        <ui:WixUI Id="WixUI_InstallDir"/>
+
+        <!-- Metadados de Apps instalados (#3): ícone, ajuda e comentário. -->
+        <Icon Id="ProductICO" SourceFile="assets\branding\simion.ico"/>
+        <Property Id="ARPPRODUCTICON" Value="ProductICO"/>
+        <Property Id="ARPNOREPAIR" Value="1"/>
+        <Property Id="ARPNOMODIFY" Value="1"/>
+        <Property Id="ARPCOMMENTS" Value="Caderno de blocos local — Markdown, tarefas e SQLite, tudo offline."/>
+        <Property Id="ARPHELPLINK" Value="https://github.com/cleisonsantos/simion"/>
+        <Property Id="ARPPUBLISHER" Value="Simion"/>
+        <SetProperty Id="ARPINSTALLLOCATION" Value="[INSTALLFOLDER]" After="CostFinalize"/>
+
+        <Feature
+            Id="Main"
+            Title="Simion"
+            Description="O aplicativo, o atalho do Menu Iniciar e a documentação."
+            Level="1"
+            ConfigurableDirectory="INSTALLFOLDER"
+            AllowAbsent="no"
+            Display="expand">
+            <ComponentRef Id="ApplicationShortcut"/>
+            <ComponentRef Id="MainExecutable"/>
+            <ComponentRef Id="ReadmeFile"/>
+            <ComponentRef Id="LicenseFile"/>
+        </Feature>
+
+        <StandardDirectory Id="$(var.PlatformProgramFilesFolder)">
+            <Directory Id="INSTALLFOLDER" Name="Simion">
+                <!--
+                  O executável fica na RAIZ da pasta de instalação
+                  (não em \bin como no template default), para o atalho e o
+                  "Abrir local do arquivo" fazerem sentido para o usuário.
+                -->
+                <Component Id="MainExecutable" Guid="*">
+                    <File Id="SimionExe"
+                          Name="simion.exe"
+                          DiskId="1"
+                          Source="$(var.CargoTargetBinDir)\simion.exe"
+                          KeyPath="yes">
+                        <Shortcut Id="DesktopShortcut"
+                                  Directory="DesktopFolder"
+                                  Name="Simion"
+                                  Description="Caderno de blocos local"
+                                  WorkingDirectory="INSTALLFOLDER"
+                                  Icon="ProductICO"
+                                  Advertise="yes"/>
+                    </File>
+                </Component>
+
+                <Component Id="ReadmeFile" Guid="*">
+                    <File Id="README"
+                          Name="README.md"
+                          DiskId="1"
+                          Source="README.md"
+                          KeyPath="yes"/>
+                </Component>
+
+                <Component Id="LicenseFile" Guid="*">
+                    <File Id="LICENSE"
+                          Name="LICENSE"
+                          DiskId="1"
+                          Source="LICENSE"
+                          KeyPath="yes"/>
+                </Component>
+            </Directory>
+        </StandardDirectory>
+
+        <!--
+          Atalho do Menu Iniciar (#1). Fica em ProgramMenuFolder\Simion e usa
+          `Advertise="yes"` apontando para a feature Main, o que garante o
+          reparo automático do atalho se ele for apagado.
+        -->
+        <StandardDirectory Id="ProgramMenuFolder">
+            <Directory Id="ApplicationProgramsFolder" Name="Simion"/>
+        </StandardDirectory>
+
+        <Component Id="ApplicationShortcut"
+                   Guid="*"
+                   Directory="ApplicationProgramsFolder">
+            <Shortcut Id="ApplicationStartMenuShortcut"
+                      Name="Simion"
+                      Description="Caderno de blocos local"
+                      Icon="ProductICO"
+                      Advertise="yes"/>
+            <!-- Remove a pasta do Menu Iniciar no uninstall, se ficar vazia. -->
+            <RemoveFolder Id="CleanUpShortcutFolder"
+                          Directory="ApplicationProgramsFolder"
+                          On="uninstall"/>
+            <RegistryValue Root="HKCU"
+                           Key="Software\Simion"
+                           Name="StartMenuShortcut"
+                           Type="integer"
+                           Value="1"
+                           KeyPath="yes"/>
+        </Component>
+    </Package>
+</Wix>
