@@ -105,35 +105,43 @@ jobs:
       - name: Install WiX and cargo-wix
         shell: pwsh
         run: |
-          choco install wixtoolset --no-progress -y
-          $wix = Get-ChildItem "${env:ProgramFiles(x86)}\WiX Toolset*" -Directory -ErrorAction SilentlyContinue |
-            Select-Object -First 1
-          if (-not $wix) {
-            $wix = Get-ChildItem "$env:ProgramFiles\WiX Toolset*" -Directory -ErrorAction SilentlyContinue |
-              Select-Object -First 1
-          }
-          if ($wix) {
-            "$($wix.FullName)\bin" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
-          } else {
-            Write-Error "WiX Toolset not found"
-            exit 1
-          }
+          # WiX 5/6 como dotnet tool: um binário (wix) + extensão UI instalada
+          # pela própria CLI. Não usamos mais o choco/`cargo wix init`, porque o
+          # template gerado por `init` não cria atalho nem pacotes de UI (#1).
+          dotnet tool install --global wix --version 6.*
+          "$env:USERPROFILE\.dotnet\tools" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+          "$env:USERPROFILE\.dotnet\tools\wix.exe" extension add -g WixToolset.UI.wixext/6.0.2
           cargo install cargo-wix --locked
 
       - name: Build MSI and zip
         shell: pwsh
         run: |
-          cargo wix init --force
-          cargo wix --no-build --nocapture
+          # .wxs versionado no repositório: atalhos do Menu Iniciar/Desktop,
+          # ícone em Apps instalados e escolha de diretório (#1, #2, #3).
+          wix build wix\main.wxs `
+            -arch x64 `
+            -ext WixToolset.UI.wixext `
+            -d CargoTargetBinDir=target\release `
+            -d Version=${{ steps.version.outputs.version }} `
+            -o "dist\Simion-${{ steps.version.outputs.version }}-x64.msi"
           New-Item -ItemType Directory -Force -Path dist | Out-Null
-          $msi = Get-ChildItem target\wix\*.msi |
-            Sort-Object LastWriteTime -Descending |
-            Select-Object -First 1
-          if (-not $msi) { Write-Error "MSI not found"; exit 1 }
-          Copy-Item $msi.FullName "dist\Simion-${{ steps.version.outputs.version }}-x64.msi"
           Compress-Archive -Force `
             -Path target\release\simion.exe, README.md, LICENSE, assets\branding\simion.ico `
             -DestinationPath "dist\simion_${{ steps.version.outputs.version }}_windows_x64.zip"
+
+      - name: Verificar conteúdo do MSI
+        shell: pwsh
+        run: |
+          # Prova, no próprio runner, que o atalho e o ícone entraram no pacote.
+          $msi = "dist\Simion-${{ steps.version.outputs.version }}-x64.msi"
+          $tables = & dark.exe -x (Join-Path $env:RUNNER_TEMP "wixdump") $msi 2>&1
+          $shortcuts = Select-String -Path (Join-Path $env:RUNNER_TEMP "wixdump\*.wxs") -Pattern "Shortcut" |
+            Where-Object { $_.Line -match "Simion" }
+          if (-not $shortcuts) {
+            Write-Error "O MSI nao contem atalho do Simion: a issue #1 regrediu"
+            exit 1
+          }
+          Write-Host "Atalho presente no MSI:" ($shortcuts | ForEach-Object { $_.Line.Trim() })
 
       - uses: actions/upload-artifact@v4
         with:
