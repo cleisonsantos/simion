@@ -124,7 +124,7 @@ jobs:
             -ext WixToolset.UI.wixext `
             -d CargoTargetBinDir=target\release `
             -d Version=${{ steps.version.outputs.version }} `
-            -o "dist\Simion-${{ steps.version.outputs.version }}-x64.msi"
+            -o "dist\Simion-Setup-${{ steps.version.outputs.version }}-x64.msi"
           New-Item -ItemType Directory -Force -Path dist | Out-Null
           Compress-Archive -Force `
             -Path target\release\simion.exe, README.md, LICENSE, assets\branding\simion.ico `
@@ -135,7 +135,7 @@ jobs:
         run: |
           # Prova, no próprio runner, que o atalho entrou no pacote. No WiX 6
           # não existe mais `dark.exe`: o decompilador é `wix msi decompile`.
-          $msi = "dist\Simion-${{ steps.version.outputs.version }}-x64.msi"
+          $msi = "dist\Simion-Setup-${{ steps.version.outputs.version }}-x64.msi"
           $dump = Join-Path $env:RUNNER_TEMP "wixdump"
           New-Item -ItemType Directory -Force -Path $dump | Out-Null
           wix msi decompile $msi -o (Join-Path $dump "msi.wxs")
@@ -206,10 +206,26 @@ jobs:
           path: dist
           merge-multiple: true
 
+      - name: Descartar artefatos que nao vao para o release
+        run: |
+          # .wixpdb sao simbolos de depuracao do WiX: poluem a lista de assets e
+          # nao servem para quem baixa o app (issue #5).
+          find dist -name '*.wixpdb' -delete
+          ls -la dist
+
       - name: Publish release
         uses: softprops/action-gh-release@v2
         with:
           name: Simion ${{ github.ref_name }}
+          body: |
+            ## Instalacao
+
+            - **Windows**: baixe `Simion-Setup-<versao>-x64.msi` e de **duplo clique**
+              (nao existe `setup.exe`: o instalador e o `.msi`).
+            - **macOS**: `Simion-<versao>-universal.dmg`.
+            - **Linux**: `.AppImage`, `.deb` ou `.rpm`.
+
+            As builds nao sao assinadas (`#5`), entao o SmartScreen/Gatekeeper pode pedir confirmacao.
           files: dist/*
           generate_release_notes: true
           draft: false

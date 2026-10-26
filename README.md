@@ -22,13 +22,17 @@ As builds são geradas pelo **GitHub Actions** a cada release:
 
 | Plataforma | Arquivo | Instalação |
 | --- | --- | --- |
+| **Windows** | `Simion-Setup-<versão>-x64.msi` | **duplo clique** — é o instalador |
+| Windows portátil | `simion_<versão>_windows_x64.zip` | extraia e rode `simion.exe` |
 | Linux (qualquer distro) | `Simion-<versão>-x86_64.AppImage` | `chmod +x` e execute |
 | Debian / Ubuntu | `simion_<versão>_amd64.deb` | `sudo apt install ./simion_<versão>_amd64.deb` |
 | Fedora / RHEL / openSUSE | `simion-<versão>-1.x86_64.rpm` | `sudo dnf install ./simion-<versão>-1.x86_64.rpm` |
 | Linux portátil | `simion_<versão>_linux_x86_64.tar.xz` | extraia e rode `./install.sh` |
-| Windows | `Simion-<versão>-x64.msi` | execute o instalador |
-| Windows portátil | `simion_<versão>_windows_x64.zip` | extraia e rode `simion.exe` |
 | macOS (Intel + Apple Silicon) | `Simion-<versão>-universal.dmg` | abra e arraste para *Applications* |
+
+> **No Windows não existe `setup.exe`: o instalador é o `.msi`.** Duplo clique nele e o
+> Simion aparece no Menu Iniciar, na Área de Trabalho e em *Configurações → Apps*
+> (onde também se desinstala). O `.zip` é a alternativa portátil, para rodar sem instalar.
 
 Os arquivos ficam em [**Releases**](https://github.com/cleisonsantos/simion/releases).
 
