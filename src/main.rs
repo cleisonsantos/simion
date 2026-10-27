@@ -59,3 +59,27 @@ fn main() -> eframe::Result {
         Box::new(|cc| Ok(Box::new(app::App::new(cc)))),
     )
 }
+
+/// Registra o AppUserModelID do processo no shell do Windows.
+///
+/// Sem isso, o Windows agrupa o Simion como um processo anonimo: o icone
+/// pinado/fixado na barra nao casa com o atalho instalado pelo MSI e pode
+/// aparecer um icone generico ao lado do correto (#7). O valor tem de ser o
+/// mesmo `System.AppUserModel.ID` gravado nos atalhos (wix/main.wxs).
+#[cfg(windows)]
+fn set_app_user_model_id(id: &str) {
+    use std::ffi::OsStr;
+    use std::os::windows::ffi::OsStrExt;
+
+    // Rust 2024 exige `unsafe extern` para blocos externos.
+    #[link(name = "shell32")]
+    unsafe extern "system" {
+        fn SetCurrentProcessExplicitAppUserModelID(app_id: *const u16) -> i32;
+    }
+
+    let wide: Vec<u16> = OsStr::new(id).encode_wide().chain([0]).collect();
+    // Falha aqui nao e fatal: o app abre normalmente, so perde o agrupamento.
+    unsafe {
+        SetCurrentProcessExplicitAppUserModelID(wide.as_ptr());
+    }
+}
