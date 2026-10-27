@@ -147,6 +147,20 @@ jobs:
           Write-Host "Atalhos no MSI:"
           $shortcuts | ForEach-Object { $_.Line.Trim() }
 
+          # O atalho sem icone (#7) passou porque o CI so olhava "Shortcut".
+          # Agora exige tambem o Icon do produto e o AppUserModelID nos atalhos.
+          $icon = Select-String -Path (Join-Path $dump "msi.wxs") -Pattern 'Icon Id="ProductICO"'
+          if (-not $icon) {
+            Write-Error "O MSI nao embutiu o icone do produto: a issue #7 regrediu"
+            exit 1
+          }
+          $aumid = Select-String -Path (Join-Path $dump "msi.wxs") -Pattern "System.AppUserModel.ID"
+          if (-not $aumid) {
+            Write-Error "Os atalhos nao declaram System.AppUserModel.ID: a issue #7 regrediu"
+            exit 1
+          }
+          Write-Host "Icone do produto e AppUserModelID presentes no MSI."
+
       - uses: actions/upload-artifact@v4
         with:
           name: windows

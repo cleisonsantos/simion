@@ -1,6 +1,6 @@
 [package]
 name = "simion"
-version = "0.1.2"
+version = "0.1.3"
 edition = "2024"
 rust-version = "1.95"
 description = "Um caderno de blocos local, leve e bonito — um clone do Notion em Rust"
@@ -11,7 +11,7 @@ homepage = "https://github.com/cleisonsantos/simion"
 
 [dependencies]
 anyhow = "1.0.104"
-eframe = { version = "0.37.0", default-features = false, features = ["glow", "default_fonts", "wayland", "x11", "clipboard"] }
+eframe = { version = "0.37.0", default-features = false, features = ["glow", "default_fonts", "persistence", "wayland", "x11", "clipboard"] }
 # Decodifica o PNG da marca para o icone da janela (ver src/icon.rs, #2).
 # `png` ja esta na arvore via eframe; declarar aqui evita depender de reexport.
 png = { version = "0.18", default-features = false }

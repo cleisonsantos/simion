@@ -1380,6 +1380,19 @@ impl eframe::App for App {
         }
     }
 
+    /// Persiste o que o eframe guarda entre execucoes (issue #6).
+    ///
+    /// `window`/`egui_memory` sao gravados pelo proprio eframe quando a feature
+    /// `persistence` esta ativa; aqui acrescentamos o estado do app que tambem
+    /// deve sobreviver ao fechamento (zoom, tema e sidebar), para que reabrir o
+    /// Simion devolva a mesma janela e o mesmo contexto de trabalho.
+    fn save(&mut self, storage: &mut dyn eframe::Storage) {
+        eframe::set_value(storage, "simion_zoom", &self.zoom);
+        eframe::set_value(storage, "simion_sidebar_visible", &self.sidebar_visible);
+        let mode = self.mode == Mode::Dark;
+        eframe::set_value(storage, "simion_dark", &mode);
+    }
+
     fn clear_color(&self, _visuals: &egui::Visuals) -> [f32; 4] {
         self.palette.bg.to_normalized_gamma_f32()
     }

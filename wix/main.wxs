@@ -93,7 +93,15 @@
                                   Description="Caderno de blocos local"
                                   WorkingDirectory="INSTALLFOLDER"
                                   Icon="ProductICO"
-                                  Advertise="yes"/>
+                                  Advertise="yes">
+                            <!-- Liga o atalho ao processo (mesmo ID que
+                                 SetCurrentProcessExplicitAppUserModelID usa). Sem
+                                 isso o shell nao associa atalho <-> executavel e
+                                 o icone do atalho pode sair em branco (#7). -->
+                            <ShortcutProperty Id="DesktopShortcutAUMID"
+                                              Key="System.AppUserModel.ID"
+                                              Value="com.cleisonsantos.simion"/>
+                        </Shortcut>
                     </File>
                 </Component>
 
@@ -131,7 +139,12 @@
                       Name="Simion"
                       Description="Caderno de blocos local"
                       Icon="ProductICO"
-                      Advertise="yes"/>
+                      Advertise="yes">
+                <!-- Ver comentario do DesktopShortcut: mesmo AppUserModel.ID. -->
+                <ShortcutProperty Id="StartMenuShortcutAUMID"
+                                  Key="System.AppUserModel.ID"
+                                  Value="com.cleisonsantos.simion"/>
+            </Shortcut>
             <!-- Remove a pasta do Menu Iniciar no uninstall, se ficar vazia. -->
             <RemoveFolder Id="CleanUpShortcutFolder"
                           Directory="ApplicationProgramsFolder"

@@ -35,10 +35,18 @@ fn main() -> eframe::Result {
         return Ok(());
     }
 
+    // Windows: sem um AppUserModelID explicito o shell trata o processo como
+    // "genérico" e o icone na barra de tarefas / pinado nao casa com o atalho.
+    // Precisa ser identico ao System.AppUserModel.ID declarado nos atalhos.
+    #[cfg(windows)]
+    set_app_user_model_id("com.cleisonsantos.simion");
+
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_title("Simion")
-            .with_app_id("simion")
+            .with_app_id("com.cleisonsantos.simion")
+            // Primeira execucao apenas: depois disso a geometria vem do storage
+            // de persistencia do eframe (issue #6).
             .with_inner_size([1240.0, 820.0])
             .with_min_inner_size([720.0, 520.0])
             .with_icon(Arc::new(icon::app_icon())),
