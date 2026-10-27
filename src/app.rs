@@ -236,6 +236,16 @@ impl App {
             window_title: String::new(),
         };
 
+        // Estado de interface que nao vive no SQLite (issue #6). O tema fica
+        // de fora de proposito: ele ja persiste na tabela `settings` e e
+        // restaurado em `boot`, e duplicar criaria duas fontes de verdade.
+        if let Some(storage) = cc.storage {
+            let zoom: Option<f32> = eframe::get_value(storage, "simion_zoom");
+            app.zoom = zoom.unwrap_or(1.0).clamp(0.75, 1.6);
+            app.sidebar_visible =
+                eframe::get_value(storage, "simion_sidebar_visible").unwrap_or(true);
+        }
+
         match Store::open_default() {
             Ok(store) => {
                 app.store = Some(store);
@@ -1387,10 +1397,11 @@ impl eframe::App for App {
     /// deve sobreviver ao fechamento (zoom, tema e sidebar), para que reabrir o
     /// Simion devolva a mesma janela e o mesmo contexto de trabalho.
     fn save(&mut self, storage: &mut dyn eframe::Storage) {
+        // A geometria da janela e gravada pelo proprio eframe (`persist_window`).
+        // Aqui vai so o que ele nao conhece. O tema nao entra: ja esta em
+        // `settings` no SQLite, restaurado por `boot`.
         eframe::set_value(storage, "simion_zoom", &self.zoom);
         eframe::set_value(storage, "simion_sidebar_visible", &self.sidebar_visible);
-        let mode = self.mode == Mode::Dark;
-        eframe::set_value(storage, "simion_dark", &mode);
     }
 
     fn clear_color(&self, _visuals: &egui::Visuals) -> [f32; 4] {
