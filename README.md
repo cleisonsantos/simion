@@ -226,7 +226,7 @@ Decisões que valem a pena conhecer:
   snapshots forçados em operações estruturais.
 - **Sem nuvem**: as anotações nunca saem do computador; o único acesso de rede é o
   updater opcional que consulta o GitHub Releases.
-- **Binário enxuto**: cerca de 14 MB no release, sem Electron, sem webview e sem
+- **Binário enxuto**: cerca de 16 MB no release, sem Electron, sem webview e sem
   runtime JavaScript.
 
 ### Testes
