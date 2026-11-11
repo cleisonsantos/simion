@@ -48,6 +48,32 @@ Os arquivos ficam em [**Releases**](https://github.com/cleisonsantos/simion/rele
   o Simion é um app GUI e a janela é a saída. Se nada aparecer, confira se você está
   em uma sessão gráfica (`DISPLAY`/`WAYLAND_DISPLAY`).
 
+## Atualizações
+
+Ao iniciar, o Simion consulta o [GitHub Releases](https://github.com/cleisonsantos/simion/releases)
+se a última checagem tiver mais de 24 horas. Quando encontra uma versão mais nova, baixa
+o instalador adequado em segundo plano e mostra uma faixa discreta no topo do editor:
+
+- **AppImage e `.tar.xz` portátil:** o novo binário é copiado para o mesmo diretório e o
+  app reinicia com **Reiniciar e atualizar**.
+- **`.deb`, `.rpm`, `.msi` e `.dmg`:** o instalador do sistema é aberto; conclua a
+  instalação pela interface dele. O Simion nunca pede `sudo` nem instala sozinho.
+- **Depois** esconde a faixa sem apagar o download já feito.
+
+Nada das suas anotações é enviado. As únicas conexões são `GET` em `api.github.com`
+e no endereço do release em `github.com`/`objects.githubusercontent.com`; o arquivo
+baixado fica em uma pasta temporária do sistema.
+
+A checagem automática pode ser desativada com a variável de ambiente
+`SIMION_NO_UPDATE_CHECK=1` (ou gravando `auto_update_check` = `0` na tabela
+`settings` do banco). A checagem manual continua disponível pelo rodapé da barra
+lateral e pela linha de comando:
+
+```bash
+simion --check-update   # 0 = atualizado, 1 = há versão nova, 2 = erro
+simion --update         # baixa e aplica a atualização, se houver
+```
+
 ## O que já funciona
 
 - **Editor de blocos** no estilo Notion: parágrafo, título 1/2/3, lista com marcadores,
@@ -76,7 +102,8 @@ Os arquivos ficam em [**Releases**](https://github.com/cleisonsantos/simion/rele
   de palavras, estado de salvamento e caminho do banco.
 - **Importação/exportação**: exporta `.md` para `~/Documentos/Simion/`, copia o
   Markdown da página e importa `.md` por arrastar-e-soltar.
-- **Tudo offline**: um único binário, um único arquivo de dados.
+- **Tudo local**: um único binário, um único arquivo de dados. A única exceção é a
+  checagem opcional de atualizações, que só faz `GET` no GitHub Releases.
 
 ![Simion no tema escuro](docs/screenshot-dark.png)
 
@@ -197,8 +224,9 @@ Decisões que valem a pena conhecer:
   em coordenadas de conteúdo — detalhe que evita a página “sumir” ao chegar ao fim.
 - **Histórico agrupado** por tempo (checkpoints a cada ~0,9 s de digitação), com
   snapshots forçados em operações estruturais.
-- **Sem nuvem**: o processo não abre conexões de rede.
-- **Binário enxuto**: cerca de 14 MB no release, sem Electron, sem webview e sem
+- **Sem nuvem**: as anotações nunca saem do computador; o único acesso de rede é o
+  updater opcional que consulta o GitHub Releases.
+- **Binário enxuto**: cerca de 16 MB no release, sem Electron, sem webview e sem
   runtime JavaScript.
 
 ### Testes
@@ -214,8 +242,8 @@ e busca sem acentos.
 O binário de release também foi aberto com o **MCP do REA** (ferramenta de engenharia
 reversa), que o identificou como `format=elf`, `kind=executable`, `architecture=x86_64`
 e registrou o SHA-256 do artefato. O provedor Ghidra ficou disponível na sessão para
-análise mais profunda. O código não inclui cliente HTTP/TLS: links externos são
-abertos pelo navegador do sistema.
+análise mais profunda. O updater usa `ureq` (com TLS) somente para o GitHub Releases;
+links externos do editor continuam sendo abertos pelo navegador do sistema.
 
 ### Builds e distribuição
 

@@ -12,6 +12,7 @@ mod sidebar;
 mod store;
 mod theme;
 mod ui;
+mod updater;
 
 use std::sync::Arc;
 
@@ -25,14 +26,91 @@ fn main() -> eframe::Result {
     }
     if args.iter().any(|arg| arg == "--help" || arg == "-h") {
         println!(
-            "Simion {} — um caderno de blocos local.\n\n\
-             Uso:\n  simion              abre o caderno\n  simion --version    mostra a versão\n  simion --help       mostra esta ajuda\n\n\
-             Dados: {}\n\
-             Projeto: https://github.com/cleisonsantos/simion",
+            concat!(
+                "Simion {} — um caderno de blocos local.\n\n",
+                "Uso:\n",
+                "  simion                 abre o caderno\n",
+                "  simion --version       mostra a versão\n",
+                "  simion --check-update  verifica se há uma nova versão\n",
+                "  simion --update        baixa e instala a nova versão, se houver\n",
+                "  simion --help          mostra esta ajuda\n\n",
+                "Dados: {}\n",
+                "Projeto: https://github.com/cleisonsantos/simion",
+            ),
             env!("CARGO_PKG_VERSION"),
             store::data_dir().join("simion.db").display()
         );
         return Ok(());
+    }
+
+    if args.iter().any(|arg| arg == "--check-update") {
+        match updater::check_latest() {
+            Ok(Some(release)) => {
+                println!(
+                    "Simion {} — nova versão {} disponível: {}",
+                    env!("CARGO_PKG_VERSION"),
+                    release.version,
+                    release.html_url
+                );
+                std::process::exit(1);
+            }
+            Ok(None) => {
+                println!("Simion {} — atualizado", env!("CARGO_PKG_VERSION"));
+                return Ok(());
+            }
+            Err(err) => {
+                eprintln!("Erro ao verificar atualizações: {err}");
+                std::process::exit(2);
+            }
+        }
+    }
+
+    if args.iter().any(|arg| arg == "--update") {
+        let release = match updater::check_latest() {
+            Ok(Some(release)) => release,
+            Ok(None) => {
+                println!("Simion {} — atualizado", env!("CARGO_PKG_VERSION"));
+                return Ok(());
+            }
+            Err(err) => {
+                eprintln!("Erro ao verificar atualizações: {err}");
+                std::process::exit(2);
+            }
+        };
+        let platform = updater::detect_platform();
+        let asset = match updater::select_asset(&release, platform) {
+            Ok(asset) => asset,
+            Err(err) => {
+                eprintln!("Erro: {err}");
+                std::process::exit(2);
+            }
+        };
+        eprintln!("Baixando Simion {} ({})…", release.version, asset.name);
+        let mut last_percent = -1i32;
+        let path = match updater::download_asset(asset, |progress| {
+            let percent = (progress * 100.0).round() as i32;
+            if percent != last_percent {
+                last_percent = percent;
+                eprintln!("  {percent}%");
+            }
+        }) {
+            Ok(path) => path,
+            Err(err) => {
+                eprintln!("Erro ao baixar atualização: {err}");
+                std::process::exit(2);
+            }
+        };
+        match updater::apply_update(&path) {
+            Ok(updater::ApplyOutcome::InstallerOpened) => {
+                println!("Instalador aberto — conclua a instalação");
+                return Ok(());
+            }
+            Ok(updater::ApplyOutcome::Restarted) => return Ok(()),
+            Err(err) => {
+                eprintln!("Erro ao aplicar atualização: {err}");
+                std::process::exit(2);
+            }
+        }
     }
 
     // Windows: sem um AppUserModelID explicito o shell trata o processo como

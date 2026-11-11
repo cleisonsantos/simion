@@ -2,11 +2,12 @@
 
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
-use std::time::Duration;
+use std::sync::mpsc::{self, TryRecvError};
+use std::time::{Duration, Instant};
 
 use eframe::egui::{
-    self, CentralPanel, Context, Frame, Key, Margin, Modifiers, Panel, Pos2, Rect, RichText, Ui,
-    ViewportCommand,
+    self, Align, Button, CentralPanel, Context, Frame, Key, Layout, Margin, Modifiers, Panel, Pos2,
+    ProgressBar, Rect, RichText, Ui, ViewportCommand,
 };
 
 use crate::markdown;
@@ -14,6 +15,7 @@ use crate::model::{Block, BlockKind, IdGen, Page, PageId, PageMeta};
 use crate::search::SearchState;
 use crate::store::{Store, export_dir, unix_now};
 use crate::theme::{self, Mode, Palette, palette};
+use crate::updater::{self, ApplyOutcome, Release, UpdateMsg, UpdateState, UpdateStatus};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 pub enum Focus {
@@ -61,6 +63,10 @@ pub enum Action {
     OpenSearch,
     OpenShortcuts,
     OpenMarkdown,
+    CheckUpdates,
+    StartDownload,
+    ApplyUpdate,
+    DismissUpdate,
     ExportMarkdown(PageId),
     CopyMarkdown(PageId),
     OpenPageMenu(PageId, Pos2),
@@ -119,6 +125,8 @@ pub struct App {
     pub confirm_delete: Option<PageId>,
 
     pub toast: Option<Toast>,
+    pub update: UpdateState,
+    pub update_rx: Option<mpsc::Receiver<UpdateMsg>>,
     pub popup_guard: f64,
     pub history: History,
     pub scroll_to: Option<u64>,
@@ -218,6 +226,8 @@ impl App {
             markdown_open: false,
             confirm_delete: None,
             toast: None,
+            update: UpdateState::default(),
+            update_rx: None,
             popup_guard: 0.0,
             history: History {
                 undo: Vec::new(),
@@ -254,6 +264,9 @@ impl App {
             Err(err) => {
                 app.fatal = Some(format!("{err:#}"));
             }
+        }
+        if app.fatal.is_none() {
+            app.init_updater(&cc.egui_ctx);
         }
         app
     }
@@ -579,6 +592,226 @@ impl App {
     }
 
     // -----------------------------------------------------------------------
+    // Updates
+    // -----------------------------------------------------------------------
+
+    fn init_updater(&mut self, ctx: &Context) {
+        let enabled = self
+            .store
+            .as_ref()
+            .and_then(|store| store.setting("auto_update_check").ok().flatten())
+            .map(|value| {
+                let value = value.trim();
+                value != "0" && !value.eq_ignore_ascii_case("false")
+            })
+            .unwrap_or(true);
+        let disabled_by_env = std::env::var("SIMION_NO_UPDATE_CHECK")
+            .map(|value| value == "1" || value.eq_ignore_ascii_case("true"))
+            .unwrap_or(false);
+        self.update.auto = enabled && !disabled_by_env;
+        self.update.last_check = self
+            .store
+            .as_ref()
+            .and_then(|store| store.setting("last_update_check").ok().flatten())
+            .and_then(|value| value.parse::<i64>().ok())
+            .unwrap_or(0);
+
+        if self.update.auto && updater::check_due(self.update.last_check, unix_now()) {
+            self.start_update_check(ctx, false);
+        }
+    }
+
+    fn start_update_check(&mut self, ctx: &Context, manual: bool) {
+        if matches!(&self.update.status, UpdateStatus::Checking) {
+            if manual {
+                self.toast("Verificando atualizações…");
+            }
+            return;
+        }
+        if let UpdateStatus::Downloading { release, .. } = &self.update.status {
+            if manual {
+                self.toast(format!("Baixando Simion v{}…", release.version));
+            }
+            return;
+        }
+        if let UpdateStatus::Ready { release, .. } = &self.update.status {
+            if manual {
+                self.toast(format!(
+                    "Simion v{} já está pronto para instalar",
+                    release.version
+                ));
+            }
+            return;
+        }
+
+        self.update.auto = !manual;
+        self.update.status = UpdateStatus::Checking;
+        if manual {
+            self.toast("Verificando atualizações…");
+        }
+
+        let (sender, receiver) = mpsc::channel();
+        self.update_rx = Some(receiver);
+        let ctx = ctx.clone();
+        std::thread::spawn(move || {
+            let result = updater::check_latest();
+            let _ = sender.send(UpdateMsg::CheckResult(result, manual));
+            ctx.request_repaint();
+        });
+    }
+
+    fn start_download(&mut self, ctx: &Context, release: Release, manual: bool) {
+        let asset = match updater::select_asset(&release, updater::detect_platform()) {
+            Ok(asset) => asset.clone(),
+            Err(err) => {
+                if manual {
+                    self.update.status = UpdateStatus::Error(err.clone());
+                    self.toast(format!("Erro ao atualizar: {err}"));
+                } else {
+                    self.update.status = UpdateStatus::Idle;
+                }
+                return;
+            }
+        };
+
+        self.update.status = UpdateStatus::Downloading {
+            release: release.clone(),
+            progress: 0.0,
+        };
+        let (sender, receiver) = mpsc::channel();
+        self.update_rx = Some(receiver);
+        let ctx = ctx.clone();
+        std::thread::spawn(move || {
+            let mut last = Instant::now();
+            let result = updater::download_asset(&asset, |progress| {
+                if progress >= 1.0 || last.elapsed() >= Duration::from_millis(80) {
+                    last = Instant::now();
+                    let _ = sender.send(UpdateMsg::DownloadProgress(release.clone(), progress));
+                    ctx.request_repaint();
+                }
+            });
+            let message = match result {
+                Ok(path) => UpdateMsg::DownloadReady(release, path),
+                Err(err) => UpdateMsg::DownloadError(release, err, manual),
+            };
+            let _ = sender.send(message);
+            ctx.request_repaint();
+        });
+    }
+
+    fn drain_update_messages(&mut self, ctx: &Context) {
+        let mut messages = Vec::new();
+        let mut disconnected = false;
+        if let Some(receiver) = self.update_rx.as_ref() {
+            loop {
+                match receiver.try_recv() {
+                    Ok(message) => messages.push(message),
+                    Err(TryRecvError::Empty) => break,
+                    Err(TryRecvError::Disconnected) => {
+                        disconnected = true;
+                        break;
+                    }
+                }
+            }
+        }
+        if disconnected {
+            self.update_rx = None;
+        }
+        for message in messages {
+            self.handle_update_message(message, ctx);
+        }
+    }
+
+    fn handle_update_message(&mut self, message: UpdateMsg, ctx: &Context) {
+        match message {
+            UpdateMsg::CheckResult(Ok(None), manual) => {
+                self.update.status = UpdateStatus::UpToDate;
+                self.record_update_check();
+                if manual {
+                    self.toast("Simion está atualizado");
+                }
+            }
+            UpdateMsg::CheckResult(Ok(Some(release)), manual) => {
+                self.record_update_check();
+                self.update.dismissed = None;
+                self.update.status = UpdateStatus::Available(release.clone());
+                // A atualização automática baixa sem esperar o usuário.
+                self.start_download(ctx, release, manual);
+            }
+            UpdateMsg::CheckResult(Err(err), manual) => {
+                if manual {
+                    self.update.status = UpdateStatus::Error(err.clone());
+                    self.toast(format!("Erro ao verificar atualizações: {err}"));
+                } else {
+                    // Uma checagem automática que falha não deve incomodar.
+                    self.update.status = UpdateStatus::Idle;
+                }
+            }
+            UpdateMsg::DownloadProgress(release, progress) => {
+                if matches!(&self.update.status, UpdateStatus::Downloading { .. }) {
+                    self.update.status = UpdateStatus::Downloading { release, progress };
+                }
+            }
+            UpdateMsg::DownloadReady(release, path) => {
+                self.update.status = UpdateStatus::Ready { release, path };
+                self.toast("Atualização baixada — pronta para instalar");
+            }
+            UpdateMsg::DownloadError(release, err, manual) => {
+                if manual {
+                    self.update.status = UpdateStatus::Error(err.clone());
+                    self.toast(format!("Erro ao baixar Simion v{}: {err}", release.version));
+                } else {
+                    self.update.status = UpdateStatus::Idle;
+                }
+            }
+        }
+    }
+
+    fn record_update_check(&mut self) {
+        let now = unix_now();
+        self.update.last_check = now;
+        if let Some(store) = self.store.as_mut() {
+            let _ = store.set_setting("last_update_check", &now.to_string());
+        }
+    }
+
+    fn apply_update_now(&mut self) {
+        let UpdateStatus::Ready { release, path } = self.update.status.clone() else {
+            return;
+        };
+        // A página precisa estar no SQLite antes de o processo ser reiniciado.
+        self.save_now();
+        match updater::apply_update(&path) {
+            Ok(ApplyOutcome::InstallerOpened) => {
+                self.update.status = UpdateStatus::Idle;
+                self.update.dismissed = None;
+                self.toast("Instalador aberto — conclua a instalação");
+            }
+            Ok(ApplyOutcome::Restarted) => {}
+            Err(err) => {
+                // Mantém o estado Ready: o download continua disponível.
+                self.toast(format!(
+                    "Não foi possível atualizar para v{}: {err}",
+                    release.version
+                ));
+            }
+        }
+    }
+
+    fn dismiss_update(&mut self) {
+        if let Some(version) = self
+            .update
+            .status
+            .release()
+            .map(|release| release.version.clone())
+        {
+            self.update.dismissed = Some(version);
+        } else {
+            self.update.status = UpdateStatus::Idle;
+        }
+    }
+
+    // -----------------------------------------------------------------------
     // History
     // -----------------------------------------------------------------------
 
@@ -836,6 +1069,15 @@ impl App {
                 self.markdown_open = true;
                 self.page_menu = None;
             }
+            Action::CheckUpdates => self.start_update_check(ctx, true),
+            Action::StartDownload => {
+                if let UpdateStatus::Available(release) = self.update.status.clone() {
+                    let manual = !self.update.auto;
+                    self.start_download(ctx, release, manual);
+                }
+            }
+            Action::ApplyUpdate => self.apply_update_now(),
+            Action::DismissUpdate => self.dismiss_update(),
             Action::ExportMarkdown(id) => {
                 self.page_menu = None;
                 self.export_markdown(id);
@@ -1286,6 +1528,126 @@ impl App {
         self.save_now();
     }
 
+    /// Faixa fina acima do editor para avisar sobre uma atualização.
+    fn draw_update_banner(&mut self, ui: &mut Ui, actions: &mut Vec<Action>) {
+        let p = self.palette;
+        let status = self.update.status.clone();
+        let dismissed = self.update.dismissed.clone();
+        let visible = match &status {
+            UpdateStatus::Available(release)
+            | UpdateStatus::Downloading { release, .. }
+            | UpdateStatus::Ready { release, .. } => {
+                dismissed.as_deref() != Some(release.version.as_str())
+            }
+            // Erros só aparecem quando a checagem foi pedida pelo usuário.
+            UpdateStatus::Error(_) => !self.update.auto,
+            _ => false,
+        };
+        if !visible {
+            return;
+        }
+
+        Panel::top("simion-update-banner")
+            .frame(Frame::new().fill(p.accent_soft).inner_margin(Margin {
+                left: 14,
+                right: 14,
+                top: 8,
+                bottom: 8,
+            }))
+            .show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    ui.spacing_mut().item_spacing.x = 9.0;
+                    match &status {
+                        UpdateStatus::Downloading { release, progress } => {
+                            ui.label(
+                                RichText::new(format!(
+                                    "Nova versão v{} disponível",
+                                    release.version
+                                ))
+                                .size(13.0)
+                                .color(p.text)
+                                .strong(),
+                            );
+                            ui.add(
+                                ProgressBar::new(*progress)
+                                    .desired_width(170.0)
+                                    .desired_height(10.0)
+                                    .fill(p.accent),
+                            );
+                            ui.label(
+                                RichText::new(format!("{:.0}%", *progress * 100.0))
+                                    .size(11.5)
+                                    .color(p.muted),
+                            );
+                            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                                if banner_dismiss(ui, &p) {
+                                    actions.push(Action::DismissUpdate);
+                                }
+                            });
+                        }
+                        UpdateStatus::Ready { release, .. } => {
+                            ui.label(
+                                RichText::new(format!(
+                                    "Simion v{} pronto para instalar",
+                                    release.version
+                                ))
+                                .size(13.0)
+                                .color(p.text)
+                                .strong(),
+                            );
+                            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                                if crate::ui::primary_button(ui, "Reiniciar e atualizar", &p)
+                                    .clicked()
+                                {
+                                    actions.push(Action::ApplyUpdate);
+                                }
+                                if banner_dismiss(ui, &p) {
+                                    actions.push(Action::DismissUpdate);
+                                }
+                            });
+                        }
+                        UpdateStatus::Available(release) => {
+                            ui.label(
+                                RichText::new(format!(
+                                    "Nova versão v{} disponível",
+                                    release.version
+                                ))
+                                .size(13.0)
+                                .color(p.text)
+                                .strong(),
+                            );
+                            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                                if crate::ui::primary_button(ui, "Baixar", &p).clicked() {
+                                    actions.push(Action::StartDownload);
+                                }
+                                if banner_dismiss(ui, &p) {
+                                    actions.push(Action::DismissUpdate);
+                                }
+                            });
+                        }
+                        UpdateStatus::Error(err) => {
+                            ui.label(
+                                RichText::new("Falha ao atualizar")
+                                    .size(13.0)
+                                    .color(p.danger)
+                                    .strong(),
+                            );
+                            ui.label(RichText::new(err.clone()).size(11.5).color(p.muted));
+                            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                                if crate::ui::primary_button(ui, "Tentar de novo", &p).clicked() {
+                                    actions.push(Action::CheckUpdates);
+                                }
+                                if banner_dismiss(ui, &p) {
+                                    actions.push(Action::DismissUpdate);
+                                }
+                            });
+                        }
+                        _ => {}
+                    }
+                });
+            });
+    }
+
     fn draw_fatal(&mut self, ui: &mut Ui) {
         let p = self.palette;
         CentralPanel::default_margins()
@@ -1320,6 +1682,7 @@ impl eframe::App for App {
     fn ui(&mut self, ui: &mut Ui, _frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
         self.now = ctx.input(|input| input.time);
+        self.drain_update_messages(&ctx);
 
         if self.fatal.is_some() {
             self.ensure_style(&ctx);
@@ -1352,6 +1715,8 @@ impl eframe::App for App {
                     self.sidebar(ui, &mut actions);
                 });
         }
+
+        self.draw_update_banner(ui, &mut actions);
 
         Panel::bottom("simion-status")
             .exact_size(28.0)
@@ -1407,6 +1772,11 @@ impl eframe::App for App {
     fn clear_color(&self, _visuals: &egui::Visuals) -> [f32; 4] {
         self.palette.bg.to_normalized_gamma_f32()
     }
+}
+
+fn banner_dismiss(ui: &mut Ui, p: &Palette) -> bool {
+    ui.add(Button::new(RichText::new("Depois").size(12.5).color(p.muted)).frame(false))
+        .clicked()
 }
 
 fn slugify(title: &str) -> String {

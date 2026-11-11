@@ -105,7 +105,7 @@ impl App {
         widgets::section_label(ui, "Páginas", &p);
 
         let avail = ui.available_height();
-        let footer_space = 78.0;
+        let footer_space = 100.0;
         let list_height = (avail - footer_space).max(80.0);
         ScrollArea::vertical()
             .auto_shrink([false, false])
@@ -148,6 +148,15 @@ impl App {
             version.on_hover_text(
                 "Banco de dados local em SQLite.\nSuas anotações nunca saem deste computador.",
             );
+
+            let check = ui.small_button(
+                RichText::new("Verificar atualizações")
+                    .size(10.5)
+                    .color(p.faint),
+            );
+            if check.clicked() {
+                actions.push(Action::CheckUpdates);
+            }
 
             ui.add_space(2.0);
             let shortcuts = action_row(
