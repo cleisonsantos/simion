@@ -18,6 +18,7 @@ png = { version = "0.18", default-features = false }
 rusqlite = { version = "0.40.2", features = ["bundled", "functions"] }
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.154"
+syntect = { version = "5.3.0", default-features = false, features = ["default-fancy", "regex-fancy", "parsing", "html", "plist-load", "yaml-load", "dump-load"] }
 ureq = { version = "3.5.1", features = ["json"] }
 
 [profile.release]

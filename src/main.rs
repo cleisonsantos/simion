@@ -10,6 +10,7 @@ mod overlays;
 mod search;
 mod sidebar;
 mod store;
+mod syntax;
 mod theme;
 mod ui;
 mod updater;

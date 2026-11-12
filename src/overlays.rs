@@ -8,6 +8,7 @@ use eframe::egui::{
 use crate::app::{Action, App, Focus, PendingFocus};
 use crate::markdown;
 use crate::model::{Block, BlockKind};
+use crate::syntax;
 use crate::theme::{FONT_BODY, FONT_MEDIUM, FONT_MONO, FONT_SEMIBOLD, GUTTER, Palette, family};
 use crate::ui as widgets;
 
@@ -22,6 +23,7 @@ impl App {
         let mut actions = Vec::new();
         actions.extend(self.search_overlay(ctx));
         self.block_menu_overlay(ctx, &mut actions);
+        self.code_lang_overlay(ctx, &mut actions);
         self.page_menu_overlay(ctx, &mut actions);
         self.emoji_overlay(ctx, &mut actions);
         self.slash_overlay(ctx);
@@ -336,6 +338,173 @@ impl App {
         } else if close || self.outside_click(ctx, area.response.rect) {
             self.block_menu = None;
             self.block_menu_transform = false;
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Code block language
+    // -----------------------------------------------------------------------
+
+    pub(crate) fn open_code_lang_menu(&mut self, id: u64, pos: Pos2) {
+        let current = self
+            .index_of(id)
+            .map(|index| syntax::normalize(&self.page.blocks[index].lang))
+            .unwrap_or("plain");
+        self.code_lang_menu = Some((id, pos));
+        self.code_lang_query.clear();
+        self.code_lang_selected = syntax::LANGS
+            .iter()
+            .position(|(lang, _)| *lang == current)
+            .unwrap_or(0);
+        self.code_lang_focus = true;
+    }
+
+    /// Stores the chosen language (undoable) and hands focus back to the block.
+    pub(crate) fn apply_code_lang(&mut self, id: u64, lang: &str) {
+        self.code_lang_menu = None;
+        let Some(index) = self.index_of(id) else {
+            return;
+        };
+        self.begin_change();
+        let block = &mut self.page.blocks[index];
+        block.lang = syntax::canonical(lang);
+        let caret = block.text.chars().count();
+        self.end_change();
+        self.close_code_lang_menu(id, caret);
+    }
+
+    fn close_code_lang_menu(&mut self, id: u64, caret: usize) {
+        self.code_lang_menu = None;
+        self.code_lang_query.clear();
+        self.pending = Some(PendingFocus {
+            target: Focus::Block(id),
+            range: Some((caret, caret)),
+            select_all: false,
+        });
+    }
+
+    fn cancel_code_lang_menu(&mut self) {
+        let Some((id, _)) = self.code_lang_menu else {
+            return;
+        };
+        match self.index_of(id) {
+            Some(index) => {
+                let caret = self.cursors.get(&id).map_or_else(
+                    || self.page.blocks[index].text.chars().count(),
+                    |cursor| cursor.0,
+                );
+                self.close_code_lang_menu(id, caret);
+            }
+            None => self.code_lang_menu = None,
+        }
+    }
+
+    pub fn code_lang_keys(&mut self, ctx: &Context) {
+        let Some((id, _)) = self.code_lang_menu else {
+            return;
+        };
+        if self.consume_pub(ctx, egui::Key::Escape, egui::Modifiers::NONE) {
+            self.cancel_code_lang_menu();
+            return;
+        }
+        let items = code_lang_items(&self.code_lang_query);
+        if items.is_empty() {
+            return;
+        }
+        if self.consume_pub(ctx, egui::Key::ArrowDown, egui::Modifiers::NONE) {
+            self.code_lang_selected = (self.code_lang_selected + 1).min(items.len() - 1);
+            return;
+        }
+        if self.consume_pub(ctx, egui::Key::ArrowUp, egui::Modifiers::NONE) {
+            self.code_lang_selected = self.code_lang_selected.saturating_sub(1);
+            return;
+        }
+        if self.consume_pub(ctx, egui::Key::Enter, egui::Modifiers::NONE) {
+            let (lang, _) = items[self.code_lang_selected.min(items.len() - 1)];
+            self.apply_code_lang(id, lang);
+        }
+    }
+
+    fn code_lang_overlay(&mut self, ctx: &Context, actions: &mut Vec<Action>) {
+        let Some((id, pos)) = self.code_lang_menu else {
+            return;
+        };
+        let Some(index) = self.index_of(id) else {
+            self.code_lang_menu = None;
+            return;
+        };
+        let current = syntax::normalize(&self.page.blocks[index].lang);
+        let p = self.palette;
+        let pos = menu_pos(ctx, pos, 232.0, 340.0);
+        let focus = std::mem::take(&mut self.code_lang_focus);
+        let mut query = self.code_lang_query.clone();
+        let items = code_lang_items(&query);
+        let mut selected = self.code_lang_selected.min(items.len().saturating_sub(1));
+
+        let area = egui::Area::new(Id::unique("simion-code-lang"))
+            .order(Order::Foreground)
+            .fixed_pos(pos)
+            .show(ctx, |ui| {
+                widgets::popup_frame(&p)
+                    .inner_margin(Margin::same(5))
+                    .show(ui, |ui| {
+                        ui.set_width(222.0);
+                        let search = ui.add(
+                            egui::TextEdit::singleline(&mut query)
+                                .hint_text("Buscar linguagem…")
+                                .desired_width(f32::INFINITY),
+                        );
+                        if focus {
+                            search.request_focus();
+                        }
+                        ui.add_space(4.0);
+                        ScrollArea::vertical()
+                            .max_height(280.0)
+                            .auto_shrink([false, true])
+                            .show(ui, |ui| {
+                                if items.is_empty() {
+                                    ui.add_space(8.0);
+                                    ui.label(
+                                        RichText::new("Nenhuma linguagem")
+                                            .size(12.5)
+                                            .color(p.faint),
+                                    );
+                                    ui.add_space(8.0);
+                                }
+                                for (index, (lang, label)) in items.iter().enumerate() {
+                                    let row = widgets::menu_row(
+                                        ui,
+                                        label,
+                                        (*lang == current).then_some("✓"),
+                                        false,
+                                        index == selected,
+                                        &p,
+                                    );
+                                    if index == selected && (focus || row.hovered()) {
+                                        row.scroll_to_me(None);
+                                    }
+                                    if row.hovered()
+                                        && ui.input(|i| i.pointer.delta() != vec2(0.0, 0.0))
+                                    {
+                                        selected = index;
+                                    }
+                                    if row.clicked() {
+                                        actions.push(Action::SetBlockLang(id, (*lang).to_owned()));
+                                    }
+                                }
+                            });
+                    });
+            });
+
+        if query != self.code_lang_query {
+            self.code_lang_query = query;
+            selected = 0;
+        }
+        self.code_lang_selected = selected;
+        // A click elsewhere keeps its own focus target; only Esc returns to the block.
+        if self.outside_click(ctx, area.response.rect) {
+            self.code_lang_menu = None;
+            self.code_lang_query.clear();
         }
     }
 
@@ -883,6 +1052,15 @@ pub fn slash_items(query: &str) -> Vec<BlockKind> {
                 || fold(kind.markdown_hint()).contains(&needle)
                 || fold(kind.keywords()).contains(&needle)
         })
+        .collect()
+}
+
+pub fn code_lang_items(query: &str) -> Vec<(&'static str, &'static str)> {
+    let query = fold(query.trim());
+    syntax::LANGS
+        .iter()
+        .filter(|(lang, label)| fold(label).contains(&query) || fold(lang).contains(&query))
+        .copied()
         .collect()
 }
 

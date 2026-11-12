@@ -76,6 +76,8 @@ pub enum Action {
     InsertBelow(u64),
     OpenBlockMenu(u64, Pos2),
     Transform(u64, BlockKind),
+    OpenCodeLangMenu(u64, Pos2),
+    SetBlockLang(u64, String),
     DuplicateBlock(u64),
     DeleteBlock(u64),
     MoveBlock(u64, i32),
@@ -117,6 +119,11 @@ pub struct App {
     pub slash: Option<SlashState>,
     pub block_menu: Option<(u64, Pos2)>,
     pub block_menu_transform: bool,
+    /// Language picker of a code block: (block id, anchor).
+    pub code_lang_menu: Option<(u64, Pos2)>,
+    pub code_lang_query: String,
+    pub code_lang_selected: usize,
+    pub code_lang_focus: bool,
     pub page_menu: Option<(PageId, Pos2)>,
     pub emoji_picker: Option<Pos2>,
 
@@ -223,6 +230,10 @@ impl App {
             slash: None,
             block_menu: None,
             block_menu_transform: false,
+            code_lang_menu: None,
+            code_lang_query: String::new(),
+            code_lang_selected: 0,
+            code_lang_focus: false,
             page_menu: None,
             emoji_picker: None,
             sidebar_visible: true,
@@ -421,6 +432,7 @@ impl App {
         self.block_selection = None;
         self.slash = None;
         self.block_menu = None;
+        self.code_lang_menu = None;
         self.page_menu = None;
         self.emoji_picker = None;
         self.focus = Focus::None;
@@ -1171,6 +1183,14 @@ impl App {
                     });
                 }
             }
+            Action::OpenCodeLangMenu(id, pos) => {
+                self.open_code_lang_menu(id, pos);
+                self.block_menu = None;
+                self.page_menu = None;
+                self.emoji_picker = None;
+                self.popup_guard = self.now + 0.2;
+            }
+            Action::SetBlockLang(id, lang) => self.apply_code_lang(id, &lang),
             Action::DuplicateBlock(id) => {
                 if let Some(index) = self.index_of(id) {
                     self.begin_change();
@@ -1262,6 +1282,7 @@ impl App {
         self.search_recent();
         self.page_menu = None;
         self.block_menu = None;
+        self.code_lang_menu = None;
         self.emoji_picker = None;
     }
 
@@ -1331,6 +1352,10 @@ impl App {
         }
         if self.slash.is_some() {
             self.slash_keys(ctx);
+            return;
+        }
+        if self.code_lang_menu.is_some() {
+            self.code_lang_keys(ctx);
             return;
         }
         if self.block_menu.is_some() || self.page_menu.is_some() || self.emoji_picker.is_some() {
@@ -1412,7 +1437,22 @@ impl App {
 
         self.editor_keys(ctx);
     }
+}
 
+/// O clipboard do Windows 11 (Edge/Word/Notepad) entrega `CF_HTML` *e* texto
+/// simples; o egui só lê o texto simples. Então decidimos aqui: texto vindo com
+/// quebras de linha (documento) ou Markdown de uma linha (título, item) vira
+/// blocos. Texto corrido de uma linha — endereço copiado do navegador — fica
+/// inline, como no Notion.
+pub(crate) fn should_parse_paste(text: &str) -> bool {
+    let text = text.trim();
+    if text.is_empty() {
+        return false;
+    }
+    text.contains('\n') || crate::markdown::looks_like_markdown(text)
+}
+
+impl App {
     fn handle_paste(&mut self, ctx: &Context) {
         if self.plain_paste_pending {
             if self.now > self.plain_paste_until {
@@ -1436,6 +1476,7 @@ impl App {
             || self.shortcuts_open
             || self.markdown_open
             || self.block_menu.is_some()
+            || self.code_lang_menu.is_some()
             || self.page_menu.is_some()
             || self.emoji_picker.is_some()
             || self.slash.is_some()
@@ -1447,16 +1488,27 @@ impl App {
             return;
         };
         let mut pasted: Option<String> = None;
+        ctx.input(|input| {
+            for event in &input.events {
+                if let egui::Event::Paste(text) = event {
+                    if !input.modifiers.shift && should_parse_paste(text) {
+                        pasted = Some(text.clone());
+                    }
+                }
+            }
+        });
         ctx.input_mut(|input| {
             let mut kept = Vec::with_capacity(input.events.len());
             for event in std::mem::take(&mut input.events) {
-                if let egui::Event::Paste(text) = &event {
-                    if markdown::looks_like_markdown(text) && !input.modifiers.shift {
-                        pasted = Some(text.clone());
-                        continue;
+                let keep = match &event {
+                    egui::Event::Paste(text) => {
+                        !(pasted.as_deref() == Some(text.as_str()) && !input.modifiers.shift)
                     }
+                    _ => true,
+                };
+                if keep {
+                    kept.push(event);
                 }
-                kept.push(event);
             }
             input.events = kept;
         });

@@ -1,5 +1,6 @@
 //! The block editor: title, blocks, inline formatting and the gutter handles.
 
+use std::ops::Range;
 use std::sync::Arc;
 
 use eframe::egui::{
@@ -14,6 +15,7 @@ use crate::app::{Action, App, Focus, PendingFocus};
 use crate::icons;
 use crate::markdown::{self, InlineLayout};
 use crate::model::BlockKind;
+use crate::syntax;
 use crate::theme::{
     FONT_BODY, FONT_ITALIC, FONT_MEDIUM, FONT_MONO, FONT_SEMIBOLD, FONT_SEMIBOLD_ITALIC, GUTTER,
     INDENT_WIDTH, MAX_CONTENT_WIDTH, Palette, family,
@@ -518,11 +520,14 @@ impl App {
         let mut toggle_todo = false;
 
         let base_family_owned = base_family.to_owned();
+        let code_lang = lang.clone();
         let mut layouter = move |ui: &Ui, buf: &dyn TextBuffer, wrap: f32| -> Arc<egui::Galley> {
             let source = buf.as_str();
             let job = if is_code {
-                plain_job(
+                let spans = syntax::highlight(source, &code_lang, &p);
+                code_job(
                     source,
+                    &spans,
                     FontId::new(base_size, family(FONT_MONO)),
                     p.text,
                     wrap,
@@ -817,8 +822,47 @@ impl App {
             let _ = response.on_hover_text("Copiar código");
         }
 
+        // Language picker, left of the copy button.
+        let lang_menu_here = self.code_lang_menu.is_some_and(|(menu, _)| menu == id);
+        if is_code && (self.hover_block == Some(id) || lang_menu_here) {
+            let galley = ui.painter().layout_no_wrap(
+                format!("{} ▾", lang_label(&lang)),
+                FontId::new(11.5 * zoom, family(FONT_BODY)),
+                p.muted,
+            );
+            let width = galley.size().x + 14.0;
+            let button_rect = Rect::from_min_size(
+                pos2(te_rect.right() - 34.0 - width, te_rect.top() + 8.0),
+                vec2(width, 22.0),
+            );
+            let response = ui.interact(
+                button_rect,
+                Id::unique(("simion-code-lang", id)),
+                Sense::click(),
+            );
+            if response.hovered() || lang_menu_here {
+                ui.painter().rect_filled(button_rect, 5, p.active);
+                ui.ctx().set_cursor_icon(CursorIcon::PointingHand);
+            }
+            ui.painter().galley(
+                pos2(
+                    button_rect.left() + 7.0,
+                    button_rect.center().y - galley.size().y / 2.0,
+                ),
+                galley,
+                p.muted,
+            );
+            if response.clicked() {
+                actions.push(Action::OpenCodeLangMenu(
+                    id,
+                    pos2(button_rect.left(), button_rect.bottom() + 4.0),
+                ));
+            }
+            let _ = response.on_hover_text("Linguagem");
+        }
+
         // Keep a recognizable language tag for code visually.
-        if is_code && !lang.is_empty() && self.hover_block != Some(id) {
+        if is_code && !lang.is_empty() && self.hover_block != Some(id) && !lang_menu_here {
             let rect = Rect::from_min_size(
                 pos2(te_rect.right() - 12.0, te_rect.bottom() - 2.0),
                 vec2(0.0, 0.0),
@@ -826,7 +870,7 @@ impl App {
             ui.painter().text(
                 rect.left_top() - vec2(0.0, 18.0),
                 Align2::RIGHT_TOP,
-                &lang,
+                lang_label(&lang),
                 FontId::new(10.5 * zoom, family(FONT_MONO)),
                 p.faint,
             );
@@ -1655,6 +1699,57 @@ fn hint_for(kind: BlockKind) -> &'static str {
         BlockKind::Code => "Código",
         BlockKind::Divider => "",
     }
+}
+
+/// Label for a block's language: the pretty name, or the stored name when the
+/// language is unknown (e.g. `mermaid` pasted from Markdown).
+pub fn lang_label(lang: &str) -> &str {
+    if syntax::normalize(lang) == "plain" && !syntax::canonical(lang).is_empty() {
+        lang
+    } else {
+        syntax::label(lang)
+    }
+}
+
+/// Code text with one section per highlighted span. Falls back to a single
+/// color if the spans do not cover the text exactly.
+fn code_job(
+    text: &str,
+    spans: &[(Range<usize>, Color32)],
+    font: FontId,
+    color: Color32,
+    wrap: f32,
+    line_height: f32,
+) -> LayoutJob {
+    let covers = spans.first().is_some_and(|(range, _)| range.start == 0)
+        && spans
+            .last()
+            .is_some_and(|(range, _)| range.end == text.len())
+        && spans
+            .windows(2)
+            .all(|pair| pair[0].0.end == pair[1].0.start)
+        && spans.iter().all(|(range, _)| {
+            text.is_char_boundary(range.start) && text.is_char_boundary(range.end)
+        });
+    if !covers {
+        return plain_job(text, font, color, wrap, line_height);
+    }
+    let mut job = plain_job(text, font, color, wrap, line_height);
+    let Some(base) = job.sections.first().map(|section| section.format.clone()) else {
+        return job;
+    };
+    job.sections = spans
+        .iter()
+        .map(|(range, color)| LayoutSection {
+            leading_space: 0.0,
+            byte_range: ByteIndex(range.start)..ByteIndex(range.end),
+            format: TextFormat {
+                color: *color,
+                ..base.clone()
+            },
+        })
+        .collect();
+    job
 }
 
 fn plain_job(text: &str, font: FontId, color: Color32, wrap: f32, line_height: f32) -> LayoutJob {
