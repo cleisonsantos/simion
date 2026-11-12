@@ -111,6 +111,8 @@ pub struct App {
     pub block_heights: HashMap<u64, f32>,
     pub block_rects: HashMap<u64, Rect>,
     pub hover_block: Option<u64>,
+    /// Blocks selected with Shift+↑/↓: (anchor, extent) block ids.
+    pub block_selection: Option<(u64, u64)>,
 
     pub slash: Option<SlashState>,
     pub block_menu: Option<(u64, Pos2)>,
@@ -215,6 +217,7 @@ impl App {
             block_heights: HashMap::new(),
             block_rects: HashMap::new(),
             hover_block: None,
+            block_selection: None,
             slash: None,
             block_menu: None,
             block_menu_transform: false,
@@ -411,6 +414,7 @@ impl App {
         self.block_rects.clear();
         self.cursors.clear();
         self.hover_block = None;
+        self.block_selection = None;
         self.slash = None;
         self.block_menu = None;
         self.page_menu = None;
@@ -1265,12 +1269,26 @@ impl App {
         self.consume_key(ctx, key, modifiers)
     }
 
+    /// Consumes one press of `key` made with exactly `modifiers`.
+    ///
+    /// Matches the modifiers carried by the key event itself, not the
+    /// modifier state at the end of the frame: when a whole chord (Shift down,
+    /// Tab, Shift up) lands in one frame, the frame state is already "no
+    /// modifiers" and Shift+Tab would be taken for Tab.
     pub fn consume_key(&self, ctx: &Context, key: Key, modifiers: Modifiers) -> bool {
-        let pressed = ctx.input(|input| input.modifiers);
-        if !pressed.matches_exact(modifiers) {
-            return false;
-        }
-        ctx.input_mut(|input| input.consume_key(modifiers, key))
+        ctx.input_mut(|input| {
+            let position = input.events.iter().position(|event| {
+                matches!(
+                    event,
+                    egui::Event::Key { key: k, pressed: true, modifiers: m, .. }
+                        if *k == key && m.matches_exact(modifiers)
+                )
+            });
+            position.is_some_and(|position| {
+                input.events.remove(position);
+                true
+            })
+        })
     }
 
     fn handle_keys(&mut self, ctx: &Context) {

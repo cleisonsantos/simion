@@ -79,6 +79,15 @@ impl App {
         let start = slash.start.min(chars.len());
         let prefix: String = chars[..start].iter().collect();
         let prefix = prefix.trim_end().to_owned();
+        let caret = prefix.chars().count();
+        // Keep whatever followed "/query" (the menu opens at the caret).
+        let end = (start + 1 + slash.query.chars().count()).min(chars.len());
+        let suffix: String = chars[end..].iter().collect();
+        let prefix = if prefix.is_empty() {
+            suffix.trim_start().to_owned()
+        } else {
+            prefix + &suffix
+        };
 
         self.begin_change();
         let id = {
@@ -116,7 +125,6 @@ impl App {
             });
             self.scroll_to = Some(new_id);
         } else {
-            let caret = self.page.blocks[index].text.chars().count();
             self.focus = Focus::Block(id);
             self.pending = Some(PendingFocus {
                 target: Focus::Block(id),
