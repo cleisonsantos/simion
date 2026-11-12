@@ -68,7 +68,6 @@
             ConfigurableDirectory="INSTALLFOLDER"
             AllowAbsent="no"
             Display="expand">
-            <ComponentRef Id="ApplicationShortcut"/>
             <ComponentRef Id="MainExecutable"/>
             <ComponentRef Id="ReadmeFile"/>
             <ComponentRef Id="LicenseFile"/>
@@ -87,13 +86,30 @@
                           DiskId="1"
                           Source="$(var.CargoTargetBinDir)\simion.exe"
                           KeyPath="yes">
+                        <!--
+                          Os dois atalhos ficam NÃO-ANUNCIADOS de propósito (#7).
+
+                          O shell monta o ícone do atalho a partir do próprio
+                          simion.exe, que já embute os recursos de ícone. Um
+                          atalho anunciado aponta para o ProductCode da feature
+                          e, junto com Icon= apontando para o .ico cru da tabela
+                          Icon, deixa o atalho sem ícone: para atalhos a
+                          Microsoft exige um binário EXE com a mesma extensão do
+                          alvo, o que o .ico não é.
+
+                          Os atalhos estão aninhados no <File> de propósito: o
+                          WiX grava Target="[!SimionExe]" na tabela Shortcut
+                          (caminho completo do executável instalado). O atributo
+                          Target explícito NÃO pode ser usado aqui — o WiX 6
+                          aborta com IllegalAttributeWhenNested; aninhado no
+                          <File>, o alvo padrão já é o próprio arquivo.
+                        -->
                         <Shortcut Id="DesktopShortcut"
                                   Directory="DesktopFolder"
                                   Name="Simion"
                                   Description="Caderno de blocos local"
                                   WorkingDirectory="INSTALLFOLDER"
-                                  Icon="ProductICO"
-                                  Advertise="yes">
+                                  Advertise="no">
                             <!-- Liga o atalho ao processo (mesmo ID que
                                  SetCurrentProcessExplicitAppUserModelID usa). Sem
                                  isso o shell nao associa atalho <-> executavel e
@@ -102,7 +118,24 @@
                                               Key="System.AppUserModel.ID"
                                               Value="com.cleisonsantos.simion"/>
                         </Shortcut>
+                        <Shortcut Id="ApplicationStartMenuShortcut"
+                                  Directory="ApplicationProgramsFolder"
+                                  Name="Simion"
+                                  Description="Caderno de blocos local"
+                                  WorkingDirectory="INSTALLFOLDER"
+                                  Advertise="no">
+                            <!-- Ver comentario do DesktopShortcut: mesmo AppUserModel.ID. -->
+                            <ShortcutProperty Id="StartMenuShortcutAUMID"
+                                              Key="System.AppUserModel.ID"
+                                              Value="com.cleisonsantos.simion"/>
+                        </Shortcut>
                     </File>
+                    <!-- Remove a pasta do Menu Iniciar no uninstall, se ficar
+                         vazia. Fica no componente do executavel: o atalho do
+                         Menu Iniciar tambem vive aqui agora (#7). -->
+                    <RemoveFolder Id="CleanUpShortcutFolder"
+                                  Directory="ApplicationProgramsFolder"
+                                  On="uninstall"/>
                 </Component>
 
                 <Component Id="ReadmeFile" Guid="*">
@@ -124,37 +157,13 @@
         </StandardDirectory>
 
         <!--
-          Atalho do Menu Iniciar (#1). Fica em ProgramMenuFolder\Simion e usa
-          `Advertise="yes"` apontando para a feature Main, o que garante o
-          reparo automático do atalho se ele for apagado.
+          Pasta do Menu Iniciar (#1): ProgramMenuFolder\Simion. Só a pasta é
+          declarada aqui — o atalho que mora nela é um Shortcut aninhado no
+          <File Id="SimionExe"> do componente MainExecutable (#7). Não existe
+          mais um componente `ApplicationShortcut`.
         -->
         <StandardDirectory Id="ProgramMenuFolder">
             <Directory Id="ApplicationProgramsFolder" Name="Simion"/>
         </StandardDirectory>
-
-        <Component Id="ApplicationShortcut"
-                   Guid="*"
-                   Directory="ApplicationProgramsFolder">
-            <Shortcut Id="ApplicationStartMenuShortcut"
-                      Name="Simion"
-                      Description="Caderno de blocos local"
-                      Icon="ProductICO"
-                      Advertise="yes">
-                <!-- Ver comentario do DesktopShortcut: mesmo AppUserModel.ID. -->
-                <ShortcutProperty Id="StartMenuShortcutAUMID"
-                                  Key="System.AppUserModel.ID"
-                                  Value="com.cleisonsantos.simion"/>
-            </Shortcut>
-            <!-- Remove a pasta do Menu Iniciar no uninstall, se ficar vazia. -->
-            <RemoveFolder Id="CleanUpShortcutFolder"
-                          Directory="ApplicationProgramsFolder"
-                          On="uninstall"/>
-            <RegistryValue Root="HKCU"
-                           Key="Software\Simion"
-                           Name="StartMenuShortcut"
-                           Type="integer"
-                           Value="1"
-                           KeyPath="yes"/>
-        </Component>
     </Package>
 </Wix>
