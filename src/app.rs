@@ -2,6 +2,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::sync::mpsc::{self, TryRecvError};
 use std::time::{Duration, Instant};
 
@@ -112,6 +113,12 @@ pub struct App {
     pub block_rows: HashMap<u64, usize>,
     pub block_heights: HashMap<u64, f32>,
     pub block_rects: HashMap<u64, Rect>,
+    /// Last laid-out text of each visible block and where it was drawn
+    /// (screen space), for ↑/↓ by visual row.
+    pub block_galleys: HashMap<u64, (Arc<egui::Galley>, Pos2)>,
+    pub title_galley: Option<(Arc<egui::Galley>, Pos2)>,
+    /// Caret of the title field: (primary, secondary) char indices.
+    pub title_cursor: Option<(usize, usize)>,
     pub hover_block: Option<u64>,
     /// Blocks selected with Shift+↑/↓: (anchor, extent) block ids.
     pub block_selection: Option<(u64, u64)>,
@@ -201,8 +208,37 @@ impl App {
     pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
         theme::install_fonts(&cc.egui_ctx);
 
+        let mut app = Self::blank();
+
+        // Estado de interface que nao vive no SQLite (issue #6). O tema fica
+        // de fora de proposito: ele ja persiste na tabela `settings` e e
+        // restaurado em `boot`, e duplicar criaria duas fontes de verdade.
+        if let Some(storage) = cc.storage {
+            let zoom: Option<f32> = eframe::get_value(storage, "simion_zoom");
+            app.zoom = zoom.unwrap_or(1.0).clamp(0.75, 1.6);
+            app.sidebar_visible =
+                eframe::get_value(storage, "simion_sidebar_visible").unwrap_or(true);
+        }
+
+        match Store::open_default() {
+            Ok(store) => {
+                app.store = Some(store);
+                app.boot();
+            }
+            Err(err) => {
+                app.fatal = Some(format!("{err:#}"));
+            }
+        }
+        if app.fatal.is_none() {
+            app.init_updater(&cc.egui_ctx);
+        }
+        app
+    }
+
+    /// App state with no store and a placeholder page.
+    pub(crate) fn blank() -> Self {
         let mode = Mode::Light;
-        let mut app = Self {
+        Self {
             store: None,
             fatal: None,
             now: 0.0,
@@ -225,6 +261,9 @@ impl App {
             block_rows: HashMap::new(),
             block_heights: HashMap::new(),
             block_rects: HashMap::new(),
+            block_galleys: HashMap::new(),
+            title_galley: None,
+            title_cursor: None,
             hover_block: None,
             block_selection: None,
             slash: None,
@@ -262,31 +301,7 @@ impl App {
             window_title: String::new(),
             plain_paste_pending: false,
             plain_paste_until: 0.0,
-        };
-
-        // Estado de interface que nao vive no SQLite (issue #6). O tema fica
-        // de fora de proposito: ele ja persiste na tabela `settings` e e
-        // restaurado em `boot`, e duplicar criaria duas fontes de verdade.
-        if let Some(storage) = cc.storage {
-            let zoom: Option<f32> = eframe::get_value(storage, "simion_zoom");
-            app.zoom = zoom.unwrap_or(1.0).clamp(0.75, 1.6);
-            app.sidebar_visible =
-                eframe::get_value(storage, "simion_sidebar_visible").unwrap_or(true);
         }
-
-        match Store::open_default() {
-            Ok(store) => {
-                app.store = Some(store);
-                app.boot();
-            }
-            Err(err) => {
-                app.fatal = Some(format!("{err:#}"));
-            }
-        }
-        if app.fatal.is_none() {
-            app.init_updater(&cc.egui_ctx);
-        }
-        app
     }
 
     fn boot(&mut self) {
@@ -333,6 +348,26 @@ impl App {
 
     pub fn index_of(&self, id: u64) -> Option<usize> {
         self.page.blocks.iter().position(|block| block.id == id)
+    }
+
+    /// Inserts a copy of the block right below it and puts the caret there.
+    pub fn duplicate_block(&mut self, id: u64) {
+        let Some(index) = self.index_of(id) else {
+            return;
+        };
+        self.begin_change();
+        let mut copy = self.page.blocks[index].clone();
+        copy.id = self.ids.next();
+        let copy_id = copy.id;
+        self.page.blocks.insert(index + 1, copy);
+        self.end_change();
+        self.focus = Focus::Block(copy_id);
+        self.pending = Some(PendingFocus {
+            target: Focus::Block(copy_id),
+            range: Some((0, 0)),
+            select_all: false,
+        });
+        self.scroll_to = Some(copy_id);
     }
 
     pub fn meta_of(&self, id: PageId) -> Option<&PageMeta> {
@@ -398,6 +433,7 @@ impl App {
             self.theme_applied = Some(key);
             self.block_heights.clear();
             self.block_rows.clear();
+            self.block_galleys.clear();
         }
     }
 
@@ -427,6 +463,7 @@ impl App {
         self.block_heights.clear();
         self.block_rows.clear();
         self.block_rects.clear();
+        self.block_galleys.clear();
         self.cursors.clear();
         self.hover_block = None;
         self.block_selection = None;
@@ -877,6 +914,7 @@ impl App {
         self.block_heights.clear();
         self.block_rows.clear();
         self.block_rects.clear();
+        self.block_galleys.clear();
         self.cursors.clear();
         if let Focus::Block(id) = self.focus {
             if self.index_of(id).is_none() {
@@ -1192,20 +1230,8 @@ impl App {
             }
             Action::SetBlockLang(id, lang) => self.apply_code_lang(id, &lang),
             Action::DuplicateBlock(id) => {
-                if let Some(index) = self.index_of(id) {
-                    self.begin_change();
-                    let mut copy = self.page.blocks[index].clone();
-                    copy.id = self.ids.next();
-                    self.page.blocks.insert(index + 1, copy.clone());
-                    self.end_change();
-                    self.block_menu = None;
-                    self.pending = Some(PendingFocus {
-                        target: Focus::Block(copy.id),
-                        range: Some((0, 0)),
-                        select_all: false,
-                    });
-                    self.scroll_to = Some(copy.id);
-                }
+                self.duplicate_block(id);
+                self.block_menu = None;
             }
             Action::DeleteBlock(id) => {
                 if let Some(index) = self.index_of(id) {
