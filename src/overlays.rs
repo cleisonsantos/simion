@@ -565,6 +565,7 @@ impl App {
                             ("Ctrl E", "Código inline"),
                             ("Ctrl ⇧ S", "Riscado"),
                             ("Ctrl ⇧ K", "Inserir link"),
+                            ("Ctrl ⇧ V", "Colar sem formatar"),
                         ],
                         &p,
                     );
