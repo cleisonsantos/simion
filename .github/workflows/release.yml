@@ -74,11 +74,42 @@ jobs:
         shell: bash
         run: bash packaging/make-tarball.sh "${{ steps.version.outputs.version }}"
 
+      - name: Smoke do instalador (tarball)
+        shell: bash
+        run: |
+          sh -n packaging/install-tarball.sh
+          bash packaging/ci-install-smoke.sh \
+            "dist/simion_${{ steps.version.outputs.version }}_linux_x86_64.tar.xz"
+
       - uses: actions/upload-artifact@v4
         with:
           name: linux
           path: dist/*
           if-no-files-found: error
+
+  instalador-arch:
+    # O relato da #27 veio do CachyOS: roda o mesmo smoke num Arch de verdade,
+    # com o tarball do artifact (não da release). Não publica nada.
+    name: Instalador no Arch Linux
+    needs: [linux]
+    runs-on: ubuntu-latest
+    container: archlinux:latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Dependências
+        run: pacman -Syu --noconfirm --needed tar xz coreutils bash
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: linux
+          path: dist
+
+      - name: Smoke do instalador
+        shell: bash
+        run: |
+          tarball="$(ls dist/simion_*_linux_x86_64.tar.xz | head -n1)"
+          bash packaging/ci-install-smoke.sh "$tarball"
 
   windows:
     name: Windows (MSI, zip)
@@ -251,7 +282,7 @@ jobs:
   release:
     name: GitHub Release
     if: startsWith(github.ref, 'refs/tags/')
-    needs: [linux, windows, macos]
+    needs: [linux, instalador-arch, windows, macos]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/download-artifact@v4
@@ -276,7 +307,8 @@ jobs:
             - **Windows**: baixe `Simion-Setup-<versao>-x64.msi` e de **duplo clique**
               (nao existe `setup.exe`: o instalador e o `.msi`).
             - **macOS**: `Simion-<versao>-universal.dmg`.
-            - **Linux**: `.AppImage`, `.deb` ou `.rpm`.
+            - **Linux**: `.AppImage`, `.deb`, `.rpm` ou `.tar.xz` portátil (extraia e rode
+              `./install.sh` de dentro da pasta). No Arch/CachyOS use o AppImage ou o `.tar.xz`.
 
             As builds nao sao assinadas (`#5`), entao o SmartScreen/Gatekeeper pode pedir confirmacao.
           files: dist/*
