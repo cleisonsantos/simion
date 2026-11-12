@@ -670,11 +670,14 @@ pub fn parse_blocks(markdown: &str, merge_paragraphs: bool) -> Vec<BlockDraft> {
     let lines: Vec<&str> = normalized.split('\n').collect();
     let mut out: Vec<BlockDraft> = Vec::new();
     let mut i = 0;
+    // A blank line ends the paragraph: the next plain line starts a new one.
+    let mut after_blank = false;
 
     while i < lines.len() {
         let line = lines[i];
         let (indent, content) = split_indent(line);
         let content_trimmed = content.trim_end();
+        let blank_before = std::mem::take(&mut after_blank);
 
         // Fenced code.
         if content_trimmed.starts_with("```") || content_trimmed.starts_with("~~~") {
@@ -714,6 +717,7 @@ pub fn parse_blocks(markdown: &str, merge_paragraphs: bool) -> Vec<BlockDraft> {
         }
 
         if content_trimmed.trim().is_empty() {
+            after_blank = true;
             i += 1;
             continue;
         }
@@ -781,7 +785,7 @@ pub fn parse_blocks(markdown: &str, merge_paragraphs: bool) -> Vec<BlockDraft> {
         let text = content_trimmed.trim().to_string();
         i += 1;
 
-        if merge_paragraphs {
+        if merge_paragraphs && !blank_before {
             if let Some(last) = out.last_mut() {
                 if last.kind == BlockKind::Paragraph && last.indent == indent && !hard_break {
                     if !text.is_empty() {
@@ -1054,6 +1058,13 @@ mod tests {
         let (text, sel) = toggle_wrap(&text, sel, "**");
         assert_eq!(text, "palavra");
         assert_eq!(sel, (0, 7));
+    }
+
+    #[test]
+    fn blank_line_separates_paragraphs() {
+        let drafts = parse_blocks("um\ndois\n\ntres\n\n\nquatro\n", true);
+        let texts: Vec<&str> = drafts.iter().map(|d| d.text.as_str()).collect();
+        assert_eq!(texts, ["um dois", "tres", "quatro"]);
     }
 
     #[test]
