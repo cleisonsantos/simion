@@ -169,7 +169,9 @@ jobs:
 
   macos:
     name: macOS (DMG universal)
-    runs-on: macos-14
+    # macOS 14 foi aposentado em 02/11/2026; macos-15 ainda é arm64 e roda o
+    # build universal (x86_64 + aarch64) com o mesmo lipo.
+    runs-on: macos-15
     steps:
       - uses: actions/checkout@v4
 
