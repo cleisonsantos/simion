@@ -133,6 +133,8 @@ pub struct App {
     pub reset_scroll: bool,
     pub file_hover: bool,
     pub window_title: String,
+    pub plain_paste_pending: bool,
+    pub plain_paste_until: f64,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -244,6 +246,8 @@ impl App {
             reset_scroll: true,
             file_hover: false,
             window_title: String::new(),
+            plain_paste_pending: false,
+            plain_paste_until: 0.0,
         };
 
         // Estado de interface que nao vive no SQLite (issue #6). O tema fica
@@ -1274,6 +1278,15 @@ impl App {
     }
 
     fn handle_keys(&mut self, ctx: &Context) {
+        // Ctrl+Shift+V: pede o clipboard ao eframe e marca o proximo
+        // `Event::Paste` para passar direto ao `TextEdit` focado, sem o
+        // parser de Markdown.
+        if self.consume(ctx, Key::V, Modifiers::COMMAND | Modifiers::SHIFT) {
+            self.plain_paste_pending = true;
+            self.plain_paste_until = self.now + 1.0;
+            ctx.send_viewport_cmd(ViewportCommand::RequestPaste);
+            return;
+        }
         if self.confirm_delete.is_some() {
             if self.consume(ctx, Key::Escape, Modifiers::NONE) {
                 self.confirm_delete = None;
@@ -1383,6 +1396,24 @@ impl App {
     }
 
     fn handle_paste(&mut self, ctx: &Context) {
+        if self.plain_paste_pending {
+            if self.now > self.plain_paste_until {
+                self.plain_paste_pending = false;
+            } else {
+                let has_paste = ctx.input(|input| {
+                    input
+                        .events
+                        .iter()
+                        .any(|event| matches!(event, egui::Event::Paste(_)))
+                });
+                if has_paste {
+                    self.plain_paste_pending = false;
+                    // Deixa o TextEdit focado receber o Event::Paste: e o
+                    // "colar sem formatar", sem passar pelo parser de Markdown.
+                    return;
+                }
+            }
+        }
         let overlays_open = self.search.open
             || self.shortcuts_open
             || self.markdown_open
