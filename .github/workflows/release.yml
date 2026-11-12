@@ -161,6 +161,43 @@ jobs:
           }
           Write-Host "Icone do produto e AppUserModelID presentes no MSI."
 
+      - name: Instalar MSI e validar atalho
+        shell: pwsh
+        run: |
+          $msi = (Resolve-Path "dist\Simion-Setup-${{ steps.version.outputs.version }}-x64.msi").Path
+          $log = Join-Path $env:RUNNER_TEMP "simion-install.log"
+          $proc = Start-Process msiexec.exe -ArgumentList @('/i', "`"$msi`"", '/qn', '/norestart', '/l*v', "`"$log`"") -Wait -PassThru
+          if ($proc.ExitCode -ne 0 -and $proc.ExitCode -ne 3010) {
+            Get-Content $log -Tail 200
+            throw "MSI install failed: $($proc.ExitCode)"
+          }
+          $exe = Join-Path $env:ProgramFiles 'Simion\simion.exe'
+          if (-not (Test-Path $exe)) { throw "simion.exe nao instalado em $exe" }
+
+          $shortcuts = @(
+            (Join-Path ([Environment]::GetFolderPath('CommonDesktopDirectory')) 'Simion.lnk'),
+            (Join-Path $env:ProgramData 'Microsoft\Windows\Start Menu\Programs\Simion\Simion.lnk')
+          )
+          $shell = New-Object -ComObject WScript.Shell
+          foreach ($lnkPath in $shortcuts) {
+            if (-not (Test-Path $lnkPath)) { throw "atalho ausente: $lnkPath" }
+            $lnk = $shell.CreateShortcut($lnkPath)
+            Write-Host "Atalho: $lnkPath"
+            Write-Host "  TargetPath: $($lnk.TargetPath)"
+            Write-Host "  IconLocation: $($lnk.IconLocation)"
+            if ($lnk.TargetPath -ne $exe) {
+              throw "atalho nao aponta para simion.exe: $($lnk.TargetPath)"
+            }
+          }
+
+          Add-Type -AssemblyName System.Drawing
+          $icon = [System.Drawing.Icon]::ExtractAssociatedIcon($exe)
+          if ($null -eq $icon) { throw "simion.exe sem icone extraivel" }
+          $bmp = $icon.ToBitmap()
+          $center = $bmp.GetPixel([int]($bmp.Width / 2), [int]($bmp.Height / 2))
+          Write-Host "Icone extraido: $($bmp.Width)x$($bmp.Height), alpha centro=$($center.A)"
+          if ($center.A -eq 0) { throw "icone do simion.exe saiu transparente no centro" }
+
       - uses: actions/upload-artifact@v4
         with:
           name: windows
