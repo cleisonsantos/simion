@@ -120,6 +120,7 @@ simion --update         # baixa e aplica a atualização, se houver
 | `Ctrl+B` / `Ctrl+I` / `Ctrl+E` | Negrito / itálico / código inline |
 | `Ctrl+Shift+S` | Riscado |
 | `Ctrl+Shift+K` | Inserir link (`[texto](url)`) |
+| `Ctrl+Shift+V` | Colar sem formatar (texto puro, sem converter Markdown) |
 | `Ctrl+Alt+1/2/3` | Transformar em título 1/2/3 |
 | `Ctrl+Alt+0` | Voltar a texto |
 | `Tab` / `Shift+Tab` | Aumentar / diminuir recuo |
