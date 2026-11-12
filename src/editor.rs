@@ -329,6 +329,11 @@ impl App {
         ui.spacing_mut().item_spacing.y = 0.0;
         self.hover_block = None;
 
+        // Any click in the editor drops the block selection.
+        if self.block_selection.is_some() && ui.input(|input| input.pointer.any_pressed()) {
+            self.block_selection = None;
+        }
+
         let count = self.page.blocks.len();
         let mut index = 0;
         let mut any_changed = false;
@@ -365,10 +370,22 @@ impl App {
                 continue;
             }
 
+            let selection_shape = ui.painter().add(Shape::Noop);
             let outcome = self.block_row(ui, index, text_width, column_left, actions);
+            if self.block_selected(index) {
+                let rect = Rect::from_min_max(
+                    pos2(column_left, outcome.rect.top()),
+                    pos2(column_left + text_width, outcome.rect.bottom()),
+                );
+                ui.painter().set(
+                    selection_shape,
+                    Shape::rect_filled(rect, 4, self.palette.hover),
+                );
+            }
             if outcome.changed {
                 any_changed = true;
-                self.after_text_change(index, actions);
+                let caret = outcome.cursor.map(|(a, b)| a.max(b));
+                self.after_text_change(index, caret, actions);
             }
             if outcome.focused {
                 self.focus = Focus::Block(id);
@@ -646,6 +663,35 @@ impl App {
 
             te_id = Id::unique(("simion-block", id));
             let available = ui.available_width().max(40.0);
+            // Pending focus / selection for this block. Applied before the
+            // text field runs so keys typed in this same frame land at the
+            // new caret instead of being moved by it afterwards.
+            let pending_here = self
+                .pending
+                .as_ref()
+                .is_some_and(|pending| pending.target == Focus::Block(id));
+            if pending_here {
+                let chars = new_text.chars().count();
+                let pending = self.pending.take().unwrap_or_default();
+                let (start, end) = pending.range.unwrap_or((chars, chars));
+                ui.memory_mut(|memory| memory.request_focus(te_id));
+                let mut state = TextEditState::load(ui.ctx(), te_id).unwrap_or_default();
+                state.cursor.set_char_range(Some(CCursorRange::two(
+                    CCursor::new(start.min(chars)),
+                    CCursor::new(end.min(chars)),
+                )));
+                state.store(ui.ctx(), te_id);
+                focused = true;
+            }
+
+            // Tab presses `block_keys` did not take (an overlay was open) must
+            // not insert "\t" either.
+            if ui.memory(|memory| memory.has_focus(te_id)) {
+                while self.consume_key(ui.ctx(), Key::Tab, Modifiers::NONE)
+                    || self.consume_key(ui.ctx(), Key::Tab, Modifiers::SHIFT)
+                {}
+            }
+
             let te = TextEdit::multiline(&mut new_text)
                 .id(te_id)
                 .font(FontId::new(base_size, family(base_family)))
@@ -657,7 +703,10 @@ impl App {
                     bottom: margin_bottom,
                 }))
                 .desired_width(available)
-                .desired_rows(1);
+                .desired_rows(1)
+                // Tab indents the block (see `block_keys`); without the lock
+                // egui would move keyboard focus to the next widget.
+                .lock_focus(true);
 
             let te = if let Some(hint) = hint {
                 te.hint_text(RichText::new(hint).font(hint_font.clone()).color(p.faint))
@@ -697,25 +746,6 @@ impl App {
                         }
                     }
                 }
-            }
-
-            // Pending focus / selection for this block.
-            let pending_here = self
-                .pending
-                .as_ref()
-                .is_some_and(|pending| pending.target == Focus::Block(id));
-            if pending_here {
-                let chars = new_text.chars().count();
-                let pending = self.pending.take().unwrap_or_default();
-                let (start, end) = pending.range.unwrap_or((chars, chars));
-                output.response.request_focus();
-                let mut state = TextEditState::load(ui.ctx(), te_id).unwrap_or_default();
-                state.cursor.set_char_range(Some(CCursorRange::two(
-                    CCursor::new(start.min(chars)),
-                    CCursor::new(end.min(chars)),
-                )));
-                state.store(ui.ctx(), te_id);
-                focused = true;
             }
         });
 
@@ -938,20 +968,27 @@ impl App {
     // Text change side effects: markdown shortcuts and the slash menu
     // -----------------------------------------------------------------------
 
-    fn after_text_change(&mut self, index: usize, actions: &mut Vec<Action>) {
+    fn after_text_change(&mut self, index: usize, caret: Option<usize>, actions: &mut Vec<Action>) {
         let Some(block) = self.page.blocks.get(index) else {
             return;
         };
         let id = block.id;
         let text = block.text.clone();
         let kind = block.kind;
-        // Markdown block shortcuts ("# ", "- ", "```" …).
-        if let Some((new_kind, prefix_chars)) = markdown::shortcut_for(&text) {
-            if kind == BlockKind::Paragraph || kind == BlockKind::Bullet {
+        let caret = caret.unwrap_or_else(|| text.chars().count());
+        // Markdown block shortcuts ("# ", "- ", "```" …), typed at the start
+        // of the block. Text after the caret is kept, like in Notion.
+        if let Some((new_kind, prefix_chars)) = markdown::shortcut_for_before_caret(&text, caret) {
+            let rest: String = text.chars().skip(prefix_chars).collect();
+            let applies = kind.accepts_text()
+                && kind != BlockKind::Code
+                && kind != new_kind
+                && (new_kind != BlockKind::Divider || rest.is_empty());
+            if applies {
                 self.begin_change();
                 if let Some(block) = self.page.blocks.get_mut(index) {
                     block.kind = new_kind;
-                    block.text.clear();
+                    block.text = rest;
                     if new_kind == BlockKind::Todo {
                         block.checked = false;
                     }
@@ -960,13 +997,11 @@ impl App {
                     }
                 }
                 self.end_change();
-                let caret = 0;
                 self.pending = Some(PendingFocus {
                     target: Focus::Block(id),
-                    range: Some((caret, caret)),
+                    range: Some((0, 0)),
                     select_all: false,
                 });
-                let _ = prefix_chars;
                 if new_kind == BlockKind::Divider {
                     let new_id = self.ids.next();
                     self.begin_change();
@@ -980,29 +1015,28 @@ impl App {
                         range: Some((0, 0)),
                         select_all: false,
                     });
-                    self.scroll_to = Some(new_id);
+                    // The divider has no text field; the caret goes below it.
+                    actions.push(Action::FocusBlock {
+                        id: new_id,
+                        range: (0, 0),
+                    });
+                    return;
                 }
                 actions.push(Action::FocusBlock { id, range: (0, 0) });
                 return;
             }
         }
 
-        // Slash menu: only when the query sits at the end of the block.
-        let chars: Vec<char> = text.chars().collect();
-        if let Some(pos) = chars.iter().rposition(|c| *c == '/') {
-            let before_ok = pos == 0 || chars[pos - 1].is_whitespace();
-            let query: String = chars[pos + 1..].iter().collect();
-            let query_ok = !query.chars().any(char::is_whitespace) && query.chars().count() <= 24;
-            if before_ok && query_ok {
-                self.slash = Some(crate::app::SlashState {
-                    block: id,
-                    start: pos,
-                    query,
-                    selected: 0,
-                });
-                self.popup_guard = self.now + 0.2;
-                return;
-            }
+        // Slash menu: only for a "/" at a word boundary right before the caret.
+        if let Some((start, query)) = markdown::slash_query_before_caret(&text, caret) {
+            self.slash = Some(crate::app::SlashState {
+                block: id,
+                start,
+                query,
+                selected: 0,
+            });
+            self.popup_guard = self.now + 0.2;
+            return;
         }
         if self.slash.as_ref().is_some_and(|slash| slash.block == id) {
             self.slash = None;
@@ -1014,6 +1048,9 @@ impl App {
     // -----------------------------------------------------------------------
 
     pub fn editor_keys(&mut self, ctx: &egui::Context) {
+        if self.block_selection.is_some() && self.selection_keys(ctx) {
+            return;
+        }
         if self.consume_pub(ctx, Key::Escape, Modifiers::NONE) {
             if let Focus::Block(id) = self.focus {
                 ctx.memory_mut(|memory| memory.surrender_focus(Id::unique(("simion-block", id))));
@@ -1108,6 +1145,22 @@ impl App {
             self.adjust_indent(id, -1);
             return;
         }
+        // Shift+↑/↓ selects this block when no text is selected, or when the
+        // text selection already reaches the start / end of the block. The
+        // range comes from the text field's own state, not `self.cursors`.
+        let text_selection = self.cursor_range_for(ctx, id).filter(|(a, b)| a != b);
+        if text_selection.is_none_or(|(start, _)| start == 0)
+            && self.consume_pub(ctx, Key::ArrowUp, Modifiers::SHIFT)
+        {
+            self.start_block_selection(ctx, id);
+            return;
+        }
+        if text_selection.is_none_or(|(_, end)| end >= text_len)
+            && self.consume_pub(ctx, Key::ArrowDown, Modifiers::SHIFT)
+        {
+            self.start_block_selection(ctx, id);
+            return;
+        }
         if self.consume_pub(ctx, Key::ArrowUp, Modifiers::ALT) {
             self.move_block(id, -1);
             return;
@@ -1118,10 +1171,18 @@ impl App {
         }
 
         if kind != BlockKind::Code && self.consume_pub(ctx, Key::Enter, Modifiers::NONE) {
-            if text_len == 0 && (kind.is_list() || kind.is_heading()) {
+            let indent = self.page.blocks[index].indent;
+            if text_len == 0 && kind.is_list() && indent > 0 {
+                // Notion first moves an empty nested item one level out.
+                self.adjust_indent(id, -1);
+            } else if text_len == 0 && (kind.is_list() || kind == BlockKind::Quote) {
+                // An empty list item (or quote) leaves the list. An empty
+                // heading stays and a paragraph opens below it.
                 self.transform_block(id, BlockKind::Paragraph);
+            } else if !has_selection && caret == 0 && text_len > 0 {
+                self.insert_block_above(id);
             } else {
-                self.split_block(id, caret);
+                self.split_block(id, (selection_start, selection_end));
             }
             return;
         }
@@ -1205,22 +1266,24 @@ impl App {
         });
     }
 
-    fn split_block(&mut self, id: u64, caret: usize) {
+    /// Enter: the text before the selection stays, the text after it moves
+    /// to a new block below. Lists continue the list; anything else (headings
+    /// included) continues as a paragraph at the same indent.
+    fn split_block(&mut self, id: u64, (start, end): (usize, usize)) {
         let Some(index) = self.index_of(id) else {
             return;
         };
         let kind = self.page.blocks[index].kind;
         let indent = self.page.blocks[index].indent;
-        let checked = self.page.blocks[index].checked;
         let text = self.page.blocks[index].text.clone();
-        let caret = caret.min(text.chars().count());
-        let byte = markdown::char_to_byte(&text, caret);
-        let left = text[..byte].to_owned();
-        let right = text[byte..].to_owned();
+        let chars = text.chars().count();
+        let left = text[..markdown::char_to_byte(&text, start.min(end).min(chars))].to_owned();
+        let right = text[markdown::char_to_byte(&text, start.max(end).min(chars))..].to_owned();
 
-        let (new_kind, new_indent) = match kind {
-            BlockKind::Bullet | BlockKind::Numbered | BlockKind::Todo => (kind, indent),
-            _ => (BlockKind::Paragraph, 0),
+        let new_kind = if kind.is_list() {
+            kind
+        } else {
+            BlockKind::Paragraph
         };
 
         self.begin_change();
@@ -1228,11 +1291,8 @@ impl App {
         let new_id = self.ids.next();
         let mut block = crate::model::Block::new(new_id, new_kind);
         block.text = right;
-        block.indent = new_indent;
+        block.indent = indent;
         block.checked = false;
-        if kind == BlockKind::Todo && checked {
-            block.checked = false;
-        }
         self.page.blocks.insert(index + 1, block);
         self.end_change();
         self.focus = Focus::Block(new_id);
@@ -1244,6 +1304,32 @@ impl App {
         self.scroll_to = Some(new_id);
     }
 
+    /// Enter at the very start of a non-empty block: Notion pushes the block
+    /// down, leaving an empty one above, and the caret stays with the text.
+    fn insert_block_above(&mut self, id: u64) {
+        let Some(index) = self.index_of(id) else {
+            return;
+        };
+        let kind = self.page.blocks[index].kind;
+        let new_kind = if kind.is_list() {
+            kind
+        } else {
+            BlockKind::Paragraph
+        };
+        self.begin_change();
+        let mut block = crate::model::Block::new(self.ids.next(), new_kind);
+        block.indent = self.page.blocks[index].indent;
+        self.page.blocks.insert(index, block);
+        self.end_change();
+        self.focus = Focus::Block(id);
+        self.pending = Some(PendingFocus {
+            target: Focus::Block(id),
+            range: Some((0, 0)),
+            select_all: false,
+        });
+        self.scroll_to = Some(id);
+    }
+
     fn backspace_block(&mut self, id: u64) {
         let Some(index) = self.index_of(id) else {
             return;
@@ -1251,16 +1337,17 @@ impl App {
         let indent = self.page.blocks[index].indent;
         let kind = self.page.blocks[index].kind;
 
+        // Notion's order: outdent, then drop the block type, then merge.
         if indent > 0 {
             self.adjust_indent(id, -1);
             return;
         }
-        if kind != BlockKind::Paragraph
-            && !matches!(
-                kind,
-                BlockKind::Quote | BlockKind::Callout | BlockKind::Code
-            )
-        {
+        if kind != BlockKind::Paragraph {
+            // A code block with content keeps its type (its text is not
+            // prose that should flow into the previous block).
+            if kind == BlockKind::Code && !self.page.blocks[index].text.is_empty() {
+                return;
+            }
             self.transform_block(id, BlockKind::Paragraph);
             return;
         }
@@ -1363,11 +1450,13 @@ impl App {
         if !kind.is_list() {
             block.indent = 0;
         }
-        let caret = block.text.chars().count();
+        // Keep the caret where it was (Backspace at the start stays at 0).
+        let chars = block.text.chars().count();
+        let (a, b) = self.cursors.get(&id).copied().unwrap_or((chars, chars));
         self.end_change();
         self.pending = Some(PendingFocus {
             target: Focus::Block(id),
-            range: Some((caret, caret)),
+            range: Some((a.min(chars), b.min(chars))),
             select_all: false,
         });
     }
@@ -1413,6 +1502,124 @@ impl App {
         self.scroll_to = Some(id);
     }
 
+    // -----------------------------------------------------------------------
+    // Block selection (Shift+↑/↓)
+    // -----------------------------------------------------------------------
+
+    fn start_block_selection(&mut self, ctx: &egui::Context, id: u64) {
+        // The text field lets go of the keyboard so typing does not edit a
+        // block while several are selected.
+        ctx.memory_mut(|memory| memory.surrender_focus(Id::unique(("simion-block", id))));
+        self.focus = Focus::None;
+        self.pending = None;
+        self.slash = None;
+        self.block_selection = Some((id, id));
+    }
+
+    /// Index range (inclusive) of the selected blocks, if the selection is
+    /// still valid for the current page.
+    pub fn block_selection_range(&self) -> Option<(usize, usize)> {
+        let (anchor, extent) = self.block_selection?;
+        let a = self.index_of(anchor)?;
+        let b = self.index_of(extent)?;
+        Some((a.min(b), a.max(b)))
+    }
+
+    fn block_selected(&self, index: usize) -> bool {
+        self.block_selection_range()
+            .is_some_and(|(lo, hi)| lo <= index && index <= hi)
+    }
+
+    /// Keys while blocks are selected. Returns true when the key was handled.
+    fn selection_keys(&mut self, ctx: &egui::Context) -> bool {
+        let Some((anchor, extent)) = self.block_selection else {
+            return false;
+        };
+        let Some(extent_index) = self.index_of(extent) else {
+            self.block_selection = None;
+            return false;
+        };
+        if self.index_of(anchor).is_none() {
+            self.block_selection = None;
+            return false;
+        }
+        if self.consume_pub(ctx, Key::Escape, Modifiers::NONE) {
+            self.block_selection = None;
+            return true;
+        }
+        if self.consume_pub(ctx, Key::Backspace, Modifiers::NONE)
+            || self.consume_pub(ctx, Key::Delete, Modifiers::NONE)
+        {
+            self.delete_block_selection();
+            return true;
+        }
+        for (key, delta) in [(Key::ArrowUp, -1i32), (Key::ArrowDown, 1)] {
+            if self.consume_pub(ctx, key, Modifiers::SHIFT) {
+                let next = (extent_index as i32 + delta).clamp(0, self.page.blocks.len() as i32 - 1)
+                    as usize;
+                let next_id = self.page.blocks[next].id;
+                self.block_selection = Some((anchor, next_id));
+                self.scroll_to = Some(next_id);
+                return true;
+            }
+            if self.consume_pub(ctx, key, Modifiers::NONE) {
+                // Plain arrows leave the selection and put the caret back.
+                self.block_selection = None;
+                if self.page.blocks[extent_index].kind.accepts_text() {
+                    let caret = if delta < 0 {
+                        0
+                    } else {
+                        self.page.blocks[extent_index].text.chars().count()
+                    };
+                    self.focus = Focus::Block(extent);
+                    self.pending = Some(PendingFocus {
+                        target: Focus::Block(extent),
+                        range: Some((caret, caret)),
+                        select_all: false,
+                    });
+                }
+                return true;
+            }
+        }
+        false
+    }
+
+    fn delete_block_selection(&mut self) {
+        let Some((lo, hi)) = self.block_selection_range() else {
+            self.block_selection = None;
+            return;
+        };
+        self.block_selection = None;
+        self.begin_change();
+        self.page.blocks.drain(lo..=hi);
+        if self.page.blocks.is_empty() {
+            self.page.blocks.push(crate::model::Block::new(
+                self.ids.next(),
+                BlockKind::Paragraph,
+            ));
+        }
+        self.end_change();
+
+        // Caret at the end of the block above the hole, else at the start of
+        // the block below it.
+        let above = lo
+            .checked_sub(1)
+            .filter(|i| self.page.blocks[*i].kind.accepts_text())
+            .map(|i| (i, self.page.blocks[i].text.chars().count()));
+        let below = (lo < self.page.blocks.len() && self.page.blocks[lo].kind.accepts_text())
+            .then_some((lo, 0));
+        if let Some((index, caret)) = above.or(below) {
+            let id = self.page.blocks[index].id;
+            self.focus = Focus::Block(id);
+            self.pending = Some(PendingFocus {
+                target: Focus::Block(id),
+                range: Some((caret, caret)),
+                select_all: false,
+            });
+            self.scroll_to = Some(id);
+        }
+    }
+
     fn cursor_range_for(&self, ctx: &egui::Context, id: u64) -> Option<(usize, usize)> {
         let te_id = Id::unique(("simion-block", id));
         let state = TextEditState::load(ctx, te_id)?;
@@ -1423,11 +1630,7 @@ impl App {
     }
 
     pub fn consume_pub(&self, ctx: &egui::Context, key: Key, modifiers: Modifiers) -> bool {
-        let pressed = ctx.input(|input| input.modifiers);
-        if !pressed.matches_exact(modifiers) {
-            return false;
-        }
-        ctx.input_mut(|input| input.consume_key(modifiers, key))
+        self.consume_key(ctx, key, modifiers)
     }
 }
 

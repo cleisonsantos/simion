@@ -897,33 +897,61 @@ pub fn page_markdown(title: &str, blocks: &[Block]) -> String {
 // Block-kind shortcuts
 // ---------------------------------------------------------------------------
 
+/// Prefixes that turn a block into another kind, longest first so that
+/// "### " wins over "## " and "# ".
+const SHORTCUTS: [(&str, BlockKind); 14] = [
+    ("### ", BlockKind::Heading3),
+    ("## ", BlockKind::Heading2),
+    ("# ", BlockKind::Heading1),
+    ("- [ ] ", BlockKind::Todo),
+    ("- [x] ", BlockKind::Todo),
+    ("[ ] ", BlockKind::Todo),
+    ("[] ", BlockKind::Todo),
+    ("- ", BlockKind::Bullet),
+    ("* ", BlockKind::Bullet),
+    ("+ ", BlockKind::Bullet),
+    ("1. ", BlockKind::Numbered),
+    ("> ", BlockKind::Quote),
+    ("```", BlockKind::Code),
+    ("---", BlockKind::Divider),
+];
+
 /// Detects markdown shortcuts while typing ("# ", "- ", "```" …).
 /// Returns the new kind and how many characters to strip from the start.
 pub fn shortcut_for(text: &str) -> Option<(BlockKind, usize)> {
-    let candidates: [(&str, BlockKind); 14] = [
-        ("### ", BlockKind::Heading3),
-        ("## ", BlockKind::Heading2),
-        ("# ", BlockKind::Heading1),
-        ("- [ ] ", BlockKind::Todo),
-        ("- [x] ", BlockKind::Todo),
-        ("[ ] ", BlockKind::Todo),
-        ("[] ", BlockKind::Todo),
-        ("- ", BlockKind::Bullet),
-        ("* ", BlockKind::Bullet),
-        ("+ ", BlockKind::Bullet),
-        ("1. ", BlockKind::Numbered),
-        ("> ", BlockKind::Quote),
-        ("```", BlockKind::Code),
-        ("---", BlockKind::Divider),
-    ];
-    for (prefix, kind) in candidates {
-        // Shortcuts that end in a space only trigger once the space is typed;
-        // "```" and "---" trigger as soon as they are complete.
-        if text == prefix {
-            return Some((kind, prefix.chars().count()));
-        }
+    // Shortcuts that end in a space only trigger once the space is typed;
+    // "```" and "---" trigger as soon as they are complete.
+    SHORTCUTS
+        .iter()
+        .find(|(prefix, _)| text == *prefix)
+        .map(|(prefix, kind)| (*kind, prefix.chars().count()))
+}
+
+/// Like [`shortcut_for`], but looks only at the text before the caret (a
+/// char index), as Notion does: "# " typed at the start of a block converts
+/// it even when there is text after the cursor. The text before the caret
+/// must be exactly the prefix.
+pub fn shortcut_for_before_caret(text: &str, caret: usize) -> Option<(BlockKind, usize)> {
+    let before = &text[..char_to_byte(text, caret.min(text.chars().count()))];
+    shortcut_for(before)
+}
+
+/// The slash-menu query being typed right before the caret: the char index
+/// of the `/` and the text between it and the caret. The `/` must start the
+/// block or follow whitespace ("e/ou" does not open the menu) and the query
+/// cannot contain whitespace.
+pub fn slash_query_before_caret(text: &str, caret: usize) -> Option<(usize, String)> {
+    let chars: Vec<char> = text.chars().collect();
+    let before = &chars[..caret.min(chars.len())];
+    let pos = before.iter().rposition(|c| *c == '/')?;
+    if pos > 0 && !before[pos - 1].is_whitespace() {
+        return None;
     }
-    None
+    let query = &before[pos + 1..];
+    if query.iter().any(|c| c.is_whitespace()) || query.len() > 24 {
+        return None;
+    }
+    Some((pos, query.iter().collect()))
 }
 
 #[cfg(test)]
@@ -1067,5 +1095,51 @@ mod tests {
             let c = byte_to_char(text, i);
             assert_eq!(char_to_byte(text, c), i);
         }
+    }
+
+    #[test]
+    fn shortcut_before_caret_matches_prefix_only_at_start() {
+        assert_eq!(
+            shortcut_for_before_caret("## ", 3),
+            Some((BlockKind::Heading2, 3))
+        );
+        assert_eq!(
+            shortcut_for_before_caret("## abc", 3),
+            Some((BlockKind::Heading2, 3))
+        );
+        assert_eq!(
+            shortcut_for_before_caret("### ", 4),
+            Some((BlockKind::Heading3, 4))
+        );
+        assert_eq!(
+            shortcut_for_before_caret("- [ ] ", 6),
+            Some((BlockKind::Todo, 6))
+        );
+        assert_eq!(shortcut_for_before_caret("x## ", 4), None);
+        assert_eq!(shortcut_for_before_caret("#", 1), None);
+        // The caret past the prefix means the shortcut was not just typed.
+        assert_eq!(shortcut_for_before_caret("# abc", 5), None);
+        assert_eq!(shortcut_for_before_caret("é# ", 99), None);
+    }
+
+    #[test]
+    fn slash_query_needs_word_boundary() {
+        assert_eq!(slash_query_before_caret("/", 1), Some((0, String::new())));
+        assert_eq!(
+            slash_query_before_caret("texto /tit", 10),
+            Some((6, "tit".to_owned()))
+        );
+        assert_eq!(
+            slash_query_before_caret("linha\n/h", 8),
+            Some((6, "h".to_owned()))
+        );
+        assert_eq!(slash_query_before_caret("e/ou", 4), None);
+        assert_eq!(slash_query_before_caret("e/", 2), None);
+        assert_eq!(slash_query_before_caret("/a b", 4), None);
+        // Text after the caret does not matter.
+        assert_eq!(
+            slash_query_before_caret("/h resto", 2),
+            Some((0, "h".to_owned()))
+        );
     }
 }
