@@ -495,28 +495,32 @@ impl BlockDraft {
     }
 }
 
-/// Heuristic: should a pasted string be turned into blocks?
+/// Heuristic: should a pasted string become blocks instead of landing as plain
+/// text in the focused block? Mirrors Notion: any Markdown-ish content becomes
+/// blocks, even a single heading line.
+#[allow(dead_code)]
 pub fn looks_like_markdown(text: &str) -> bool {
     let text = text.trim();
     if text.is_empty() {
         return false;
     }
-    if !text.contains('\n') {
-        return false;
-    }
-    if text.contains("\n\n") {
+    if text.contains('\n') {
         return true;
     }
-    text.lines()
-        .any(|line| line_starts_a_block(line.trim_start()))
+    line_starts_a_block(text) || parse_block_line(text).is_some()
 }
 
 fn line_starts_a_block(line: &str) -> bool {
     let line = line.trim_start();
-    if line.starts_with("# ")
-        || line.starts_with("## ")
-        || line.starts_with("### ")
-        || line.starts_with("- ")
+    let hashes = line.chars().take_while(|&c| c == '#').count();
+    if (1..=6).contains(&hashes) {
+        let rest = &line[hashes..];
+        // "# Titulo", "## Titulo" ou o que o Notion escreve ao copiar: "## Titulo ##".
+        if rest.starts_with(' ') && !rest.trim().is_empty() {
+            return true;
+        }
+    }
+    if line.starts_with("- ")
         || line.starts_with("* ")
         || line.starts_with("+ ")
         || line.starts_with("> ")
@@ -533,6 +537,21 @@ fn line_starts_a_block(line: &str) -> bool {
     }
     let digits = line.chars().take_while(char::is_ascii_digit).count();
     digits > 0 && (line[digits..].starts_with(". ") || line[digits..].starts_with(") "))
+}
+
+/// Fecha o formato ATX no estilo do Notion: qualquer `#` sobrando no fim de um
+/// título é marcador, não conteúdo (`## Titulo ##` -> `Titulo`).
+fn strip_closing_hashes(text: &str) -> &str {
+    let trimmed = text.trim_end();
+    let without = trimmed.trim_end_matches('#');
+    if without.len() == trimmed.len() {
+        return trimmed;
+    }
+    if without.is_empty() || without.ends_with(' ') {
+        without.trim_end()
+    } else {
+        trimmed
+    }
 }
 
 fn split_indent(line: &str) -> (u8, &str) {
@@ -627,7 +646,10 @@ fn parse_block_line(line: &str) -> Option<(BlockKind, String)> {
             2 => BlockKind::Heading2,
             _ => BlockKind::Heading3,
         };
-        return Some((kind, content[hashes..].trim_start().to_string()));
+        return Some((
+            kind,
+            strip_closing_hashes(content[hashes..].trim_start()).to_string(),
+        ));
     }
     let divider = content.trim();
     if divider.len() >= 3
@@ -662,7 +684,7 @@ pub fn parse_blocks(markdown: &str, merge_paragraphs: bool) -> Vec<BlockDraft> {
                 .take_while(|&c| c == fence)
                 .count()
                 .max(3);
-            let lang = content_trimmed[fence_len..].trim().to_string();
+            let lang = crate::syntax::canonical(&content_trimmed[fence_len..]);
             let mut code = String::new();
             i += 1;
             while i < lines.len() {
@@ -864,7 +886,10 @@ pub fn to_markdown(blocks: &[Block]) -> String {
                 } else {
                     "```"
                 };
-                out.push_str(&format!("{indent}{fence}{}\n", block.lang));
+                out.push_str(&format!(
+                    "{indent}{fence}{}\n",
+                    crate::syntax::canonical(&block.lang)
+                ));
                 out.push_str(&block.text);
                 out.push('\n');
                 out.push_str(&format!("{indent}{fence}\n"));
@@ -1076,6 +1101,16 @@ mod tests {
     }
 
     #[test]
+    fn code_language_roundtrip() {
+        let mut code = block(1, BlockKind::Code, "let x = 1;");
+        code.lang = "JavaScript".to_owned();
+        let md = to_markdown(&[code]);
+        assert!(md.contains("```javascript\n"));
+        let drafts = parse_blocks("```js\nx\n```", true);
+        assert_eq!(drafts[0].lang, "javascript");
+    }
+
+    #[test]
     fn shortcuts_need_their_trigger() {
         assert!(shortcut_for("-").is_none());
         assert!(shortcut_for("#").is_none());
@@ -1141,5 +1176,47 @@ mod tests {
             slash_query_before_caret("/h resto", 2),
             Some((0, "h".to_owned()))
         );
+    }
+
+    #[test]
+    fn pasted_headings_without_blank_lines_are_markdown() {
+        // Formato que o Notion escreve ao copiar com formatação.
+        let md = "## Titulo 2\nlinha do paragrafo\n### Titulo 3\n- item**negrito**\n- [ ] tarefa";
+        assert!(looks_like_markdown(md));
+        let drafts = parse_blocks(md, true);
+        let kinds: Vec<BlockKind> = drafts.iter().map(|d| d.kind).collect();
+        assert_eq!(
+            kinds,
+            vec![
+                BlockKind::Heading2,
+                BlockKind::Paragraph,
+                BlockKind::Heading3,
+                BlockKind::Bullet,
+                BlockKind::Todo,
+            ]
+        );
+        assert_eq!(drafts[1].text, "linha do paragrafo");
+    }
+
+    #[test]
+    fn closing_hashes_are_markers() {
+        let drafts = parse_blocks("## Titulo ##\n### Outro ###", true);
+        assert_eq!(drafts[0].kind, BlockKind::Heading2);
+        assert_eq!(drafts[0].text, "Titulo");
+        assert_eq!(drafts[1].kind, BlockKind::Heading3);
+        assert_eq!(drafts[1].text, "Outro");
+        // "#" no meio do texto continua sendo conteudo.
+        let drafts = parse_blocks("## C# #top", true);
+        assert_eq!(drafts[0].text, "C# #top");
+        // H4 para cima continua caindo em h3, como o app so tem tres niveis.
+        let drafts = parse_blocks("#### Fundo ####", true);
+        assert_eq!(drafts[0].kind, BlockKind::Heading3);
+        assert_eq!(drafts[0].text, "Fundo");
+    }
+
+    #[test]
+    fn single_line_heading_paste_is_not_a_paragraph() {
+        let drafts = parse_blocks("# Titulo", false);
+        assert_eq!(drafts[0].kind, BlockKind::Heading1);
     }
 }
