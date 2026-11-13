@@ -28,6 +28,8 @@
     <string>10.15</string>
     <key>NSHighResolutionCapable</key>
     <true/>
+    <key>CFBundleGetInfoString</key>
+    <string>Simion — caderno de blocos local, com Markdown, tarefas e SQLite</string>
     <key>NSHumanReadableCopyright</key>
     <string>MIT — Simion contributors</string>
     <key>NSSupportsAutomaticGraphicsSwitching</key>

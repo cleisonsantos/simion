@@ -55,7 +55,7 @@
         <Property Id="ARPPRODUCTICON" Value="ProductICO"/>
         <Property Id="ARPNOREPAIR" Value="1"/>
         <!-- ARPNOMODIFY vem da WixUI_InstallDir: declarar aqui gera WIX0091. -->
-        <Property Id="ARPCOMMENTS" Value="Caderno de blocos local — Markdown, tarefas e SQLite, tudo offline."/>
+        <Property Id="ARPCOMMENTS" Value="Simion — caderno de blocos local. Markdown, tarefas, hierarquia de páginas e SQLite, tudo offline."/>
         <Property Id="ARPHELPLINK" Value="https://github.com/cleisonsantos/simion"/>
         <Property Id="ARPPUBLISHER" Value="Simion"/>
         <SetProperty Id="ARPINSTALLLOCATION" Value="[INSTALLFOLDER]" After="CostFinalize"/>
@@ -63,7 +63,7 @@
         <Feature
             Id="Main"
             Title="Simion"
-            Description="O aplicativo, o atalho do Menu Iniciar e a documentação."
+            Description="Instala o Simion, o atalho do Menu Iniciar/Desktop e a documentação."
             Level="1"
             ConfigurableDirectory="INSTALLFOLDER"
             AllowAbsent="no"
