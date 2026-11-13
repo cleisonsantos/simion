@@ -10,6 +10,7 @@ use eframe::egui::{
 use crate::app::{Action, App};
 use crate::icons;
 use crate::store::SearchHit;
+use crate::text::plural;
 use crate::theme::{FONT_BODY, FONT_SEMIBOLD, Palette, family};
 use crate::ui as widgets;
 
@@ -200,7 +201,7 @@ impl App {
                 ui.label(RichText::new("Enter abrir").size(11.0).color(p.faint));
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     ui.label(
-                        RichText::new(format!("{} resultados", results.len()))
+                        RichText::new(plural(results.len(), "resultado", "resultados"))
                             .size(11.0)
                             .color(p.faint),
                     );
