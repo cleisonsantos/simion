@@ -51,6 +51,7 @@ impl App {
         let full_width = ui.available_width();
         let inner_width = (full_width - 64.0).clamp(280.0, MAX_CONTENT_WIDTH);
         let left = ((full_width - inner_width) / 2.0).max(22.0);
+        let editor_left = ui.cursor().left();
 
         // Page keys move the caret as well as revealing its destination.
         if !self.search.open && self.slash.is_none() && self.code_lang_menu.is_none() {
@@ -76,7 +77,7 @@ impl App {
                 self.page_icon(ui, actions);
                 self.page_title(ui, actions);
                 ui.add_space(6.0);
-                self.blocks(ui, viewport, actions);
+                self.blocks(ui, viewport, editor_left, actions);
             });
         });
     }
@@ -342,7 +343,7 @@ impl App {
         }
     }
 
-    fn blocks(&mut self, ui: &mut Ui, viewport: Rect, actions: &mut Vec<Action>) {
+    fn blocks(&mut self, ui: &mut Ui, viewport: Rect, editor_left: f32, actions: &mut Vec<Action>) {
         let text_width = (ui.available_width()).max(120.0);
         let column_left = ui.cursor().left();
         ui.spacing_mut().item_spacing.y = 0.0;
@@ -390,7 +391,7 @@ impl App {
             }
 
             let selection_shape = ui.painter().add(Shape::Noop);
-            let outcome = self.block_row(ui, index, text_width, column_left, actions);
+            let outcome = self.block_row(ui, index, text_width, column_left, editor_left, actions);
             if self.block_selected(index) {
                 let rect = Rect::from_min_max(
                     pos2(column_left, outcome.rect.top()),
@@ -488,6 +489,7 @@ impl App {
         index: usize,
         text_width: f32,
         column_left: f32,
+        editor_left: f32,
         actions: &mut Vec<Action>,
     ) -> BlockOutcome {
         let p = self.palette;
@@ -825,7 +827,38 @@ impl App {
                 .set(shape_idx, Shape::rect_filled(rect, 2, p.quote_bar));
         }
 
-        self.hover_handles(ui, id, column_left, row_rect, actions);
+        let margin_right = if kind == BlockKind::Todo {
+            marker_rect.left()
+        } else {
+            te_rect.left()
+        };
+        let margin_rect = Rect::from_min_max(
+            pos2(editor_left, row_rect.top()),
+            pos2(margin_right.max(editor_left), row_rect.bottom()),
+        );
+        let margin_response = if margin_rect.width() > 0.0 && margin_rect.height() > 0.0 {
+            Some(ui.interact(
+                margin_rect,
+                Id::unique(("simion-row-margin", id)),
+                Sense::click(),
+            ))
+        } else {
+            None
+        };
+
+        let handle_clicked = self.hover_handles(ui, id, column_left, row_rect, actions);
+        if !handle_clicked
+            && !toggle_todo
+            && margin_response.is_some_and(|response| response.clicked())
+        {
+            self.focus = Focus::Block(id);
+            self.pending = Some(PendingFocus {
+                target: Focus::Block(id),
+                range: Some((0, 0)),
+                select_all: false,
+            });
+            ui.memory_mut(|memory| memory.request_focus(te_id));
+        }
 
         // Copy button for code blocks, on hover.
         if is_code && self.hover_block == Some(id) {
@@ -960,7 +993,7 @@ impl App {
         column_left: f32,
         row_rect: Rect,
         actions: &mut Vec<Action>,
-    ) {
+    ) -> bool {
         let p = self.palette;
         let overlays_open = self.slash.is_some()
             || self.block_menu.is_some()
@@ -971,14 +1004,14 @@ impl App {
             || self.markdown_open
             || self.confirm_delete.is_some();
         if overlays_open {
-            return;
+            return false;
         }
         let zone = Rect::from_min_max(
             pos2(column_left - 46.0, row_rect.top() - 3.0),
             pos2(row_rect.right() + 6.0, row_rect.bottom() + 3.0),
         );
         if !ui.rect_contains_pointer(zone) {
-            return;
+            return false;
         }
         self.hover_block = Some(id);
 
@@ -1011,18 +1044,22 @@ impl App {
             let _ = tip;
         }
 
+        let mut handle_clicked = false;
         if plus.clicked() {
             actions.push(Action::InsertBelow(id));
+            handle_clicked = true;
         }
         if plus.hovered() {
             ui.ctx().set_cursor_icon(CursorIcon::PointingHand);
         }
         if grip.clicked() {
             actions.push(Action::OpenBlockMenu(id, grip_rect.left_bottom()));
+            handle_clicked = true;
         }
         if grip.hovered() {
             ui.ctx().set_cursor_icon(CursorIcon::PointingHand);
         }
+        handle_clicked
     }
 
     fn list_number(&self, index: usize) -> usize {
@@ -2298,6 +2335,7 @@ mod tests {
         app: App,
         ctx: egui::Context,
         copied: Vec<String>,
+        last_actions: Vec<Action>,
     }
 
     impl Harness {
@@ -2319,6 +2357,7 @@ mod tests {
                 app,
                 ctx,
                 copied: Vec::new(),
+                last_actions: Vec::new(),
             };
             harness.idle();
             harness
@@ -2331,12 +2370,13 @@ mod tests {
                 ..Default::default()
             };
             let app = &mut self.app;
+            let mut actions = Vec::new();
             let mut output = self.ctx.run_ui(input, |ui| {
                 let ctx = ui.ctx().clone();
                 app.editor_keys(&ctx);
-                let mut actions = Vec::new();
                 app.editor(ui, &mut actions);
             });
+            self.last_actions = actions;
             // No renderer here: the font atlas updates are dropped on purpose.
             output.textures_delta.clear();
             for command in output.platform_output.commands {
@@ -2369,6 +2409,25 @@ mod tests {
 
         fn type_text(&mut self, text: &str) {
             self.event(Event::Text(text.to_owned()));
+        }
+
+        fn click(&mut self, pos: egui::Pos2) -> Vec<Action> {
+            self.frame(vec![Event::PointerMoved(pos)]);
+            self.frame(vec![Event::PointerButton {
+                pos,
+                button: egui::PointerButton::Primary,
+                pressed: true,
+                modifiers: Modifiers::NONE,
+            }]);
+            self.frame(vec![Event::PointerButton {
+                pos,
+                button: egui::PointerButton::Primary,
+                pressed: false,
+                modifiers: Modifiers::NONE,
+            }]);
+            let actions = std::mem::take(&mut self.last_actions);
+            self.idle();
+            actions
         }
 
         fn id(&self, index: usize) -> u64 {
@@ -2762,5 +2821,109 @@ mod tests {
         assert_eq!(h.texts(), ["alpha", "alpha"]);
         assert_eq!(h.app.page.blocks[1].kind, BlockKind::Bullet);
         assert_eq!(h.app.focus, Focus::Block(h.id(1)));
+    }
+
+    #[test]
+    fn left_margin_click_focuses_block_at_offset_zero() {
+        let mut h = Harness::new(
+            "t",
+            &[
+                (BlockKind::Paragraph, "alpha one"),
+                (BlockKind::Paragraph, "bravo two"),
+            ],
+        );
+        let id1 = h.id(1);
+        let row_rect = h.app.block_rects[&id1];
+        let y = row_rect.center().y;
+
+        // Click in the gutter/margin between column_left and TextEdit.
+        h.click(pos2(row_rect.left() + 10.0, y));
+        assert_eq!(h.app.focus, Focus::Block(id1));
+        h.type_text("Q");
+        assert_eq!(h.texts(), ["alpha one", "Qbravo two"]);
+
+        // Click in the outer left margin (to the left of the hover handles).
+        h.caret_in(0, 2);
+        h.click(pos2(10.0, y));
+        assert_eq!(h.app.focus, Focus::Block(id1));
+        h.type_text("R");
+        assert_eq!(h.texts(), ["alpha one", "RQbravo two"]);
+    }
+
+    #[test]
+    fn clicking_inside_text_keeps_pointer_caret_position() {
+        let mut h = Harness::new(
+            "t",
+            &[
+                (BlockKind::Paragraph, "alpha one"),
+                (BlockKind::Paragraph, "bravo two"),
+            ],
+        );
+        let id1 = h.id(1);
+        let (galley, galley_pos) = h.app.block_galleys[&id1].clone();
+        let x = galley_pos.x + caret_x(&galley, CCursor::new(5));
+        let y = galley_pos.y + galley.rows[0].rect().center().y;
+        h.click(pos2(x, y));
+        assert_eq!(h.app.focus, Focus::Block(id1));
+        h.type_text("Q");
+        assert_eq!(h.texts(), ["alpha one", "bravoQ two"]);
+    }
+
+    #[test]
+    fn clicking_hover_handles_does_not_focus_block_or_move_caret() {
+        let mut h = Harness::new(
+            "t",
+            &[
+                (BlockKind::Paragraph, "alpha one"),
+                (BlockKind::Paragraph, "bravo two"),
+            ],
+        );
+        h.caret_in(0, 3);
+        let id1 = h.id(1);
+        let row_rect = h.app.block_rects[&id1];
+
+        // Click on the grip handle (column_left - 46..26, top + 1..21).
+        let grip_pos = pos2(row_rect.left() - 36.0, row_rect.top() + 10.0);
+        let actions = h.click(grip_pos);
+        assert!(
+            actions
+                .iter()
+                .any(|action| matches!(action, Action::OpenBlockMenu(id, _) if *id == id1)),
+            "expected OpenBlockMenu for block {id1}, got {actions:?}"
+        );
+        assert_eq!(h.app.focus, Focus::Block(h.id(0)));
+
+        // Click on the '+' handle (column_left - 26..6, top + 1..21).
+        let plus_pos = pos2(row_rect.left() - 16.0, row_rect.top() + 10.0);
+        let actions = h.click(plus_pos);
+        assert!(
+            actions
+                .iter()
+                .any(|action| matches!(action, Action::InsertBelow(id) if *id == id1)),
+            "expected InsertBelow for block {id1}, got {actions:?}"
+        );
+        assert_eq!(h.app.focus, Focus::Block(h.id(0)));
+    }
+
+    #[test]
+    fn left_margin_click_clears_block_selection() {
+        let mut h = Harness::new(
+            "t",
+            &[
+                (BlockKind::Paragraph, "alpha one"),
+                (BlockKind::Paragraph, "bravo two"),
+            ],
+        );
+        h.caret_in(0, 1);
+        h.key(Key::Escape, Modifiers::NONE);
+        assert_eq!(h.app.block_selection, Some((h.id(0), h.id(0))));
+
+        let id1 = h.id(1);
+        let row_rect = h.app.block_rects[&id1];
+        h.click(pos2(row_rect.left() + 10.0, row_rect.center().y));
+        assert_eq!(h.app.block_selection, None);
+        assert_eq!(h.app.focus, Focus::Block(id1));
+        h.type_text("Q");
+        assert_eq!(h.texts(), ["alpha one", "Qbravo two"]);
     }
 }
