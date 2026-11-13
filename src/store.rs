@@ -349,6 +349,60 @@ impl Store {
         })
     }
 
+    /// Move `id` para ficar filha de `new_parent` (None = raiz), na posicao `index`
+    /// (0 = primeiro) entre os irmaos de destino. `index` maior que o numero de
+    /// irmaos e tratado como "no fim".
+    pub fn move_page(
+        &mut self,
+        id: PageId,
+        new_parent: Option<PageId>,
+        index: usize,
+    ) -> Result<()> {
+        let tx = self.conn.transaction()?;
+        let Some(old_parent) = page_parent(&tx, id)? else {
+            anyhow::bail!("pagina {id} nao existe");
+        };
+
+        // Anti-ciclo: o destino nao pode ser a propria pagina nem um descendente dela.
+        if new_parent == Some(id) {
+            anyhow::bail!("nao e possivel mover a pagina {id} para dentro dela mesma");
+        }
+        let mut cursor = new_parent;
+        while let Some(current) = cursor {
+            if current == id {
+                anyhow::bail!("nao e possivel mover a pagina {id} para dentro de um descendente");
+            }
+            cursor = page_parent(&tx, current)?
+                .ok_or_else(|| anyhow::anyhow!("pagina de destino {current} nao existe"))?;
+        }
+
+        // Irmaos de destino sem a pagina movida, com ela inserida na posicao pedida.
+        let mut destination = sibling_ids(&tx, new_parent)?;
+        destination.retain(|sibling| *sibling != id);
+        let at = index.min(destination.len());
+        destination.insert(at, id);
+
+        if old_parent != new_parent {
+            let mut origin = sibling_ids(&tx, old_parent)?;
+            origin.retain(|sibling| *sibling != id);
+            write_sort(&tx, &origin)?;
+            tx.execute(
+                "UPDATE pages SET parent_id = ?2 WHERE id = ?1",
+                params![id, new_parent],
+            )?;
+        }
+        write_sort(&tx, &destination)?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Caso particular de mesmo pai: reordena para `index`.
+    pub fn reorder_page(&mut self, id: PageId, index: usize) -> Result<()> {
+        let parent = page_parent(&self.conn, id)?
+            .ok_or_else(|| anyhow::anyhow!("pagina {id} nao existe"))?;
+        self.move_page(id, parent, index)
+    }
+
     pub fn set_favorite(&mut self, id: PageId, favorite: bool) -> Result<()> {
         self.conn.execute(
             "UPDATE pages SET favorite = ?2 WHERE id = ?1",
@@ -470,6 +524,38 @@ impl Store {
     }
 }
 
+/// Pai da pagina: `None` quando a pagina nao existe, `Some(None)` quando e raiz.
+fn page_parent(conn: &Connection, id: PageId) -> Result<Option<Option<PageId>>> {
+    conn.query_row(
+        "SELECT parent_id FROM pages WHERE id = ?1",
+        params![id],
+        |row| row.get::<_, Option<PageId>>(0),
+    )
+    .optional()
+    .map_err(Into::into)
+}
+
+/// Filhos do pai, na ordem gravada.
+fn sibling_ids(conn: &Connection, parent: Option<PageId>) -> Result<Vec<PageId>> {
+    let mut stmt =
+        conn.prepare("SELECT id FROM pages WHERE parent_id IS ?1 ORDER BY sort ASC, id ASC")?;
+    let rows = stmt.query_map(params![parent], |row| row.get(0))?;
+    let mut out = Vec::new();
+    for row in rows {
+        out.push(row?);
+    }
+    Ok(out)
+}
+
+/// Reescreve `sort` como 0,1,2,... na ordem recebida.
+fn write_sort(conn: &Connection, ids: &[PageId]) -> Result<()> {
+    let mut stmt = conn.prepare("UPDATE pages SET sort = ?2 WHERE id = ?1")?;
+    for (sort, id) in ids.iter().enumerate() {
+        stmt.execute(params![id, sort as i64])?;
+    }
+    Ok(())
+}
+
 pub fn fold(text: &str) -> String {
     let mut out = String::with_capacity(text.len());
     for ch in text.chars() {
@@ -580,6 +666,30 @@ mod tests {
                 .as_nanos()
         ));
         (Store::open(&path).unwrap(), path)
+    }
+
+    /// Banco vazio, sem as paginas iniciais, para testar ordem de raiz.
+    fn blank_store() -> (Store, PathBuf) {
+        let (mut store, path) = temp_store();
+        for page in store.list_pages().unwrap() {
+            store.delete_page(page.id).unwrap();
+        }
+        assert!(store.list_pages().unwrap().is_empty());
+        (store, path)
+    }
+
+    fn child_ids(store: &Store, parent: Option<PageId>) -> Vec<PageId> {
+        let mut pages = store.list_pages().unwrap();
+        pages.retain(|page| page.parent == parent);
+        pages.sort_by_key(|page| page.sort);
+        pages.into_iter().map(|page| page.id).collect()
+    }
+
+    fn child_sorts(store: &Store, parent: Option<PageId>) -> Vec<i64> {
+        let mut pages = store.list_pages().unwrap();
+        pages.retain(|page| page.parent == parent);
+        pages.sort_by_key(|page| page.sort);
+        pages.into_iter().map(|page| page.sort).collect()
     }
 
     #[test]
@@ -693,6 +803,178 @@ mod tests {
     fn counts_blocks() {
         let (store, path) = temp_store();
         assert!(store.block_count().unwrap() > 0);
+        drop(store);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn moves_page_into_the_middle_of_another_parent() {
+        let (mut store, path) = blank_store();
+        let now = unix_now();
+        let origem = store.create_page(None, "Origem", "", now).unwrap();
+        let destino = store.create_page(None, "Destino", "", now).unwrap();
+        let a = store.create_page(Some(origem.id), "A", "", now).unwrap();
+        let b = store.create_page(Some(origem.id), "B", "", now).unwrap();
+        let c = store.create_page(Some(origem.id), "C", "", now).unwrap();
+        let d = store.create_page(Some(destino.id), "D", "", now).unwrap();
+        let e = store.create_page(Some(destino.id), "E", "", now).unwrap();
+
+        store.move_page(b.id, Some(destino.id), 1).unwrap();
+
+        assert_eq!(child_ids(&store, Some(origem.id)), vec![a.id, c.id]);
+        assert_eq!(child_ids(&store, Some(destino.id)), vec![d.id, b.id, e.id]);
+        assert_eq!(child_sorts(&store, Some(origem.id)), vec![0, 1]);
+        assert_eq!(child_sorts(&store, Some(destino.id)), vec![0, 1, 2]);
+        assert_eq!(
+            store.page_meta(b.id).unwrap().unwrap().parent,
+            Some(destino.id)
+        );
+        drop(store);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn moves_page_to_root_at_the_end() {
+        let (mut store, path) = blank_store();
+        let now = unix_now();
+        let raiz = store.create_page(None, "Raiz", "", now).unwrap();
+        let outra = store.create_page(None, "Outra", "", now).unwrap();
+        let filha = store.create_page(Some(raiz.id), "Filha", "", now).unwrap();
+
+        store.move_page(filha.id, None, 99).unwrap();
+
+        assert!(child_ids(&store, Some(raiz.id)).is_empty());
+        assert_eq!(child_ids(&store, None), vec![raiz.id, outra.id, filha.id]);
+        assert_eq!(child_sorts(&store, None), vec![0, 1, 2]);
+        assert_eq!(store.page_meta(filha.id).unwrap().unwrap().parent, None);
+        drop(store);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn reorders_siblings_up_and_down() {
+        let (mut store, path) = blank_store();
+        let now = unix_now();
+        let pai = store.create_page(None, "Pai", "", now).unwrap();
+        let a = store.create_page(Some(pai.id), "A", "", now).unwrap();
+        let b = store.create_page(Some(pai.id), "B", "", now).unwrap();
+        let c = store.create_page(Some(pai.id), "C", "", now).unwrap();
+
+        store.reorder_page(c.id, 0).unwrap();
+        assert_eq!(child_ids(&store, Some(pai.id)), vec![c.id, a.id, b.id]);
+
+        store.reorder_page(c.id, 1).unwrap();
+        assert_eq!(child_ids(&store, Some(pai.id)), vec![a.id, c.id, b.id]);
+
+        store.reorder_page(a.id, 99).unwrap();
+        assert_eq!(child_ids(&store, Some(pai.id)), vec![c.id, b.id, a.id]);
+
+        // Indice atual e no-op idempotente.
+        store.reorder_page(a.id, 2).unwrap();
+        assert_eq!(child_ids(&store, Some(pai.id)), vec![c.id, b.id, a.id]);
+        assert_eq!(child_sorts(&store, Some(pai.id)), vec![0, 1, 2]);
+        drop(store);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn rejects_moving_page_into_a_descendant() {
+        let (mut store, path) = blank_store();
+        let now = unix_now();
+        let pai = store.create_page(None, "Pai", "", now).unwrap();
+        let filha = store.create_page(Some(pai.id), "Filha", "", now).unwrap();
+        let neta = store.create_page(Some(filha.id), "Neta", "", now).unwrap();
+        let irma = store.create_page(None, "Irma", "", now).unwrap();
+
+        let raiz_antes = child_ids(&store, None);
+        let pai_antes = child_ids(&store, Some(pai.id));
+        let filha_antes = child_ids(&store, Some(filha.id));
+
+        assert!(store.move_page(pai.id, Some(filha.id), 0).is_err());
+        assert!(store.move_page(pai.id, Some(neta.id), 0).is_err());
+        assert!(store.move_page(pai.id, Some(pai.id), 0).is_err());
+
+        // Estado intacto depois das rejeicoes.
+        assert_eq!(child_ids(&store, None), raiz_antes);
+        assert_eq!(child_ids(&store, Some(pai.id)), pai_antes);
+        assert_eq!(child_ids(&store, Some(filha.id)), filha_antes);
+        assert_eq!(store.page_meta(pai.id).unwrap().unwrap().parent, None);
+        assert!(child_ids(&store, None).contains(&irma.id));
+        drop(store);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn rejects_unknown_page() {
+        let (mut store, path) = blank_store();
+        let now = unix_now();
+        let pai = store.create_page(None, "Pai", "", now).unwrap();
+        let filha = store.create_page(Some(pai.id), "Filha", "", now).unwrap();
+
+        let raiz_antes = child_ids(&store, None);
+        assert!(store.move_page(9999, Some(pai.id), 0).is_err());
+        assert!(store.move_page(9999, None, 0).is_err());
+        assert!(store.reorder_page(9999, 0).is_err());
+        assert!(store.move_page(filha.id, Some(9999), 0).is_err());
+        assert_eq!(child_ids(&store, None), raiz_antes);
+        assert_eq!(
+            store.page_meta(filha.id).unwrap().unwrap().parent,
+            Some(pai.id)
+        );
+        drop(store);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn normalizes_sort_after_moves() {
+        let (mut store, path) = blank_store();
+        let now = unix_now();
+        let pai = store.create_page(None, "Pai", "", now).unwrap();
+        let a = store.create_page(Some(pai.id), "A", "", now).unwrap();
+        let b = store.create_page(Some(pai.id), "B", "", now).unwrap();
+        let c = store.create_page(Some(pai.id), "C", "", now).unwrap();
+        let d = store.create_page(Some(pai.id), "D", "", now).unwrap();
+        let e = store.create_page(Some(pai.id), "E", "", now).unwrap();
+
+        store.move_page(d.id, None, 1).unwrap();
+        store.move_page(e.id, Some(pai.id), 0).unwrap();
+        store.move_page(a.id, Some(pai.id), 2).unwrap();
+        store.move_page(b.id, Some(pai.id), 99).unwrap();
+
+        assert_eq!(
+            child_ids(&store, Some(pai.id)),
+            vec![e.id, a.id, c.id, b.id]
+        );
+        for parent in [None, Some(pai.id)] {
+            let sorts = child_sorts(&store, parent);
+            let esperado: Vec<i64> = (0..sorts.len() as i64).collect();
+            assert_eq!(sorts, esperado);
+            let unicos: std::collections::HashSet<i64> = sorts.iter().copied().collect();
+            assert_eq!(unicos.len(), sorts.len());
+        }
+        drop(store);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn create_page_appends_after_moves() {
+        let (mut store, path) = blank_store();
+        let now = unix_now();
+        let pai = store.create_page(None, "Pai", "", now).unwrap();
+        let a = store.create_page(Some(pai.id), "A", "", now).unwrap();
+        let b = store.create_page(Some(pai.id), "B", "", now).unwrap();
+        let c = store.create_page(Some(pai.id), "C", "", now).unwrap();
+
+        store.reorder_page(c.id, 0).unwrap();
+        store.move_page(a.id, None, 0).unwrap();
+
+        let d = store.create_page(Some(pai.id), "D", "", now).unwrap();
+        assert_eq!(d.sort, 2);
+        let e = store.create_page(None, "E", "", now).unwrap();
+        assert_eq!(e.sort, 2);
+        assert_eq!(child_ids(&store, Some(pai.id)), vec![c.id, b.id, d.id]);
+        assert_eq!(child_sorts(&store, Some(pai.id)), vec![0, 1, 2]);
+        assert_eq!(child_ids(&store, None).last().copied(), Some(e.id));
         drop(store);
         let _ = std::fs::remove_file(path);
     }
