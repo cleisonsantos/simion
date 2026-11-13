@@ -1361,7 +1361,17 @@ impl App {
             let id = self.page.blocks[next].id;
             let caret = x
                 .zip(self.block_galleys.get(&id))
-                .map_or(0, |(x, (galley, pos))| caret_at_row_x(galley, 0, x - pos.x));
+                .map_or(0, |(x, (galley, pos))| {
+                    let local_x = x - pos.x;
+                    let fits = galley.rows.first().is_some_and(|row| {
+                        local_x >= row.pos.x && local_x <= row.pos.x + row.size.x
+                    });
+                    if fits {
+                        caret_at_row_x(galley, 0, local_x)
+                    } else {
+                        0
+                    }
+                });
             self.focus_block(id, caret);
         }
     }
@@ -1462,11 +1472,19 @@ impl App {
         }
 
         if self.consume_pub(ctx, Key::Tab, Modifiers::NONE) {
-            self.adjust_indent(id, 1);
+            if kind == BlockKind::Code {
+                self.edit_code_tab(id, (selection_start, selection_end), false);
+            } else {
+                self.adjust_indent(id, 1);
+            }
             return;
         }
         if self.consume_pub(ctx, Key::Tab, Modifiers::SHIFT) {
-            self.adjust_indent(id, -1);
+            if kind == BlockKind::Code {
+                self.edit_code_tab(id, (selection_start, selection_end), true);
+            } else {
+                self.adjust_indent(id, -1);
+            }
             return;
         }
         // Notion's move shortcut. Left to the text field it would select up
@@ -1534,6 +1552,11 @@ impl App {
             return;
         }
 
+        if kind.accepts_text() && self.consume_pub(ctx, Key::Enter, Modifiers::SHIFT) {
+            self.replace_block_text(id, (selection_start, selection_end), "\n");
+            return;
+        }
+
         if kind != BlockKind::Code && self.consume_pub(ctx, Key::Enter, Modifiers::NONE) {
             let indent = self.page.blocks[index].indent;
             if text_len == 0 && kind.is_list() && indent > 0 {
@@ -1587,7 +1610,7 @@ impl App {
         }
 
         // ↑/↓ leave the block from its first / last visual row, keeping the
-        // caret's x. Inside the block the text field moves between rows.
+        // caret's x. Handle interior rows here too, using the same geometry.
         let Some((galley, galley_pos)) = self.block_galleys.get(&id).cloned() else {
             // Not laid out yet: fall back to the start / end of the text.
             if caret == 0 && self.consume_pub(ctx, Key::ArrowUp, Modifiers::NONE) {
@@ -1602,13 +1625,52 @@ impl App {
             .map_or(CCursor::new(caret), |range| range.primary);
         let row = caret_row(&galley, cursor);
         let x = galley_pos.x + caret_x(&galley, cursor);
-        if row == 0 && self.consume_pub(ctx, Key::ArrowUp, Modifiers::NONE) {
-            self.focus_above(index, Some(x));
+        for (key, down) in [(Key::ArrowUp, false), (Key::ArrowDown, true)] {
+            if !self.consume_pub(ctx, key, Modifiers::NONE) {
+                continue;
+            }
+            if !down && row == 0 {
+                self.focus_above(index, Some(x));
+            } else if down && row + 1 >= galley.rows.len() {
+                self.focus_below(index, Some(x));
+            } else {
+                let target_row = if down { row + 1 } else { row - 1 };
+                let target = caret_at_row_x(&galley, target_row, x - galley_pos.x);
+                let mut cursor = CCursor::new(target);
+                cursor.prefer_next_row = caret_row(&galley, cursor) != target_row;
+                let mut state = TextEditState::load(ctx, block_te_id(id)).unwrap_or_default();
+                state.cursor.set_char_range(Some(CCursorRange::one(cursor)));
+                state.store(ctx, block_te_id(id));
+            }
             return;
         }
-        if row + 1 >= galley.rows.len() && self.consume_pub(ctx, Key::ArrowDown, Modifiers::NONE) {
-            self.focus_below(index, Some(x));
+    }
+
+    fn replace_block_text(&mut self, id: u64, range: (usize, usize), replacement: &str) {
+        let Some(index) = self.index_of(id) else {
+            return;
+        };
+        let text = &self.page.blocks[index].text;
+        let start = range.0.min(range.1).min(text.chars().count());
+        let end = range.0.max(range.1).min(text.chars().count());
+        let bytes = markdown::char_to_byte(text, start)..markdown::char_to_byte(text, end);
+        if text[bytes.clone()] == *replacement {
+            return;
         }
+        self.begin_change();
+        self.page.blocks[index]
+            .text
+            .replace_range(bytes, replacement);
+        self.end_change();
+        self.focus_block(id, start + replacement.chars().count());
+    }
+
+    fn edit_code_tab(&mut self, id: u64, range: (usize, usize), unindent: bool) {
+        let Some(index) = self.index_of(id) else {
+            return;
+        };
+        let (range, replacement) = code_tab_edit(&self.page.blocks[index].text, range, unindent);
+        self.replace_block_text(id, range, replacement);
     }
 
     fn inline_toggle(&mut self, marker: &str, id: u64, sel: (usize, usize)) {
@@ -2758,6 +2820,26 @@ fn caret_at_row_x(galley: &egui::Galley, row: usize, x: f32) -> usize {
     (start + placed.char_at(x - placed.pos.x).0).min(galley.text().chars().count())
 }
 
+/// A code Tab edits character offsets, never the block's indentation.
+fn code_tab_edit(
+    text: &str,
+    range: (usize, usize),
+    unindent: bool,
+) -> ((usize, usize), &'static str) {
+    let caret = range.0.max(range.1).min(text.chars().count());
+    if !unindent {
+        return (range, "  ");
+    }
+    let byte = markdown::char_to_byte(text, caret);
+    let spaces = text[..byte]
+        .chars()
+        .rev()
+        .take(2)
+        .take_while(|c| *c == ' ')
+        .count();
+    ((caret - spaces, caret), "")
+}
+
 pub struct BlockOutcome {
     pub span_shape: egui::layers::ShapeIdx,
     pub changed: bool,
@@ -3599,6 +3681,145 @@ mod tests {
         assert_eq!(h.texts(), vec!["alphaQravo"]);
         h.app.undo();
         assert_eq!(h.texts(), vec!["alpha", "bravo"]);
+    }
+
+    #[test]
+    fn code_tab_edits_character_offsets_and_only_adjacent_spaces() {
+        assert_eq!(code_tab_edit("abc", (2, 2), false), ((2, 2), "  "));
+        assert_eq!(code_tab_edit("ab  c", (4, 4), true), ((2, 4), ""));
+        assert_eq!(code_tab_edit("é x", (2, 2), true), ((1, 2), ""));
+        assert_eq!(code_tab_edit("a\n x", (3, 3), true), ((2, 3), ""));
+        assert_eq!(code_tab_edit("abc", (0, 0), true), ((0, 0), ""));
+        assert_eq!(code_tab_edit("a   b", (4, 4), true), ((2, 4), ""));
+    }
+
+    #[test]
+    fn code_tab_and_soft_enter_are_single_undo_operations() {
+        let mut h = Harness::new("t", &[(BlockKind::Code, "abc")]);
+        h.caret_in(0, 2);
+        h.app.flush_history(true);
+        let before = h.app.history.undo.len();
+        h.key(Key::Tab, Modifiers::NONE);
+        assert_eq!(h.texts(), ["ab  c"]);
+        assert_eq!(h.app.page.blocks[0].kind, BlockKind::Code);
+        assert_eq!(h.app.history.undo.len(), before + 1);
+        h.key(Key::Tab, Modifiers::SHIFT);
+        assert_eq!(h.texts(), ["abc"]);
+        assert_eq!(h.app.history.undo.len(), before + 2);
+        h.app.undo();
+        assert_eq!(h.texts(), ["ab  c"]);
+        for kind in [
+            BlockKind::Paragraph,
+            BlockKind::Quote,
+            BlockKind::Bullet,
+            BlockKind::Code,
+        ] {
+            let mut h = Harness::new("t", &[(kind, "alpha")]);
+            h.caret_in(0, 5);
+            h.app.flush_history(true);
+            let before = h.app.history.undo.len();
+            h.key(Key::Enter, Modifiers::SHIFT);
+            assert_eq!(h.texts(), ["alpha\n"]);
+            assert_eq!(h.app.page.blocks[0].kind, kind);
+            assert_eq!(h.app.history.undo.len(), before + 1);
+            h.app.undo();
+            assert_eq!(h.texts(), ["alpha"]);
+        }
+        let mut h = Harness::new("t", &[(BlockKind::Paragraph, "alpha")]);
+        h.caret_in(0, 2);
+        h.key(Key::Tab, Modifiers::NONE);
+        assert_eq!(h.app.page.blocks[0].indent, 1);
+        h.key(Key::Tab, Modifiers::SHIFT);
+        assert_eq!(h.app.page.blocks[0].indent, 0);
+        h.key(Key::Enter, Modifiers::NONE);
+        assert_eq!(h.texts(), ["al", "pha"]);
+    }
+
+    #[test]
+    fn multiline_arrows_visit_each_row_then_cross_blocks() {
+        for kind in [BlockKind::Paragraph, BlockKind::Quote, BlockKind::Code] {
+            let mut h = Harness::new(
+                "t",
+                &[
+                    (BlockKind::Paragraph, "antes"),
+                    (kind, "linha1\nlinha2\nlinha3"),
+                    (BlockKind::Paragraph, "fim"),
+                ],
+            );
+            h.caret_in(1, 3);
+            for offset in [10, 17] {
+                h.key(Key::ArrowDown, Modifiers::NONE);
+                assert_eq!(h.app.focus, Focus::Block(h.id(1)));
+                assert_eq!(
+                    h.app.cursor_range_for(&h.ctx, h.id(1)),
+                    Some((offset, offset))
+                );
+            }
+            h.key(Key::ArrowDown, Modifiers::NONE);
+            assert_eq!(h.app.focus, Focus::Block(h.id(2)));
+            h.caret_in(1, 17);
+            for offset in [10, 3] {
+                h.key(Key::ArrowUp, Modifiers::NONE);
+                assert_eq!(
+                    h.app.cursor_range_for(&h.ctx, h.id(1)),
+                    Some((offset, offset))
+                );
+            }
+            h.key(Key::ArrowUp, Modifiers::NONE);
+            assert_eq!(h.app.focus, Focus::Block(h.id(0)));
+        }
+    }
+
+    #[test]
+    fn crossing_to_a_short_neighbor_uses_directional_fallback() {
+        let mut h = Harness::new(
+            "t",
+            &[
+                (BlockKind::Paragraph, "x"),
+                (BlockKind::Paragraph, "abcdefgh"),
+                (BlockKind::Paragraph, "y"),
+            ],
+        );
+        h.caret_in(1, 7);
+        h.key(Key::ArrowDown, Modifiers::NONE);
+        assert_eq!(h.app.cursor_range_for(&h.ctx, h.id(2)), Some((0, 0)));
+        h.caret_in(1, 7);
+        h.key(Key::ArrowUp, Modifiers::NONE);
+        assert_eq!(h.app.cursor_range_for(&h.ctx, h.id(0)), Some((1, 1)));
+    }
+
+    #[test]
+    fn visual_columns_handle_newlines_short_rows_and_unicode() {
+        let h = Harness::new("t", &[(BlockKind::Paragraph, "ééé\nx\nééé")]);
+        let (g, _) = &h.app.block_galleys[&h.id(0)];
+        assert_eq!(g.rows.len(), 3);
+        for (offset, row) in [(0, 0), (3, 0), (4, 1), (5, 1), (6, 2), (9, 2)] {
+            assert_eq!(caret_row(g, CCursor::new(offset)), row);
+        }
+        let x = caret_x(g, CCursor::new(2));
+        assert_eq!(caret_at_row_x(g, 2, x), 8);
+        assert_eq!(caret_at_row_x(g, 1, x), 5);
+        assert_eq!(caret_at_row_x(g, 2, -100.0), 6);
+    }
+
+    #[test]
+    fn wrapped_arrows_progress_even_at_the_start_of_a_visual_row() {
+        let text = long_text();
+        let mut h = Harness::new(
+            "t",
+            &[(BlockKind::Paragraph, &text), (BlockKind::Paragraph, "fim")],
+        );
+        h.caret_in(0, 0);
+        let rows = h.app.block_galleys[&h.id(0)].0.rows.len();
+        for row in 1..rows {
+            h.key(Key::ArrowDown, Modifiers::NONE);
+            let state = TextEditState::load(&h.ctx, block_te_id(h.id(0))).unwrap();
+            let cursor = state.cursor.char_range().unwrap().primary;
+            assert_eq!(caret_row(&h.app.block_galleys[&h.id(0)].0, cursor), row);
+            assert_eq!(h.app.focus, Focus::Block(h.id(0)));
+        }
+        h.key(Key::ArrowDown, Modifiers::NONE);
+        assert_eq!(h.app.focus, Focus::Block(h.id(1)));
     }
 
     #[test]
