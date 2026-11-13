@@ -577,6 +577,12 @@ impl App {
                         });
                         close = true;
                     }
+                    if widgets::menu_row(ui, "Nova pasta", None, false, false, &p).clicked() {
+                        actions.push(Action::NewFolder {
+                            parent: Some(page_id),
+                        });
+                        close = true;
+                    }
                     widgets::hairline(ui, &p);
                     ui.add_space(2.0);
                     if widgets::menu_row(ui, "Duplicar página", None, false, false, &p).clicked() {

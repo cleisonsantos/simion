@@ -55,6 +55,14 @@ pub enum Action {
     NewPage {
         parent: Option<PageId>,
     },
+    NewFolder {
+        parent: Option<PageId>,
+    },
+    MovePage {
+        id: PageId,
+        parent: Option<PageId>,
+        index: usize,
+    },
     AskDelete(PageId),
     DeletePage(PageId),
     DuplicatePage(PageId),
@@ -114,6 +122,7 @@ pub struct App {
     pub page: Page,
     pub current: Option<PageId>,
     pub collapsed: HashSet<PageId>,
+    pub drag_page: Option<PageId>,
 
     pub ids: IdGen,
     pub dirty: bool,
@@ -267,6 +276,7 @@ impl App {
             page: Page::placeholder(),
             current: None,
             collapsed: HashSet::new(),
+            drag_page: None,
             ids: IdGen::default(),
             dirty: false,
             last_edit: 0.0,
@@ -516,11 +526,19 @@ impl App {
     }
 
     fn create_page(&mut self, parent: Option<PageId>) {
+        self.create_page_with(parent, "", "");
+    }
+
+    fn create_folder(&mut self, parent: Option<PageId>) {
+        self.create_page_with(parent, "Nova pasta", "📁");
+    }
+
+    fn create_page_with(&mut self, parent: Option<PageId>, title: &str, icon: &str) {
         self.save_now();
         let Some(store) = self.store.as_mut() else {
             return;
         };
-        match store.create_page(parent, "", "", unix_now()) {
+        match store.create_page(parent, title, icon, unix_now()) {
             Ok(meta) => {
                 let page = Page {
                     meta: meta.clone(),
@@ -1115,6 +1133,21 @@ impl App {
         match action {
             Action::SelectPage(id) => self.open_page(id),
             Action::NewPage { parent } => self.create_page(parent),
+            Action::NewFolder { parent } => self.create_folder(parent),
+            Action::MovePage { id, parent, index } => {
+                let result = self.store.as_mut().map(|s| s.move_page(id, parent, index));
+                match result {
+                    Some(Ok(())) => {
+                        self.reload_pages();
+                        if let Some(parent) = parent {
+                            self.collapsed.remove(&parent);
+                        }
+                        self.toast("Página movida");
+                    }
+                    Some(Err(err)) => self.toast(format!("Não foi possível mover: {err}")),
+                    None => {}
+                }
+            }
             Action::AskDelete(id) => {
                 self.confirm_delete = Some(id);
                 self.page_menu = None;
