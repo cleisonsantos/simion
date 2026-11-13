@@ -34,6 +34,17 @@ impl TextSpan {
     }
 }
 
+#[derive(Clone, Copy, Debug)]
+pub enum BlockContextAction {
+    Cut,
+    Copy,
+    Paste,
+    Duplicate,
+    Delete,
+    Transform(BlockKind),
+    Move(i32),
+}
+
 impl App {
     pub fn editor(&mut self, ui: &mut Ui, actions: &mut Vec<Action>) {
         let p = self.palette;
@@ -363,7 +374,10 @@ impl App {
         self.block_rects.clear();
 
         // Any click in the editor drops the block selection.
-        if self.block_selection.is_some() && ui.input(|input| input.pointer.any_pressed()) {
+        if self.block_selection.is_some()
+            && !egui::Popup::is_any_open(ui.ctx())
+            && ui.input(|input| input.pointer.primary_pressed())
+        {
             self.block_selection = None;
         }
 
@@ -779,7 +793,8 @@ impl App {
             // Keep the native text widget as the drag target. The document-level
             // controller uses its cached rect/galley before TextEdit handles events,
             // so a drag continues beyond this widget's bounds.
-            let _ = output.response.clone().interact(Sense::click_and_drag());
+            let response = output.response.clone().interact(Sense::click_and_drag());
+            self.block_context_menu(ui, &response, id, actions);
             te_rect = output.response.rect;
             rows = output.galley.rows.len().max(1);
             // Anchor to this frame's widget geometry, including the text inset.
@@ -999,8 +1014,9 @@ impl App {
         let p = self.palette;
         let zoom = self.zoom;
         let row_start = ui.cursor().min;
-        let (rect, _response) =
+        let (rect, response) =
             ui.allocate_exact_size(vec2(text_width, 24.0 * zoom), Sense::click());
+        self.block_context_menu(ui, &response, id, actions);
         let y = rect.center().y;
         ui.painter().rect_filled(
             Rect::from_min_size(pos2(rect.left(), y - 0.75), vec2(rect.width(), 1.5)),
@@ -1790,6 +1806,196 @@ impl App {
         });
     }
 
+    fn block_context_menu(
+        &mut self,
+        ui: &Ui,
+        response: &egui::Response,
+        id: u64,
+        actions: &mut Vec<Action>,
+    ) {
+        if response.secondary_clicked() {
+            if !self.index_of(id).is_some_and(|i| self.block_selected(i)) {
+                self.start_block_selection(ui.ctx(), id);
+            }
+            self.slash = None;
+        }
+        let p = self.palette;
+        let mut chosen = None;
+        egui::Popup::context_menu(response)
+            .frame(widgets::popup_frame(&p))
+            .show(|ui| {
+                ui.set_width(240.0);
+                for (label, action) in [
+                    ("Recortar", BlockContextAction::Cut),
+                    ("Copiar", BlockContextAction::Copy),
+                    ("Colar", BlockContextAction::Paste),
+                ] {
+                    if widgets::menu_row(ui, label, None, false, false, &p).clicked() {
+                        chosen = Some(action);
+                    }
+                }
+                ui.separator();
+                for (label, action) in [
+                    ("Duplicar", BlockContextAction::Duplicate),
+                    ("Excluir", BlockContextAction::Delete),
+                ] {
+                    if widgets::menu_row(ui, label, None, label == "Excluir", false, &p).clicked() {
+                        chosen = Some(action);
+                    }
+                }
+                ui.separator();
+                let common = self.block_selection_range().and_then(|(lo, hi)| {
+                    let kind = self.page.blocks[lo].kind;
+                    self.page.blocks[lo..=hi]
+                        .iter()
+                        .all(|b| b.kind == kind)
+                        .then_some(kind)
+                });
+                ui.menu_button("Transformar em", |ui| {
+                    ui.set_width(240.0);
+                    for kind in BlockKind::ALL {
+                        if widgets::menu_row(
+                            ui,
+                            &format!(
+                                "{}{}",
+                                if common == Some(kind) { "● " } else { "" },
+                                kind.label()
+                            ),
+                            None,
+                            false,
+                            common == Some(kind),
+                            &p,
+                        )
+                        .clicked()
+                        {
+                            chosen = Some(BlockContextAction::Transform(kind));
+                        }
+                    }
+                    if chosen.is_some() {
+                        ui.close();
+                    }
+                });
+                ui.separator();
+                for (label, delta) in [("Mover para cima", -1), ("Mover para baixo", 1)] {
+                    if widgets::menu_row(ui, label, None, false, false, &p).clicked() {
+                        chosen = Some(BlockContextAction::Move(delta));
+                    }
+                }
+                if chosen.is_some() {
+                    ui.close();
+                }
+            });
+        if let Some(action) = chosen {
+            actions.push(Action::BlockContext(action));
+        }
+    }
+
+    pub fn apply_block_context(&mut self, action: BlockContextAction, ctx: &egui::Context) {
+        let Some((lo, hi)) = self.block_selection_range() else {
+            return;
+        };
+        match action {
+            BlockContextAction::Copy | BlockContextAction::Cut => {
+                ctx.copy_text(markdown::to_markdown(&self.page.blocks[lo..=hi]));
+                if matches!(action, BlockContextAction::Cut) {
+                    self.delete_block_selection();
+                }
+            }
+            BlockContextAction::Paste => ctx.send_viewport_cmd(egui::ViewportCommand::RequestPaste),
+            BlockContextAction::Delete => self.delete_block_selection(),
+            BlockContextAction::Transform(kind) => self.transform_selection(kind),
+            BlockContextAction::Duplicate => {
+                self.begin_change();
+                let mut blocks = self.page.blocks[lo..=hi].to_vec();
+                for block in &mut blocks {
+                    block.id = self.ids.next();
+                }
+                self.page.blocks.splice(hi + 1..hi + 1, blocks);
+                self.end_change();
+            }
+            BlockContextAction::Move(delta) => {
+                if delta < 0 && lo > 0 {
+                    self.begin_change();
+                    self.page.blocks[lo - 1..=hi].rotate_left(1);
+                    self.end_change();
+                } else if delta > 0 && hi + 1 < self.page.blocks.len() {
+                    self.begin_change();
+                    self.page.blocks[lo..=hi + 1].rotate_right(1);
+                    self.end_change();
+                }
+            }
+        }
+        if let Some((anchor, _)) = self.block_selection {
+            self.restore_selection_focus(anchor);
+        }
+    }
+
+    fn restore_selection_focus(&mut self, id: u64) {
+        let (a, b) = self.cursors.get(&id).copied().unwrap_or((0, 0));
+        self.focus = Focus::Block(id);
+        self.pending = Some(PendingFocus {
+            target: Focus::Block(id),
+            range: Some((a, b)),
+            select_all: false,
+        });
+    }
+
+    pub fn paste_block_selection(&mut self, text: &str) {
+        let Some((lo, hi)) = self.block_selection_range() else {
+            return;
+        };
+        let drafts = markdown::parse_blocks(text, true);
+        if drafts.is_empty() {
+            return;
+        }
+        self.begin_change();
+        let blocks: Vec<_> = drafts
+            .into_iter()
+            .map(|draft| draft.into_block(self.ids.next()))
+            .collect();
+        let last = blocks.last().unwrap();
+        let (id, caret) = (last.id, last.text.chars().count());
+        self.page.blocks.splice(lo..=hi, blocks);
+        self.block_selection = None;
+        self.end_change();
+        self.focus_block(id, caret);
+    }
+
+    fn transform_selection(&mut self, kind: BlockKind) {
+        let Some((lo, hi)) = self.block_selection_range() else {
+            return;
+        };
+        if !self.page.blocks[lo..=hi]
+            .iter()
+            .any(|b| b.kind != BlockKind::Divider && (b.kind != kind || kind == BlockKind::Todo))
+        {
+            return;
+        }
+        self.begin_change();
+        for block in &mut self.page.blocks[lo..=hi] {
+            if block.kind == BlockKind::Divider {
+                continue;
+            }
+            block.kind = kind;
+            if kind == BlockKind::Divider {
+                block.text.clear();
+            }
+            if kind == BlockKind::Todo {
+                block.checked = false;
+            }
+            if kind == BlockKind::Callout && block.emoji.is_empty() {
+                block.emoji = "💡".to_owned();
+            }
+            if !kind.is_list() {
+                block.indent = 0;
+            }
+        }
+        self.end_change();
+        if let Some((anchor, _)) = self.block_selection {
+            self.restore_selection_focus(anchor);
+        }
+    }
+
     fn transform_block(&mut self, id: u64, kind: BlockKind) {
         let Some(index) = self.index_of(id) else {
             return;
@@ -2332,6 +2538,18 @@ impl App {
             return false;
         }
         let extent_kind = self.page.blocks[extent_index].kind;
+        for (key, kind) in [
+            (Key::Num1, BlockKind::Heading1),
+            (Key::Num2, BlockKind::Heading2),
+            (Key::Num3, BlockKind::Heading3),
+            (Key::Num0, BlockKind::Paragraph),
+        ] {
+            if self.consume_pub(ctx, key, Modifiers::COMMAND | Modifiers::ALT) {
+                self.transform_selection(kind);
+                return true;
+            }
+        }
+
         // Escape restores the anchor; Enter edits the moving end.
         if self.consume_pub(ctx, Key::Escape, Modifiers::NONE) {
             self.block_selection = None;
@@ -2953,6 +3171,138 @@ mod tests {
             modifiers: Modifiers::NONE,
         }]);
         h.idle();
+    }
+
+    #[test]
+    fn context_menu_keeps_inside_selection_and_retargets_outside() {
+        let mut h = Harness::new(
+            "",
+            &[
+                (BlockKind::Paragraph, "A"),
+                (BlockKind::Paragraph, "B"),
+                (BlockKind::Paragraph, "C"),
+            ],
+        );
+        let selection = Some((h.id(0), h.id(1)));
+        h.app.block_selection = selection;
+        for index in [1, 2] {
+            let pos = h.app.block_rects[&h.id(index)].center();
+            h.frame(vec![
+                Event::PointerMoved(pos),
+                Event::PointerButton {
+                    pos,
+                    button: egui::PointerButton::Secondary,
+                    pressed: true,
+                    modifiers: Modifiers::NONE,
+                },
+            ]);
+            h.frame(vec![Event::PointerButton {
+                pos,
+                button: egui::PointerButton::Secondary,
+                pressed: false,
+                modifiers: Modifiers::NONE,
+            }]);
+            assert!(egui::Popup::is_any_open(&h.ctx));
+            assert_eq!(
+                h.app.block_selection,
+                if index == 1 {
+                    selection
+                } else {
+                    Some((h.id(2), h.id(2)))
+                }
+            );
+            egui::Popup::close_all(&h.ctx);
+            h.idle();
+        }
+    }
+
+    #[test]
+    fn batch_transform_preserves_structure_selection_and_undo() {
+        let mut h = Harness::new(
+            "",
+            &[
+                (BlockKind::Paragraph, "A"),
+                (BlockKind::Divider, ""),
+                (BlockKind::Bullet, "B"),
+                (BlockKind::Todo, "C"),
+            ],
+        );
+        h.app.page.blocks[2].indent = 2;
+        h.app.page.blocks[3].checked = true;
+        let selection = Some((h.id(0), h.id(3)));
+        h.app.block_selection = selection;
+        h.app.begin_change();
+        let before = h.app.page.blocks.clone();
+        let undo_count = h.app.history.undo.len();
+        h.app.transform_selection(BlockKind::Todo);
+        assert_eq!(h.app.history.undo.len(), undo_count + 1);
+        assert_eq!(h.app.block_selection, selection);
+        assert_eq!(h.app.page.blocks[1].kind, BlockKind::Divider);
+        assert_eq!(h.app.page.blocks[2].indent, 2);
+        for i in [0, 2, 3] {
+            assert_eq!(h.app.page.blocks[i].kind, BlockKind::Todo);
+            assert!(!h.app.page.blocks[i].checked);
+            assert_eq!(h.app.page.blocks[i].text, before[i].text);
+        }
+        h.app.undo();
+        assert_eq!(
+            markdown::to_markdown(&h.app.page.blocks),
+            markdown::to_markdown(&before)
+        );
+    }
+
+    #[test]
+    fn selection_duplicate_move_and_paste() {
+        let mut h = Harness::new(
+            "",
+            &[
+                (BlockKind::Paragraph, "A"),
+                (BlockKind::Bullet, "B"),
+                (BlockKind::Paragraph, "C"),
+            ],
+        );
+        h.app.block_selection = Some((h.id(0), h.id(1)));
+        let selection = h.app.block_selection;
+        h.app
+            .apply_block_context(BlockContextAction::Duplicate, &h.ctx);
+        assert_eq!(h.texts(), vec!["A", "B", "A", "B", "C"]);
+        let ids: std::collections::HashSet<_> = h.app.page.blocks.iter().map(|b| b.id).collect();
+        assert_eq!(ids.len(), 5);
+        h.app
+            .apply_block_context(BlockContextAction::Move(1), &h.ctx);
+        assert_eq!(h.texts(), vec!["A", "A", "B", "B", "C"]);
+        assert_eq!(h.app.block_selection, selection);
+        h.app.paste_block_selection("replacement");
+        assert_eq!(h.texts(), vec!["A", "replacement", "B", "C"]);
+        assert!(h.app.block_selection.is_none());
+    }
+
+    #[test]
+    fn selection_heading_shortcut_and_divider_only_noop() {
+        let mut h = Harness::new(
+            "",
+            &[(BlockKind::Paragraph, "A"), (BlockKind::Paragraph, "B")],
+        );
+        h.app.block_selection = Some((h.id(0), h.id(1)));
+        h.key(Key::Num2, Modifiers::COMMAND | Modifiers::ALT);
+        assert!(
+            h.app
+                .page
+                .blocks
+                .iter()
+                .all(|b| b.kind == BlockKind::Heading2)
+        );
+        h.app.transform_selection(BlockKind::Divider);
+        let count = h.app.history.undo.len();
+        h.app.transform_selection(BlockKind::Paragraph);
+        assert_eq!(h.app.history.undo.len(), count);
+        assert!(
+            h.app
+                .page
+                .blocks
+                .iter()
+                .all(|b| b.kind == BlockKind::Divider)
+        );
     }
 
     #[test]
