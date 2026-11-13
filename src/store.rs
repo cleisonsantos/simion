@@ -403,6 +403,71 @@ impl Store {
         self.move_page(id, parent, index)
     }
 
+    /// Sobe a pagina uma posicao entre as irmas. `false` quando ja e a primeira.
+    pub fn move_page_up(&mut self, id: PageId) -> Result<bool> {
+        let parent = page_parent(&self.conn, id)?
+            .ok_or_else(|| anyhow::anyhow!("pagina {id} nao existe"))?;
+        let siblings = sibling_ids(&self.conn, parent)?;
+        let Some(index) = siblings.iter().position(|sibling| *sibling == id) else {
+            anyhow::bail!("pagina {id} nao esta entre as irmas");
+        };
+        if index == 0 {
+            return Ok(false);
+        }
+        self.reorder_page(id, index - 1)?;
+        Ok(true)
+    }
+
+    /// Desce a pagina uma posicao entre as irmas. `false` quando ja e a ultima.
+    pub fn move_page_down(&mut self, id: PageId) -> Result<bool> {
+        let parent = page_parent(&self.conn, id)?
+            .ok_or_else(|| anyhow::anyhow!("pagina {id} nao existe"))?;
+        let siblings = sibling_ids(&self.conn, parent)?;
+        let Some(index) = siblings.iter().position(|sibling| *sibling == id) else {
+            anyhow::bail!("pagina {id} nao esta entre as irmas");
+        };
+        if index + 1 >= siblings.len() {
+            return Ok(false);
+        }
+        self.reorder_page(id, index + 1)?;
+        Ok(true)
+    }
+
+    /// Reparenta para a irma anterior, virando a ultima filha dela.
+    /// `false` quando a pagina e a primeira entre as irmas.
+    pub fn indent_page(&mut self, id: PageId) -> Result<bool> {
+        let parent = page_parent(&self.conn, id)?
+            .ok_or_else(|| anyhow::anyhow!("pagina {id} nao existe"))?;
+        let siblings = sibling_ids(&self.conn, parent)?;
+        let Some(index) = siblings.iter().position(|sibling| *sibling == id) else {
+            anyhow::bail!("pagina {id} nao esta entre as irmas");
+        };
+        if index == 0 {
+            return Ok(false);
+        }
+        let new_parent = siblings[index - 1];
+        let at = sibling_ids(&self.conn, Some(new_parent))?.len();
+        self.move_page(id, Some(new_parent), at)?;
+        Ok(true)
+    }
+
+    /// Sai do pai e vira irma dele, logo depois. `false` quando ja e raiz.
+    pub fn outdent_page(&mut self, id: PageId) -> Result<bool> {
+        let parent = page_parent(&self.conn, id)?
+            .ok_or_else(|| anyhow::anyhow!("pagina {id} nao existe"))?;
+        let Some(parent) = parent else {
+            return Ok(false);
+        };
+        let grandparent = page_parent(&self.conn, parent)?
+            .ok_or_else(|| anyhow::anyhow!("pagina {parent} nao existe"))?;
+        let siblings = sibling_ids(&self.conn, grandparent)?;
+        let Some(index) = siblings.iter().position(|sibling| *sibling == parent) else {
+            anyhow::bail!("pagina {parent} nao esta entre as irmas");
+        };
+        self.move_page(id, grandparent, index + 1)?;
+        Ok(true)
+    }
+
     pub fn set_favorite(&mut self, id: PageId, favorite: bool) -> Result<()> {
         self.conn.execute(
             "UPDATE pages SET favorite = ?2 WHERE id = ?1",
@@ -900,6 +965,96 @@ mod tests {
         assert_eq!(child_ids(&store, Some(filha.id)), filha_antes);
         assert_eq!(store.page_meta(pai.id).unwrap().unwrap().parent, None);
         assert!(child_ids(&store, None).contains(&irma.id));
+        drop(store);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn moves_page_one_step_up_and_down() {
+        let (mut store, path) = blank_store();
+        let now = unix_now();
+        let pai = store.create_page(None, "Pai", "", now).unwrap();
+        let a = store.create_page(Some(pai.id), "A", "", now).unwrap();
+        let b = store.create_page(Some(pai.id), "B", "", now).unwrap();
+        let c = store.create_page(Some(pai.id), "C", "", now).unwrap();
+
+        assert!(store.move_page_down(a.id).unwrap());
+        assert_eq!(child_ids(&store, Some(pai.id)), vec![b.id, a.id, c.id]);
+        assert!(store.move_page_up(c.id).unwrap());
+        assert_eq!(child_ids(&store, Some(pai.id)), vec![b.id, c.id, a.id]);
+
+        assert!(!store.move_page_up(b.id).unwrap());
+        assert!(!store.move_page_down(a.id).unwrap());
+        assert_eq!(child_ids(&store, Some(pai.id)), vec![b.id, c.id, a.id]);
+        assert_eq!(child_sorts(&store, Some(pai.id)), vec![0, 1, 2]);
+        drop(store);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn indents_page_under_the_previous_sibling() {
+        let (mut store, path) = blank_store();
+        let now = unix_now();
+        let pai = store.create_page(None, "Pai", "", now).unwrap();
+        let a = store.create_page(Some(pai.id), "A", "", now).unwrap();
+        let b = store.create_page(Some(pai.id), "B", "", now).unwrap();
+        let c = store.create_page(Some(pai.id), "C", "", now).unwrap();
+        let neto = store.create_page(Some(b.id), "Neto", "", now).unwrap();
+
+        assert!(store.indent_page(c.id).unwrap());
+        assert_eq!(child_ids(&store, Some(pai.id)), vec![a.id, b.id]);
+        assert_eq!(child_ids(&store, Some(b.id)), vec![neto.id, c.id]);
+        assert_eq!(child_sorts(&store, Some(b.id)), vec![0, 1]);
+        assert_eq!(store.page_meta(c.id).unwrap().unwrap().parent, Some(b.id));
+
+        // Primeira irma nao tem para onde indentar.
+        assert!(!store.indent_page(a.id).unwrap());
+        assert_eq!(child_ids(&store, Some(pai.id)), vec![a.id, b.id]);
+        drop(store);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn outdents_page_after_its_parent() {
+        let (mut store, path) = blank_store();
+        let now = unix_now();
+        let pai = store.create_page(None, "Pai", "", now).unwrap();
+        let irma = store.create_page(None, "Irma", "", now).unwrap();
+        let a = store.create_page(Some(pai.id), "A", "", now).unwrap();
+        let b = store.create_page(Some(pai.id), "B", "", now).unwrap();
+        let neto = store.create_page(Some(a.id), "Neto", "", now).unwrap();
+
+        assert!(store.outdent_page(neto.id).unwrap());
+        assert_eq!(child_ids(&store, Some(pai.id)), vec![a.id, neto.id, b.id]);
+        assert!(child_ids(&store, Some(a.id)).is_empty());
+        assert_eq!(child_sorts(&store, Some(pai.id)), vec![0, 1, 2]);
+
+        // Raiz nao tem avo: gesto idempotente, nada muda.
+        let raizes = child_ids(&store, None);
+        assert!(!store.outdent_page(pai.id).unwrap());
+        assert_eq!(child_ids(&store, None), raizes);
+        assert_eq!(child_ids(&store, None), vec![pai.id, irma.id]);
+        drop(store);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn indenting_a_page_can_never_create_a_cycle() {
+        let (mut store, path) = blank_store();
+        let now = unix_now();
+        let pai = store.create_page(None, "Pai", "", now).unwrap();
+        let filha = store.create_page(Some(pai.id), "Filha", "", now).unwrap();
+        let irma = store.create_page(Some(pai.id), "Irma", "", now).unwrap();
+
+        // Indentar a irma sob a filha e valido; mover o pai para dentro da
+        // filha continua barrado por `move_page`.
+        assert!(store.indent_page(irma.id).unwrap());
+        assert_eq!(
+            store.page_meta(irma.id).unwrap().unwrap().parent,
+            Some(filha.id)
+        );
+        assert!(store.move_page(pai.id, Some(filha.id), 0).is_err());
+        assert_eq!(store.page_meta(pai.id).unwrap().unwrap().parent, None);
         drop(store);
         let _ = std::fs::remove_file(path);
     }
