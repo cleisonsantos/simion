@@ -39,4 +39,10 @@ jobs:
       - name: git diff --check
         run: git diff --check
       - name: Metadados AppStream
-        run: appstreamcli validate --no-net packaging/com.cleisonsantos.simion.appdata.xml
+        run: |
+          file=packaging/com.cleisonsantos.simion.appdata.xml
+          if [ ! -f "$file" ]; then
+            echo "::warning::$file ainda não existe neste branch (entra na #35); validação pulada"
+            exit 0
+          fi
+          appstreamcli validate --no-net "$file"
