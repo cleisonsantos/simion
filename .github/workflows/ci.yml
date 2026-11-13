@@ -1,13 +1,48 @@
 name: CI
 
 on:
+  pull_request:
   push:
     branches: [master]
   workflow_dispatch:
 
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   check:
+    # O nome do job é estável de propósito: a proteção de branch do master
+    # exige exatamente "check" verde antes de qualquer merge.
+    name: check
     runs-on: ubuntu-22.04
     steps:
       - uses: actions/checkout@v4
-      - run: echo "Simion CI ok"
+      - name: Dependências de sistema
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            build-essential pkg-config \
+            libxkbcommon-dev libwayland-dev libx11-dev libxi-dev \
+            libxrandr-dev libxcursor-dev libxinerama-dev libgl1-mesa-dev \
+            appstream
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      - uses: Swatinem/rust-cache@v2
+      - name: cargo fmt --check
+        run: cargo fmt --all -- --check
+      - name: cargo test
+        run: cargo test --locked
+      - name: cargo build --release
+        run: cargo build --release --locked
+      - name: git diff --check
+        run: git diff --check
+      - name: Metadados AppStream
+        run: |
+          file=packaging/com.cleisonsantos.simion.appdata.xml
+          if [ ! -f "$file" ]; then
+            echo "::warning::$file ainda não existe neste branch (entra na #35); validação pulada"
+            exit 0
+          fi
+          appstreamcli validate --no-net "$file"
