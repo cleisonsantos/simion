@@ -10,12 +10,14 @@ TOOL="${APPIMAGETOOL:-appimagetool}"
 rm -rf "$APPDIR"
 mkdir -p "$APPDIR/usr/bin" \
          "$APPDIR/usr/share/applications" \
+         "$APPDIR/usr/share/metainfo" \
          "$APPDIR/usr/share/icons/hicolor/512x512/apps" \
          "$ROOT/dist"
 
 install -m 0755 "$ROOT/target/release/simion" "$APPDIR/usr/bin/simion"
 install -m 0644 "$ROOT/packaging/simion.desktop" "$APPDIR/simion.desktop"
 install -m 0644 "$ROOT/packaging/simion.desktop" "$APPDIR/usr/share/applications/simion.desktop"
+install -m 0644 "$ROOT/packaging/com.cleisonsantos.simion.appdata.xml" "$APPDIR/usr/share/metainfo/com.cleisonsantos.simion.appdata.xml"
 install -m 0644 "$ROOT/assets/branding/simion-512.png" "$APPDIR/simion.png"
 install -m 0644 "$ROOT/assets/branding/simion-512.png" "$APPDIR/usr/share/icons/hicolor/512x512/apps/simion.png"
 

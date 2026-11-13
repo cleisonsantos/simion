@@ -1,0 +1,32 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<component type="desktop-application">
+  <id>com.cleisonsantos.simion</id>
+  <metadata_license>CC0-1.0</metadata_license>
+  <project_license>MIT</project_license>
+  <name>Simion</name>
+  <summary>Caderno de blocos local, com Markdown, tarefas e SQLite</summary>
+  <description>
+    <p>Simion é um caderno de blocos local, leve e bonito, inspirado no Notion: você escreve em blocos — parágrafos, títulos, listas de tarefas, citações e código — e organiza tudo em páginas com hierarquia.</p>
+    <p>O editor aceita Markdown diretamente, tem busca local e atalhos de teclado parecidos com os do Notion.</p>
+    <p>Tudo fica no seu computador, em um único banco SQLite, e funciona offline: sem conta, sem nuvem e sem Electron.</p>
+  </description>
+  <developer_name>Cleison Santos</developer_name>
+  <launchable type="desktop-id">simion.desktop</launchable>
+  <icon type="stock">simion</icon>
+  <url type="homepage">https://github.com/cleisonsantos/simion</url>
+  <categories>
+    <category>Office</category>
+    <category>Utility</category>
+  </categories>
+  <keywords>
+    <keyword>anotações</keyword>
+    <keyword>notas</keyword>
+    <keyword>markdown</keyword>
+    <keyword>tarefas</keyword>
+    <keyword>sqlite</keyword>
+  </keywords>
+  <content_rating type="oars-1.1"/>
+  <releases>
+    <release version="0.1.11" date="2026-11-13"/>
+  </releases>
+</component>
