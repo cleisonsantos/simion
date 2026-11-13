@@ -26,7 +26,11 @@ jobs:
           sudo apt-get install -y \
             build-essential pkg-config \
             libxkbcommon-dev libwayland-dev libx11-dev libxi-dev \
-            libxrandr-dev libxcursor-dev libxinerama-dev libgl1-mesa-dev
+            libxrandr-dev libxcursor-dev libxinerama-dev libgl1-mesa-dev \
+            appstream
+
+      - name: Validar metadados AppStream
+        run: appstreamcli validate --no-net packaging/simion.appdata.xml
 
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
@@ -60,6 +64,19 @@ jobs:
               packaging/nfpm.yaml > "/tmp/nfpm-$1.yaml"
             /tmp/nfpm package -f "/tmp/nfpm-$1.yaml" -p "$1" -t dist
           done
+
+      - name: Smoke do deb e rpm (AppStream)
+        shell: bash
+        run: |
+          dpkg-deb -c dist/*.deb | grep -q 'usr/share/metainfo/simion.appdata.xml' \
+            || { echo "✗ .deb sem simion.appdata.xml" >&2; exit 1; }
+          if command -v rpm >/dev/null 2>&1; then
+            rpm -qlp dist/*.rpm | grep -q 'usr/share/metainfo/simion.appdata.xml' \
+              || { echo "✗ .rpm sem simion.appdata.xml" >&2; exit 1; }
+          else
+            bsdtar -tf dist/*.rpm | grep -q 'usr/share/metainfo/simion.appdata.xml' \
+              || { echo "✗ .rpm sem simion.appdata.xml" >&2; exit 1; }
+          fi
 
       - name: AppImage
         shell: bash
