@@ -71,15 +71,95 @@ impl App {
 
         let page_id = self.current.unwrap_or(0);
         let mut scroll = egui::ScrollArea::vertical()
+            // Caret navigation must use the final viewport in the same frame.
+            .animated(false)
             .auto_shrink([false, false])
             .id_salt(("simion-editor", page_id));
         if reset_scroll {
             scroll = scroll.vertical_scroll_offset(0.0);
         }
 
-        scroll.show_viewport(ui, |ui, viewport| {
+        let paging = if !self.search.open && self.slash.is_none() && self.code_lang_menu.is_none() {
+            if self.consume_pub(ui.ctx(), Key::PageDown, Modifiers::NONE) {
+                Some(true)
+            } else if self.consume_pub(ui.ctx(), Key::PageUp, Modifiers::NONE) {
+                Some(false)
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+        let paging_id = ui.scope_id().with(("editor-paging", page_id));
+        if let Some(down) = paging {
+            if let Some((offset, height, maximum)) = ui
+                .ctx()
+                .data(|data| data.get_temp::<(f32, f32, f32)>(paging_id))
+            {
+                let target =
+                    (offset + if down { height * 0.8 } else { -height * 0.8 }).clamp(0.0, maximum);
+                scroll = scroll.vertical_scroll_offset(target);
+            }
+            self.scroll_to = None;
+        }
+        let output = scroll.show_viewport(ui, |ui, viewport| {
             self.editor_content(ui, viewport, actions);
         });
+        ui.ctx().data_mut(|data| {
+            data.insert_temp(
+                paging_id,
+                (
+                    output.state.clamped_offset().y,
+                    output.inner_rect.height(),
+                    (output.content_size.y - output.inner_rect.height()).max(0.0),
+                ),
+            )
+        });
+        if let Some(down) = paging {
+            let visible: Vec<_> = self
+                .page
+                .blocks
+                .iter()
+                .filter(|block| {
+                    block.kind.accepts_text()
+                        && self
+                            .block_rects
+                            .get(&block.id)
+                            .is_some_and(|rect| rect.intersects(output.inner_rect))
+                })
+                .collect();
+            let nonempty: Vec<_> = visible
+                .iter()
+                .copied()
+                .filter(|block| !block.text.is_empty())
+                .collect();
+            let candidates = if nonempty.is_empty() {
+                &visible
+            } else {
+                &nonempty
+            };
+            if let Some(block) = if down {
+                candidates.last()
+            } else {
+                candidates.first()
+            } {
+                let id = block.id;
+                let caret = self.block_galleys.get(&id).map_or(0, |(galley, origin)| {
+                    let rect = self.block_rects[&id].intersect(output.inner_rect);
+                    let y = if down {
+                        rect.bottom() - 2.0
+                    } else {
+                        rect.top() + 2.0
+                    };
+                    galley.cursor_from_pos(pos2(origin.x, y) - *origin).index.0
+                });
+                self.block_selection = None;
+                self.text_span = None;
+                self.focus_block(id, caret);
+                self.scroll_to = None;
+                ui.ctx().request_repaint();
+            }
+        }
     }
 
     fn editor_content(&mut self, ui: &mut Ui, viewport: Rect, actions: &mut Vec<Action>) {
@@ -87,18 +167,6 @@ impl App {
         let inner_width = (full_width - 64.0).clamp(280.0, MAX_CONTENT_WIDTH);
         let left = ((full_width - inner_width) / 2.0).max(22.0);
         let editor_left = ui.cursor().left();
-
-        // Scroll relative to the viewport, independently of the focused block.
-        // Moving focus here would make TextEdit scroll back to its caret.
-        if !self.search.open && self.slash.is_none() && self.code_lang_menu.is_none() {
-            let page = viewport.height() * 0.8;
-            if self.consume_pub(ui.ctx(), Key::PageDown, Modifiers::NONE) {
-                ui.scroll_with_delta(vec2(0.0, -page));
-            }
-            if self.consume_pub(ui.ctx(), Key::PageUp, Modifiers::NONE) {
-                ui.scroll_with_delta(vec2(0.0, page));
-            }
-        }
 
         ui.horizontal_top(|ui| {
             ui.spacing_mut().item_spacing.x = 0.0;
@@ -1320,9 +1388,31 @@ impl App {
         }) {
             ctx.data_mut(|data| data.remove::<u64>(Id::unique("ctrl-a-empty")));
         }
+        // Consume duplication before text/selection handlers or TextEdit can
+        // interpret Ctrl+D as a native text-editing command on Linux.
+        let duplicate_range = self.block_selection_range().or_else(|| match self.focus {
+            Focus::Block(id) => self.index_of(id).map(|index| (index, index)),
+            _ => None,
+        });
+        if let Some((lo, hi)) = duplicate_range
+            && self.consume_pub(ctx, Key::D, Modifiers::COMMAND)
+        {
+            self.text_span = None;
+            self.text_anchor = None;
+            self.duplicate_range(lo, hi);
+            return;
+        }
         self.span_pointer(ctx);
         if self.span_keys(ctx) {
             return;
+        }
+        if self.block_selection_range().is_some() {
+            for (key, delta) in [(Key::ArrowUp, -1), (Key::ArrowDown, 1)] {
+                if self.consume_pub(ctx, key, Modifiers::COMMAND | Modifiers::SHIFT) {
+                    self.apply_block_context(BlockContextAction::Move(delta), ctx);
+                    return;
+                }
+            }
         }
         if self.block_selection.is_some() && self.selection_keys(ctx) {
             return;
@@ -1592,10 +1682,6 @@ impl App {
         }
         if self.consume_pub(ctx, Key::ArrowDown, Modifiers::COMMAND | Modifiers::SHIFT) {
             self.move_block(id, 1);
-            return;
-        }
-        if self.consume_pub(ctx, Key::D, Modifiers::COMMAND) {
-            self.duplicate_block(id);
             return;
         }
         // Ctrl+A selects the text; with all of it already selected (or
@@ -2131,6 +2217,20 @@ impl App {
         if let Some((anchor, _)) = self.block_selection {
             self.restore_selection_focus(anchor);
         }
+    }
+
+    fn duplicate_range(&mut self, lo: usize, hi: usize) {
+        self.begin_change();
+        let mut copies = self.page.blocks[lo..=hi].to_vec();
+        for block in &mut copies {
+            block.id = self.ids.next();
+        }
+        let last = copies.last().unwrap();
+        let (id, caret) = (last.id, last.text.chars().count());
+        self.page.blocks.splice(hi + 1..hi + 1, copies);
+        self.block_selection = None;
+        self.focus_block(id, caret);
+        self.end_change();
     }
 
     fn restore_selection_focus(&mut self, id: u64) {
@@ -4453,20 +4553,45 @@ mod tests {
     }
 
     #[test]
-    fn page_keys_preserve_caret() {
+    fn page_keys_move_caret_to_visible_text() {
         let blocks = vec![(BlockKind::Paragraph, "alpha one"); 60];
         let mut h = Harness::new("title", &blocks);
         h.caret_in(0, 3);
         let top = h.app.block_rects[&h.id(0)].top();
-        h.key(Key::PageDown, Modifiers::NONE);
-        for _ in 0..20 {
-            h.idle();
+        for key in [Key::PageDown, Key::PageDown, Key::PageUp] {
+            h.key(key, Modifiers::NONE);
+            let Focus::Block(id) = h.app.focus else {
+                panic!("editor lost focus")
+            };
+            let rect = h.app.block_rects[&id];
+            assert!(rect.bottom() > 32.0 && rect.top() < 700.0, "{rect:?}");
+            let index = h.app.index_of(id).unwrap();
+            h.type_text("Q");
+            assert!(h.app.page.blocks[index].text.contains('Q'));
         }
         assert!(h.app.block_rects[&h.id(0)].top() < top - 100.0);
-        for key in [Key::PageDown, Key::PageUp] {
+    }
+
+    #[test]
+    fn paging_prefers_visible_text_over_empty_blocks_and_dividers() {
+        let mut blocks = vec![(BlockKind::Paragraph, "text"); 60];
+        for (index, block) in blocks.iter_mut().enumerate() {
+            if index % 3 == 1 {
+                *block = (BlockKind::Divider, "");
+            } else if index % 3 == 2 {
+                *block = (BlockKind::Paragraph, "");
+            }
+        }
+        let mut h = Harness::new("t", &blocks);
+        h.caret_in(0, 0);
+        for key in [Key::PageDown, Key::PageDown, Key::PageUp] {
             h.key(key, Modifiers::NONE);
-            assert_eq!(h.app.focus, Focus::Block(h.id(0)));
-            assert_eq!(h.app.cursor_range_for(&h.ctx, h.id(0)), Some((3, 3)));
+            let Focus::Block(id) = h.app.focus else {
+                panic!("editor lost focus")
+            };
+            let index = h.app.index_of(id).unwrap();
+            assert_eq!(h.app.page.blocks[index].text, "text");
+            assert!(index > 0);
         }
     }
 
@@ -4689,13 +4814,180 @@ mod tests {
     }
 
     #[test]
-    fn ctrl_d_duplicates_the_block() {
-        let mut h = Harness::new("t", &[(BlockKind::Bullet, "alpha")]);
-        h.caret_in(0, 2);
-        h.key(Key::D, Modifiers::COMMAND);
-        assert_eq!(h.texts(), ["alpha", "alpha"]);
-        assert_eq!(h.app.page.blocks[1].kind, BlockKind::Bullet);
-        assert_eq!(h.app.focus, Focus::Block(h.id(1)));
+    fn individual_operations_restore_order_focus_and_caret_with_one_undo() {
+        let mut h = Harness::new(
+            "t",
+            &[
+                (BlockKind::Paragraph, "a"),
+                (BlockKind::Paragraph, "alpha"),
+                (BlockKind::Paragraph, "b"),
+            ],
+        );
+        h.caret_in(1, 5);
+        let id = h.id(1);
+        for (key, modifiers) in [
+            (Key::D, Modifiers::COMMAND),
+            (Key::ArrowUp, Modifiers::COMMAND | Modifiers::SHIFT),
+            (Key::ArrowDown, Modifiers::COMMAND | Modifiers::SHIFT),
+        ] {
+            let count = h.app.history.undo.len();
+            h.key(key, modifiers);
+            assert_eq!(h.app.history.undo.len(), count + 1);
+            h.app.undo();
+            h.idle();
+            assert_eq!(h.texts(), ["a", "alpha", "b"]);
+            assert_eq!(h.app.focus, Focus::Block(id));
+            assert_eq!(h.app.cursor_range_for(&h.ctx, id), Some((5, 5)));
+        }
+        h.caret_in(2, 1);
+        let count = h.app.history.undo.len();
+        h.key(Key::ArrowDown, Modifiers::COMMAND | Modifiers::SHIFT);
+        assert_eq!(h.app.history.undo.len(), count);
+        assert_eq!(h.texts(), ["a", "alpha", "b"]);
+    }
+
+    #[test]
+    fn duplicate_range_indices_metadata_and_single_undo() {
+        for (lo, hi) in [(0, 0), (0, 1), (1, 2), (2, 2)] {
+            let mut h = Harness::new(
+                "t",
+                &[
+                    (BlockKind::Todo, "á"),
+                    (BlockKind::Code, "beta"),
+                    (BlockKind::Divider, ""),
+                ],
+            );
+            h.app.page.blocks[0].checked = true;
+            h.app.page.blocks[0].indent = 2;
+            h.app.page.blocks[1].lang = "rust".into();
+            let original = h.app.page.blocks.clone();
+            h.caret_in(lo, 0);
+            h.app.block_selection = Some((h.id(hi), h.id(lo)));
+            let count = h.app.history.undo.len();
+            h.key(Key::D, Modifiers::COMMAND);
+            assert_eq!(h.app.history.undo.len(), count + 1);
+            assert_eq!(h.app.page.blocks.len(), 3 + hi - lo + 1);
+            for (offset, source) in original[lo..=hi].iter().enumerate() {
+                let copy = &h.app.page.blocks[hi + 1 + offset];
+                let mut expected = source.clone();
+                expected.id = copy.id;
+                assert_eq!(*copy, expected);
+                assert_ne!(copy.id, source.id);
+            }
+            let last = hi + 1 + hi - lo;
+            assert_eq!(h.app.focus, Focus::Block(h.id(last)));
+            assert_eq!(
+                h.app.cursors.get(&h.id(last)).copied(),
+                Some((
+                    original[hi].text.chars().count(),
+                    original[hi].text.chars().count()
+                ))
+            );
+            h.app.undo();
+            assert_eq!(h.app.page.blocks, original);
+        }
+    }
+
+    #[test]
+    fn move_range_indices_limits_and_single_undo() {
+        for (lo, hi, down, expected) in [
+            (1, 1, false, vec!["b", "a", "c", "d"]),
+            (1, 2, false, vec!["b", "c", "a", "d"]),
+            (1, 2, true, vec!["a", "d", "b", "c"]),
+            (0, 1, false, vec!["a", "b", "c", "d"]),
+            (2, 3, true, vec!["a", "b", "c", "d"]),
+        ] {
+            let mut h = Harness::new(
+                "t",
+                &[
+                    (BlockKind::Paragraph, "a"),
+                    (BlockKind::Paragraph, "b"),
+                    (BlockKind::Paragraph, "c"),
+                    (BlockKind::Paragraph, "d"),
+                ],
+            );
+            h.caret_in(lo, 1);
+            h.app.block_selection = Some((h.id(hi), h.id(lo)));
+            let selection = h.app.block_selection;
+            let count = h.app.history.undo.len();
+            h.key(
+                if down { Key::ArrowDown } else { Key::ArrowUp },
+                Modifiers::COMMAND | Modifiers::SHIFT,
+            );
+            assert_eq!(h.texts(), expected);
+            assert_eq!(h.app.block_selection, selection);
+            let moved = expected != vec!["a", "b", "c", "d"];
+            assert_eq!(h.app.history.undo.len(), count + usize::from(moved));
+            if moved {
+                h.app.undo();
+                assert_eq!(h.texts(), ["a", "b", "c", "d"]);
+            }
+        }
+    }
+
+    #[test]
+    fn ctrl_d_duplicates_focused_blocks_and_restores_native_caret() {
+        for kind in [
+            BlockKind::Paragraph,
+            BlockKind::Code,
+            BlockKind::Todo,
+            BlockKind::Bullet,
+            BlockKind::Divider,
+        ] {
+            let text = if kind == BlockKind::Divider {
+                ""
+            } else {
+                "álpha"
+            };
+            let mut h = Harness::new("t", &[(kind, text), (BlockKind::Paragraph, "delta")]);
+            h.caret_in(0, 2);
+            assert!(h.app.block_selection.is_none());
+            let original = h.app.page.blocks.clone();
+            let count = h.app.history.undo.len();
+            h.key(Key::D, Modifiers::COMMAND);
+            assert_eq!(h.texts(), [text, text, "delta"]);
+            assert_eq!(h.app.page.blocks[1].kind, kind);
+            assert_eq!(h.app.focus, Focus::Block(h.id(1)));
+            assert_eq!(h.app.history.undo.len(), count + 1);
+            if kind.accepts_text() {
+                let end = text.chars().count();
+                assert_eq!(h.app.cursor_range_for(&h.ctx, h.id(1)), Some((end, end)));
+            }
+            h.key(Key::Z, Modifiers::COMMAND);
+            assert_eq!(h.app.page.blocks, original);
+
+            h.key(Key::D, Modifiers::COMMAND);
+            if kind.accepts_text() {
+                h.type_text("Q");
+                assert_eq!(h.texts(), [text, &format!("{text}Q"), "delta"]);
+            }
+        }
+    }
+
+    #[test]
+    fn ctrl_d_is_left_for_contexts_outside_the_editor() {
+        for focus in [Focus::Title, Focus::None] {
+            let mut h = Harness::new("t", &[(BlockKind::Paragraph, "alpha")]);
+            h.app.focus = focus;
+            let _ = h.ctx.run_ui(
+                RawInput {
+                    events: vec![Event::Key {
+                        key: Key::D,
+                        physical_key: None,
+                        pressed: true,
+                        repeat: false,
+                        modifiers: Modifiers::COMMAND,
+                    }],
+                    ..Default::default()
+                },
+                |ui| {
+                    let ctx = ui.ctx();
+                    h.app.handle_keys(ctx);
+                    assert!(ctx.input_mut(|input| input.consume_key(Modifiers::COMMAND, Key::D)));
+                },
+            );
+            assert_eq!(h.texts(), ["alpha"]);
+        }
     }
 
     #[test]
