@@ -13,7 +13,7 @@ use crate::theme::{
     FONT_BODY, FONT_MEDIUM, FONT_MONO, FONT_SEMIBOLD, GUTTER, Mode, Palette, family,
 };
 use crate::ui as widgets;
-use crate::updater::UpdateStatus;
+use crate::updater::{self, UpdateStatus};
 
 const EMOJIS: [&str; 48] = [
     "📄", "📝", "📚", "📌", "💡", "✅", "🚀", "⭐", "❤", "🎯", "🔥", "🌱", "🍀", "🌊", "☀", "🌙",
@@ -1407,18 +1407,34 @@ fn update_status(ui: &mut Ui, status: &UpdateStatus, p: &Palette, actions: &mut 
                 text(ui, format!("{:.0} %", progress * 100.0), p.muted);
             });
         }
-        UpdateStatus::Ready { release, .. } => {
+        UpdateStatus::Ready { release, path } => {
             ui.horizontal(|ui| {
-                text(
-                    ui,
-                    format!("v{} pronto para instalar", release.version),
-                    p.text,
-                );
+                text(ui, format!("Atualizar para v{}", release.version), p.text);
                 ui.add_space(6.0);
-                if widgets::primary_button(ui, "Reiniciar e instalar", p).clicked() {
+                let action = if updater::replaces_running_app(path) {
+                    "Reiniciar e atualizar"
+                } else {
+                    "Abrir instalador"
+                };
+                if widgets::primary_button(ui, action, p).clicked() {
                     actions.push(Action::ApplyUpdate);
                 }
             });
+            ui.add_space(2.0);
+            if updater::replaces_running_app(path) {
+                text(
+                    ui,
+                    "O Simion vai fechar e abrir sozinho na versão nova.".to_owned(),
+                    p.muted,
+                );
+            } else {
+                text(
+                    ui,
+                    "Vamos abrir o instalador do sistema — conclua e abra o Simion de novo."
+                        .to_owned(),
+                    p.muted,
+                );
+            }
         }
         UpdateStatus::Error(err) => {
             ui.add(egui::Label::new(RichText::new(err).size(12.5).color(p.danger)).wrap());

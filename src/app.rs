@@ -1,7 +1,7 @@
 //! Application state, actions and the main frame loop.
 
 use std::collections::{HashMap, HashSet};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::mpsc::{self, TryRecvError};
 use std::time::{Duration, Instant};
@@ -736,9 +736,49 @@ impl App {
             .and_then(|store| store.setting("last_update_check").ok().flatten())
             .and_then(|value| value.parse::<i64>().ok())
             .unwrap_or(0);
+        self.restore_pending_update();
 
         if self.update.auto && updater::check_due(self.update.last_check, unix_now()) {
             self.start_update_check(ctx, false);
+        }
+    }
+
+    /// Reoferece um download concluído numa sessão anterior, sem consultar a
+    /// API nem baixar de novo. O arquivo temporário pode ter sido apagado.
+    fn restore_pending_update(&mut self) {
+        let Some(value) = self
+            .store
+            .as_ref()
+            .and_then(|store| store.setting(updater::PENDING_UPDATE_KEY).ok().flatten())
+        else {
+            return;
+        };
+        let pending = updater::parse_pending_update(&value).filter(|(version, path)| {
+            path.is_file() && updater::is_newer(version, env!("CARGO_PKG_VERSION"))
+        });
+        match pending {
+            Some((version, path)) => {
+                self.update.status = UpdateStatus::Ready {
+                    release: updater::pending_release(&version),
+                    path,
+                };
+            }
+            None => self.clear_pending_update(),
+        }
+    }
+
+    fn remember_pending_update(&mut self, release: &Release, path: &Path) {
+        if let Some(store) = self.store.as_mut() {
+            let value = updater::format_pending_update(&release.version, path);
+            let _ = store.set_setting(updater::PENDING_UPDATE_KEY, &value);
+        }
+    }
+
+    fn clear_pending_update(&mut self) {
+        if let Some(store) = self.store.as_mut() {
+            // O `Store` só expõe upsert; valor vazio equivale a "sem pendência"
+            // para `parse_pending_update`.
+            let _ = store.set_setting(updater::PENDING_UPDATE_KEY, "");
         }
     }
 
@@ -874,6 +914,7 @@ impl App {
                 }
             }
             UpdateMsg::DownloadReady(release, path) => {
+                self.remember_pending_update(&release, &path);
                 self.update.status = UpdateStatus::Ready { release, path };
                 self.toast("Atualização baixada — pronta para instalar");
             }
@@ -902,15 +943,25 @@ impl App {
         };
         // A página precisa estar no SQLite antes de o processo ser reiniciado.
         self.save_now();
+        // Portátil: o processo sai dentro de `apply_update`; limpa a pendência
+        // antes, mas restaura se a substituição/respawn falhar e o app seguir
+        // vivo. Instalador de pacote: mantém a chave para reoferecer ao abrir.
+        let portable = updater::replaces_running_app(&path);
+        if portable {
+            self.clear_pending_update();
+        }
         match updater::apply_update(&path) {
             Ok(ApplyOutcome::InstallerOpened) => {
                 self.update.status = UpdateStatus::Idle;
                 self.update.dismissed = None;
                 self.toast("Instalador aberto — conclua a instalação");
             }
-            Ok(ApplyOutcome::Restarted) => {}
+            Ok(ApplyOutcome::Restarted) => self.clear_pending_update(),
             Err(err) => {
                 // Mantém o estado Ready: o download continua disponível.
+                if portable {
+                    self.remember_pending_update(&release, &path);
+                }
                 self.toast(format!(
                     "Não foi possível atualizar para v{}: {err}",
                     release.version
@@ -1882,20 +1933,20 @@ impl App {
                                 }
                             });
                         }
-                        UpdateStatus::Ready { release, .. } => {
+                        UpdateStatus::Ready { release, path } => {
                             ui.label(
-                                RichText::new(format!(
-                                    "Simion v{} pronto para instalar",
-                                    release.version
-                                ))
-                                .size(13.0)
-                                .color(p.text)
-                                .strong(),
+                                RichText::new(format!("Atualizar para v{}", release.version))
+                                    .size(13.0)
+                                    .color(p.text)
+                                    .strong(),
                             );
                             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                                if crate::ui::primary_button(ui, "Reiniciar e atualizar", &p)
-                                    .clicked()
-                                {
+                                let action = if updater::replaces_running_app(path) {
+                                    "Reiniciar e atualizar"
+                                } else {
+                                    "Abrir instalador"
+                                };
+                                if crate::ui::primary_button(ui, action, &p).clicked() {
                                     actions.push(Action::ApplyUpdate);
                                 }
                                 if banner_dismiss(ui, &p) {
