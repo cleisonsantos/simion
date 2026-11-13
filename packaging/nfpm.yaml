@@ -29,8 +29,8 @@ contents:
     dst: /usr/bin/simion
   - src: packaging/simion.desktop
     dst: /usr/share/applications/simion.desktop
-  - src: packaging/simion.appdata.xml
-    dst: /usr/share/metainfo/simion.appdata.xml
+  - src: packaging/com.cleisonsantos.simion.appdata.xml
+    dst: /usr/share/metainfo/com.cleisonsantos.simion.appdata.xml
   - src: assets/branding/simion-512.png
     dst: /usr/share/icons/hicolor/512x512/apps/simion.png
   - src: assets/branding/simion-128.png

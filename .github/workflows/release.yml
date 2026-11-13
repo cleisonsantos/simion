@@ -30,7 +30,7 @@ jobs:
             appstream
 
       - name: Validar metadados AppStream
-        run: appstreamcli validate --no-net packaging/simion.appdata.xml
+        run: appstreamcli validate --no-net packaging/com.cleisonsantos.simion.appdata.xml
 
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
@@ -68,14 +68,14 @@ jobs:
       - name: Smoke do deb e rpm (AppStream)
         shell: bash
         run: |
-          dpkg-deb -c dist/*.deb | grep -q 'usr/share/metainfo/simion.appdata.xml' \
-            || { echo "✗ .deb sem simion.appdata.xml" >&2; exit 1; }
+          dpkg-deb -c dist/*.deb | grep -q 'usr/share/metainfo/com.cleisonsantos.simion.appdata.xml' \
+            || { echo "✗ .deb sem com.cleisonsantos.simion.appdata.xml" >&2; exit 1; }
           if command -v rpm >/dev/null 2>&1; then
-            rpm -qlp dist/*.rpm | grep -q 'usr/share/metainfo/simion.appdata.xml' \
-              || { echo "✗ .rpm sem simion.appdata.xml" >&2; exit 1; }
+            rpm -qlp dist/*.rpm | grep -q 'usr/share/metainfo/com.cleisonsantos.simion.appdata.xml' \
+              || { echo "✗ .rpm sem com.cleisonsantos.simion.appdata.xml" >&2; exit 1; }
           else
-            bsdtar -tf dist/*.rpm | grep -q 'usr/share/metainfo/simion.appdata.xml' \
-              || { echo "✗ .rpm sem simion.appdata.xml" >&2; exit 1; }
+            bsdtar -tf dist/*.rpm | grep -q 'usr/share/metainfo/com.cleisonsantos.simion.appdata.xml' \
+              || { echo "✗ .rpm sem com.cleisonsantos.simion.appdata.xml" >&2; exit 1; }
           fi
 
       - name: AppImage

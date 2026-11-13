@@ -10,9 +10,7 @@
     <p>O editor aceita Markdown diretamente, tem busca local e atalhos de teclado parecidos com os do Notion.</p>
     <p>Tudo fica no seu computador, em um único banco SQLite, e funciona offline: sem conta, sem nuvem e sem Electron.</p>
   </description>
-  <developer id="com.cleisonsantos">
-    <name>Cleison Santos</name>
-  </developer>
+  <developer_name>Cleison Santos</developer_name>
   <launchable type="desktop-id">simion.desktop</launchable>
   <icon type="stock">simion</icon>
   <url type="homepage">https://github.com/cleisonsantos/simion</url>
