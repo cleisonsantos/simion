@@ -278,7 +278,7 @@ impl App {
         let p = self.palette;
         let zoom = self.zoom;
         let page_id = self.current.unwrap_or(0);
-        let te_id = Id::unique(("simion-title", page_id));
+        let te_id = title_te_id(page_id);
         let font = FontId::new(38.0 * zoom, family(FONT_SEMIBOLD));
         let line_height = 46.0 * zoom;
         let mut title = self.page.meta.title.clone();
@@ -1212,6 +1212,18 @@ impl App {
     // -----------------------------------------------------------------------
 
     pub fn editor_keys(&mut self, ctx: &egui::Context) {
+        if ctx.input(|input| {
+            input.events.iter().any(|event| {
+                matches!(event,
+                    egui::Event::Key { key, pressed: true, .. } if *key != Key::A
+                ) || matches!(
+                    event,
+                    egui::Event::Text(_) | egui::Event::PointerButton { pressed: true, .. }
+                )
+            })
+        }) {
+            ctx.data_mut(|data| data.remove::<u64>(Id::unique("ctrl-a-empty")));
+        }
         self.span_pointer(ctx);
         if self.span_keys(ctx) {
             return;
@@ -1251,49 +1263,16 @@ impl App {
         let (start, end) = (a.min(b).min(chars), a.max(b).min(chars));
 
         if self.consume_pub(ctx, Key::Enter, Modifiers::NONE) {
-            if start >= chars {
-                self.focus_first_block(None);
-                return;
-            }
-            // Enter in the middle splits the title: the rest becomes the
-            // first block.
-            let head = title[..markdown::char_to_byte(&title, start)].to_owned();
-            let tail = title[markdown::char_to_byte(&title, end)..].to_owned();
-            self.begin_change();
-            self.set_title(head);
-            let id = self.ids.next();
-            let mut block = crate::model::Block::new(id, BlockKind::Paragraph);
-            block.text = tail;
-            self.page.blocks.insert(0, block);
-            self.end_change();
-            self.focus_block(id, 0);
+            self.focus_first_block(None);
             return;
         }
 
         if start != end {
             return;
         }
-        let caret = TextEditState::load(ctx, title_te_id(self.current.unwrap_or(0)))
-            .and_then(|state| state.cursor.char_range())
-            .map_or(CCursor::new(start), |range| range.primary);
-        let galley = self.title_galley.clone();
-        let on_last_row = galley
-            .as_ref()
-            .is_none_or(|(galley, _)| caret_row(galley, caret) + 1 >= galley.rows.len());
-        if on_last_row && self.consume_pub(ctx, Key::ArrowDown, Modifiers::NONE) {
+        if self.consume_pub(ctx, Key::ArrowDown, Modifiers::NONE) {
             self.focus_first_block(None);
         }
-    }
-
-    fn set_title(&mut self, title: String) {
-        self.page.meta.title = title;
-        if let Some(current) = self.current {
-            if let Some(meta) = self.pages.iter_mut().find(|page| page.id == current) {
-                meta.title = self.page.meta.title.clone();
-            }
-        }
-        self.dirty = true;
-        self.last_edit = self.now;
     }
 
     /// From the title into the first text block: on its first row at `x`
@@ -1398,6 +1377,25 @@ impl App {
             .cursor_range_for(ctx, id)
             .or_else(|| self.cursors.get(&id).copied())
             .unwrap_or((text_len, text_len));
+        for (key, last) in [(Key::Home, false), (Key::End, true)] {
+            if self.consume_pub(ctx, key, Modifiers::COMMAND) {
+                let target = if last {
+                    self.page
+                        .blocks
+                        .iter()
+                        .rfind(|block| block.kind.accepts_text())
+                } else {
+                    self.page
+                        .blocks
+                        .iter()
+                        .find(|block| block.kind.accepts_text())
+                };
+                if let Some(block) = target {
+                    self.focus_block(block.id, if last { block.text.chars().count() } else { 0 });
+                }
+                return;
+            }
+        }
         let has_selection = selection_start != selection_end;
         let caret = selection_end.min(text_len);
 
@@ -1488,14 +1486,20 @@ impl App {
         // Ctrl+A selects the text; with all of it already selected (or
         // nothing to select), the next one selects every block.
         if kind.accepts_text() && self.consume_pub(ctx, Key::A, Modifiers::COMMAND) {
-            if text_len == 0 || (selection_start == 0 && selection_end == text_len) {
+            let empty_selected =
+                ctx.data(|data| data.get_temp::<u64>(Id::unique("ctrl-a-empty"))) == Some(id);
+            if (text_len == 0 && empty_selected)
+                || (text_len > 0 && selection_start == 0 && selection_end == text_len)
+            {
                 let first = self.page.blocks.first().map(|block| block.id);
                 let last = self.page.blocks.last().map(|block| block.id);
                 if let Some(range) = first.zip(last) {
                     self.start_block_selection(ctx, id);
+                    ctx.data_mut(|data| data.insert_temp(Id::unique("ctrl-a-origin"), id));
                     self.block_selection = Some(range);
                 }
             } else {
+                ctx.data_mut(|data| data.insert_temp(Id::unique("ctrl-a-empty"), id));
                 self.pending = Some(PendingFocus {
                     target: Focus::Block(id),
                     range: Some((0, text_len)),
@@ -1566,6 +1570,7 @@ impl App {
 
         // ←/→ (and Ctrl+←/→) at the edge of the block cross into the next one.
         if caret == 0
+            && self.prev_text_block(index).is_some()
             && (self.consume_pub(ctx, Key::ArrowLeft, Modifiers::NONE)
                 || self.consume_pub(ctx, Key::ArrowLeft, Modifiers::COMMAND))
         {
@@ -1573,6 +1578,7 @@ impl App {
             return;
         }
         if caret == text_len
+            && self.next_text_block(index).is_some()
             && (self.consume_pub(ctx, Key::ArrowRight, Modifiers::NONE)
                 || self.consume_pub(ctx, Key::ArrowRight, Modifiers::COMMAND))
         {
@@ -2537,7 +2543,48 @@ impl App {
             self.block_selection = None;
             return false;
         }
+        let mut replacement = String::new();
+        let mut typed = false;
+        ctx.input_mut(|input| {
+            input.events.retain(|event| {
+                if let egui::Event::Text(text) | egui::Event::Paste(text) = event {
+                    replacement.push_str(text);
+                    typed = true;
+                    false
+                } else {
+                    true
+                }
+            })
+        });
+        if typed {
+            let (lo, hi) = self.block_selection_range().unwrap();
+            self.block_selection = None;
+            self.begin_change();
+            let id = self.ids.next();
+            let mut block = crate::model::Block::new(id, BlockKind::Paragraph);
+            block.text = replacement;
+            let caret = block.text.chars().count();
+            self.page.blocks.splice(lo..=hi, [block]);
+            self.end_change();
+            self.focus_block(id, caret);
+            return true;
+        }
         let extent_kind = self.page.blocks[extent_index].kind;
+        if self.consume_pub(ctx, Key::A, Modifiers::COMMAND) {
+            let id = ctx
+                .data(|data| data.get_temp::<u64>(Id::unique("ctrl-a-origin")))
+                .filter(|id| self.index_of(*id).is_some())
+                .unwrap_or(anchor);
+            self.block_selection = None;
+            let length = self.page.blocks[self.index_of(id).unwrap()]
+                .text
+                .chars()
+                .count();
+            self.focus_block(id, 0);
+            self.pending.as_mut().unwrap().range = Some((0, length));
+            return true;
+        }
+
         for (key, kind) in [
             (Key::Num1, BlockKind::Heading1),
             (Key::Num2, BlockKind::Heading2),
@@ -3681,19 +3728,20 @@ mod tests {
         h.caret_in(0, 0);
         h.key(Key::ArrowLeft, Modifiers::NONE);
         h.type_text("S");
-        assert_eq!(h.app.page.meta.title, "titleS");
+        assert_eq!(h.app.page.meta.title, "title");
+        assert_eq!(h.texts(), ["SalphaR", "Qbravo"]);
     }
 
     #[test]
-    fn enter_in_the_middle_of_the_title_splits_it() {
+    fn enter_in_the_title_focuses_first_block_without_editing_title() {
         let mut h = Harness::new("titulo", &[(BlockKind::Paragraph, "alpha")]);
         h.app.focus_title(3);
         h.idle();
         h.key(Key::Enter, Modifiers::NONE);
-        assert_eq!(h.app.page.meta.title, "tit");
-        assert_eq!(h.texts(), ["ulo", "alpha"]);
+        assert_eq!(h.app.page.meta.title, "titulo");
+        assert_eq!(h.texts(), ["alpha"]);
         h.type_text("Q");
-        assert_eq!(h.texts(), ["Qulo", "alpha"]);
+        assert_eq!(h.texts(), ["Qalpha"]);
     }
 
     #[test]
@@ -3849,6 +3897,91 @@ mod tests {
         assert_eq!(h.texts(), ["bravoQ two", "alpha one"]);
         h.key(Key::ArrowDown, Modifiers::COMMAND | Modifiers::SHIFT);
         assert_eq!(h.texts(), ["alpha one", "bravoQ two"]);
+    }
+
+    #[test]
+    fn keyboard_selection_continues_and_deletes_only_selected_text() {
+        let mut h = Harness::new(
+            "t",
+            &[
+                (BlockKind::Paragraph, "alpha"),
+                (BlockKind::Paragraph, "bravo"),
+            ],
+        );
+        h.caret_in(1, 5);
+        h.key(Key::ArrowLeft, Modifiers::SHIFT);
+        h.key(Key::ArrowLeft, Modifiers::SHIFT);
+        assert_eq!(h.app.cursor_range_for(&h.ctx, h.id(1)), Some((3, 5)));
+        h.key(Key::Backspace, Modifiers::NONE);
+        assert_eq!(h.texts(), ["alpha", "bra"]);
+        h.caret_in(0, 0);
+        h.key(Key::ArrowRight, Modifiers::CTRL | Modifiers::SHIFT);
+        assert_eq!(h.app.cursor_range_for(&h.ctx, h.id(0)), Some((0, 5)));
+    }
+
+    #[test]
+    fn home_end_use_visual_lines_and_ctrl_uses_page_edges() {
+        let mut h = Harness::new(
+            "t",
+            &[
+                (BlockKind::Divider, ""),
+                (BlockKind::Paragraph, "alpha\nbravo\ncharlie"),
+                (BlockKind::Paragraph, "last"),
+                (BlockKind::Divider, ""),
+            ],
+        );
+        h.caret_in(1, 8);
+        h.key(Key::Home, Modifiers::NONE);
+        assert_eq!(h.app.cursor_range_for(&h.ctx, h.id(1)), Some((6, 6)));
+        h.key(Key::End, Modifiers::NONE);
+        assert_eq!(h.app.cursor_range_for(&h.ctx, h.id(1)), Some((11, 11)));
+        h.key(Key::End, Modifiers::COMMAND);
+        assert_eq!(h.app.focus, Focus::Block(h.id(2)));
+        assert_eq!(h.app.cursor_range_for(&h.ctx, h.id(2)), Some((4, 4)));
+        h.key(Key::Home, Modifiers::COMMAND);
+        assert_eq!(h.app.focus, Focus::Block(h.id(1)));
+        assert_eq!(h.app.cursor_range_for(&h.ctx, h.id(1)), Some((0, 0)));
+    }
+
+    #[test]
+    fn ctrl_a_cycles_back_to_current_block() {
+        for presses in [1, 2, 3] {
+            let mut h = Harness::new(
+                "t",
+                &[
+                    (BlockKind::Paragraph, "alpha"),
+                    (BlockKind::Paragraph, "bravo"),
+                ],
+            );
+            h.caret_in(1, 2);
+            for _ in 0..presses {
+                h.key(Key::A, Modifiers::COMMAND);
+            }
+            h.app.begin_change();
+            let undo_count = h.app.history.undo.len();
+            h.type_text("Q");
+            if presses == 2 {
+                assert_eq!(h.app.history.undo.len(), undo_count + 1);
+                assert_eq!(h.texts(), ["Q"]);
+                h.app.undo();
+                assert_eq!(h.texts(), ["alpha", "bravo"]);
+            } else {
+                assert_eq!(h.texts(), ["alpha", "Q"]);
+            }
+        }
+    }
+
+    #[test]
+    fn empty_block_ctrl_a_needs_two_presses_for_page_selection() {
+        let mut h = Harness::new(
+            "t",
+            &[(BlockKind::Paragraph, "alpha"), (BlockKind::Paragraph, "")],
+        );
+        h.caret_in(1, 0);
+        h.key(Key::A, Modifiers::COMMAND);
+        assert!(h.app.block_selection.is_none());
+        h.key(Key::A, Modifiers::COMMAND);
+        assert!(h.app.block_selection.is_some());
     }
 
     #[test]
