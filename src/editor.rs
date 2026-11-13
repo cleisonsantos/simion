@@ -54,6 +54,18 @@ impl App {
             reset_scroll = true;
         }
 
+        // Restore native focus before any other field can report its old focus.
+        // The target TextEdit may only be created later in this frame.
+        if let Some(pending) = &self.pending {
+            let id = match pending.target {
+                Focus::Block(id) => Some(block_te_id(id)),
+                Focus::Title => Some(title_te_id(self.current.unwrap_or(0))),
+                Focus::None => None,
+            };
+            if let Some(id) = id {
+                ui.memory_mut(|memory| memory.request_focus(id));
+            }
+        }
         self.header(ui, actions);
         widgets::hairline(ui, &p);
 
@@ -286,6 +298,36 @@ impl App {
             ui.fonts_mut(|fonts| fonts.layout_job(job))
         };
 
+        let pending_title = self
+            .pending
+            .as_ref()
+            .is_some_and(|pending| pending.target == Focus::Title);
+        if pending_title {
+            let chars = self.page.meta.title.chars().count();
+            let pending = self.pending.take().unwrap_or_default();
+            let (start, end) = if pending.select_all {
+                (0, chars)
+            } else {
+                pending.range.unwrap_or((chars, chars))
+            };
+            ui.memory_mut(|memory| memory.request_focus(te_id));
+            if let Some(mut state) = TextEditState::load(ui.ctx(), te_id) {
+                state.cursor.set_char_range(Some(CCursorRange::two(
+                    CCursor::new(start.min(chars)),
+                    CCursor::new(end.min(chars)),
+                )));
+                state.store(ui.ctx(), te_id);
+            } else {
+                let mut state = TextEditState::default();
+                state.cursor.set_char_range(Some(CCursorRange::two(
+                    CCursor::new(start.min(chars)),
+                    CCursor::new(end.min(chars)),
+                )));
+                state.store(ui.ctx(), te_id);
+            }
+            self.focus = Focus::Title;
+        }
+
         let output = ui
             .horizontal(|ui| {
                 ui.spacing_mut().item_spacing.x = 0.0;
@@ -312,6 +354,10 @@ impl App {
             })
             .inner;
 
+        if pending_title {
+            ui.scroll_to_rect(output.response.rect, None);
+        }
+
         if title != self.page.meta.title {
             self.page.meta.title = title;
             if let Some(current) = self.current {
@@ -330,37 +376,6 @@ impl App {
         self.title_cursor = output
             .cursor_range
             .map(|range| (range.primary.index.0, range.secondary.index.0));
-
-        let pending_title = self
-            .pending
-            .as_ref()
-            .is_some_and(|pending| pending.target == Focus::Title);
-        if pending_title {
-            let chars = self.page.meta.title.chars().count();
-            let pending = self.pending.take().unwrap_or_default();
-            let (start, end) = if pending.select_all {
-                (0, chars)
-            } else {
-                pending.range.unwrap_or((chars, chars))
-            };
-            output.response.request_focus();
-            ui.scroll_to_rect(output.response.rect, None);
-            if let Some(mut state) = TextEditState::load(ui.ctx(), te_id) {
-                state.cursor.set_char_range(Some(CCursorRange::two(
-                    CCursor::new(start.min(chars)),
-                    CCursor::new(end.min(chars)),
-                )));
-                state.store(ui.ctx(), te_id);
-            } else {
-                let mut state = TextEditState::default();
-                state.cursor.set_char_range(Some(CCursorRange::two(
-                    CCursor::new(start.min(chars)),
-                    CCursor::new(end.min(chars)),
-                )));
-                state.store(ui.ctx(), te_id);
-            }
-            self.focus = Focus::Title;
-        }
     }
 
     fn blocks(&mut self, ui: &mut Ui, viewport: Rect, editor_left: f32, actions: &mut Vec<Action>) {
@@ -415,6 +430,9 @@ impl App {
             }
 
             let selection_shape = ui.painter().add(Shape::Noop);
+            let before = ui
+                .input(|input| !input.events.is_empty())
+                .then(|| self.editor_snapshot());
             let outcome = self.block_row(ui, index, text_width, column_left, editor_left, actions);
             if self.block_selected(index) {
                 let rect = Rect::from_min_max(
@@ -426,16 +444,30 @@ impl App {
                     Shape::rect_filled(rect, 4, self.palette.selection),
                 );
             }
-            if outcome.changed {
-                any_changed = true;
-                let caret = outcome.cursor.map(|(a, b)| a.max(b));
-                self.after_text_change(index, caret, actions);
-            }
             if outcome.focused && self.block_selection.is_none() {
                 self.focus = Focus::Block(id);
             }
             if let Some(range) = outcome.cursor {
                 self.cursors.insert(id, range);
+            }
+            if outcome.changed {
+                any_changed = true;
+                let typing = ui.input(|input| {
+                    input
+                        .events
+                        .iter()
+                        .any(|event| matches!(event, egui::Event::Text(_)))
+                        && !input
+                            .events
+                            .iter()
+                            .any(|event| matches!(event, egui::Event::Paste(_)))
+                });
+                self.record_text_change(
+                    before.unwrap_or_else(|| self.history.last.clone()),
+                    typing,
+                );
+                let caret = outcome.cursor.map(|(a, b)| a.max(b));
+                self.after_text_change(index, caret, actions);
             }
             let measured = outcome.rect.height().max(8.0);
             self.block_heights.insert(id, measured);
@@ -1234,7 +1266,43 @@ impl App {
         self.focus_block(last_id, caret);
     }
 
+    pub(crate) fn sync_editor_cursor(&mut self, ctx: &egui::Context) {
+        // Read native selection before structural commands remove or split widgets.
+        if self.pending.is_some() {
+            return;
+        }
+        if let Focus::Block(id) = self.focus
+            && let Some(range) = TextEditState::load(ctx, block_te_id(id))
+                .and_then(|state| state.cursor.char_range())
+        {
+            self.cursors
+                .insert(id, (range.primary.index.0, range.secondary.index.0));
+        }
+    }
+
     pub fn editor_keys(&mut self, ctx: &egui::Context) {
+        self.sync_editor_cursor(ctx);
+        if ctx.input(|input| {
+            input.events.iter().any(|event| {
+                matches!(
+                    event,
+                    egui::Event::PointerButton { pressed: true, .. }
+                        | egui::Event::Paste(_)
+                        | egui::Event::Key {
+                            pressed: true,
+                            key: Key::ArrowLeft
+                                | Key::ArrowRight
+                                | Key::ArrowUp
+                                | Key::ArrowDown
+                                | Key::Home
+                                | Key::End,
+                            ..
+                        }
+                )
+            })
+        }) {
+            self.history.typing = None;
+        }
         if let Some((id, text)) = self.pending_paste.take() {
             self.paste_lines(ctx, id, &text);
             return;
@@ -1330,6 +1398,7 @@ impl App {
     }
 
     fn focus_block(&mut self, id: u64, caret: usize) {
+        self.cursors.insert(id, (caret, caret));
         self.focus = Focus::Block(id);
         self.pending = Some(PendingFocus {
             target: Focus::Block(id),
@@ -1759,6 +1828,8 @@ impl App {
             BlockKind::Paragraph
         };
 
+        self.focus_block(id, start.min(end).min(chars));
+        self.pending.as_mut().unwrap().range = Some((start.min(chars), end.min(chars)));
         self.begin_change();
         self.page.blocks[index].text = left;
         let new_id = self.ids.next();
@@ -1767,7 +1838,6 @@ impl App {
         block.indent = indent;
         block.checked = false;
         self.page.blocks.insert(index + 1, block);
-        self.end_change();
         self.focus = Focus::Block(new_id);
         self.pending = Some(PendingFocus {
             target: Focus::Block(new_id),
@@ -1775,6 +1845,7 @@ impl App {
             select_all: false,
         });
         self.scroll_to = Some(new_id);
+        self.end_change();
     }
 
     /// Enter at the very start of a non-empty block: Notion pushes the block
@@ -1823,14 +1894,15 @@ impl App {
         let Some(index) = self.index_of(id) else {
             return;
         };
+        self.focus_block(id, 0);
         if self.page.blocks[index].text.is_empty() {
             if index > 0 {
                 let previous = &self.page.blocks[index - 1];
                 let (target, caret) = (previous.id, previous.text.chars().count());
                 self.begin_change();
                 self.page.blocks.remove(index);
-                self.end_change();
                 self.focus_block(target, caret);
+                self.end_change();
             }
             return;
         }
@@ -1865,13 +1937,13 @@ impl App {
             self.page.blocks.remove(index - 1);
             let new_index = index - 1;
             let target = self.page.blocks[new_index].id;
-            self.end_change();
             self.focus = Focus::Block(target);
             self.pending = Some(PendingFocus {
                 target: Focus::Block(target),
                 range: Some((0, 0)),
                 select_all: false,
             });
+            self.end_change();
             return;
         }
 
@@ -1888,13 +1960,13 @@ impl App {
         }
         self.page.blocks.remove(index);
         let target = self.page.blocks[index - 1].id;
-        self.end_change();
         self.focus = Focus::Block(target);
         self.pending = Some(PendingFocus {
             target: Focus::Block(target),
             range: Some((previous_len, previous_len)),
             select_all: false,
         });
+        self.end_change();
     }
 
     fn delete_merge_forward(&mut self, id: u64) {
@@ -3154,8 +3226,9 @@ mod tests {
             let mut output = self.ctx.run_ui(input, |ui| {
                 let ctx = ui.ctx().clone();
                 app.handle_paste(&ctx);
-                app.editor_keys(&ctx);
+                app.handle_keys(&ctx);
                 app.editor(ui, &mut actions);
+                app.after_frame(&ctx);
             });
             self.last_actions = actions;
             fn selection_rects(shape: &Shape, color: Color32, rects: &mut Vec<Rect>) {
@@ -3698,6 +3771,250 @@ mod tests {
         assert_eq!(code_tab_edit("a\n x", (3, 3), true), ((2, 3), ""));
         assert_eq!(code_tab_edit("abc", (0, 0), true), ((0, 0), ""));
         assert_eq!(code_tab_edit("a   b", (4, 4), true), ((2, 4), ""));
+    }
+
+    #[test]
+    fn history_keeps_valid_pending_focus_after_widget_structural_edits() {
+        for merge in [false, true] {
+            let mut h = if merge {
+                Harness::new(
+                    "Title",
+                    &[
+                        (BlockKind::Paragraph, "alpha"),
+                        (BlockKind::Paragraph, "bravo"),
+                    ],
+                )
+            } else {
+                Harness::new("Title", &[(BlockKind::Paragraph, "alphabravo")])
+            };
+            let index = usize::from(merge);
+            let source = h.id(index);
+            let caret = if merge { 0 } else { 5 };
+            h.caret_in(index, caret);
+            h.key(
+                if merge { Key::Backspace } else { Key::Enter },
+                Modifiers::NONE,
+            );
+            let destination = h.app.focus;
+            h.app.undo();
+            assert_eq!(h.app.focus, Focus::Block(source));
+            let pending = h.app.pending.as_ref().unwrap();
+            assert_eq!(pending.target, Focus::Block(source));
+            assert!(h.app.index_of(source).is_some());
+            assert_eq!(pending.range, Some((caret, caret)));
+            h.app.redo();
+            assert_eq!(h.app.focus, destination);
+            assert_eq!(h.app.pending.as_ref().unwrap().target, destination);
+            h.app.undo();
+            h.type_text("Q");
+            assert_eq!(
+                h.texts(),
+                if merge {
+                    vec!["alpha", "Qbravo"]
+                } else {
+                    vec!["alphaQbravo"]
+                }
+            );
+        }
+    }
+
+    #[test]
+    fn history_resolves_removed_widget_focus_before_requesting_focus() {
+        for missing_focus in [false, true] {
+            let mut h = Harness::new(
+                "Title",
+                &[
+                    (BlockKind::Paragraph, "prefix"),
+                    (BlockKind::Paragraph, "alphabravo"),
+                ],
+            );
+            h.caret_in(1, 5);
+            let source = h.id(1);
+            h.key(Key::Enter, Modifiers::NONE);
+            let removed = h.id(2);
+            // Reproduce a snapshot carrying the split widget's stale focus.
+            let snapshot = h.app.history.undo.last_mut().unwrap();
+            snapshot.focus = if missing_focus {
+                Focus::None
+            } else {
+                Focus::Block(removed)
+            };
+            snapshot.cursors.insert(removed, (0, 0));
+            h.app.undo();
+            assert_eq!(h.app.focus, Focus::Block(source));
+            let pending = h.app.pending.as_ref().unwrap();
+            assert_eq!(pending.target, Focus::Block(source));
+            assert_eq!(pending.range, Some((5, 5)));
+            assert_eq!(h.app.scroll_to, Some(source));
+            h.type_text("Q");
+            assert_eq!(h.texts(), vec!["prefix", "alphaQbravo"]);
+            assert!(h.ctx.memory(|memory| memory.has_focus(block_te_id(source))));
+        }
+    }
+
+    #[test]
+    fn history_restores_split_and_merge_carets() {
+        for merge in [false, true] {
+            let mut h = if merge {
+                Harness::new(
+                    "Title",
+                    &[
+                        (BlockKind::Paragraph, "alpha"),
+                        (BlockKind::Paragraph, "bravo"),
+                    ],
+                )
+            } else {
+                Harness::new("Title", &[(BlockKind::Paragraph, "alphabravo")])
+            };
+            let source = h.id(usize::from(merge));
+            let caret = if merge { 0 } else { 5 };
+            h.click_in(usize::from(merge), caret);
+            h.key(
+                if merge { Key::Backspace } else { Key::Enter },
+                Modifiers::NONE,
+            );
+            let target = h.id(usize::from(!merge));
+            let target_caret = if merge { 5 } else { 0 };
+            let before = h.app.history.undo.last().unwrap();
+            assert_eq!(before.focus, Focus::Block(source));
+            assert_eq!(before.cursors[&source], (caret, caret));
+
+            h.key(Key::Z, Modifiers::COMMAND);
+            assert_eq!(h.app.focus, Focus::Block(source));
+            assert!(h.ctx.memory(|memory| memory.has_focus(block_te_id(source))));
+            assert_eq!(h.app.cursor_range_for(&h.ctx, source), Some((caret, caret)));
+            assert_eq!(
+                h.texts(),
+                if merge {
+                    vec!["alpha", "bravo"]
+                } else {
+                    vec!["alphabravo"]
+                }
+            );
+
+            h.key(Key::Z, Modifiers::COMMAND | Modifiers::SHIFT);
+            assert_eq!(h.app.focus, Focus::Block(target));
+            assert!(h.ctx.memory(|memory| memory.has_focus(block_te_id(target))));
+            assert_eq!(
+                h.app.cursor_range_for(&h.ctx, target),
+                Some((target_caret, target_caret))
+            );
+            assert_eq!(
+                h.texts(),
+                if merge {
+                    vec!["alphabravo"]
+                } else {
+                    vec!["alpha", "bravo"]
+                }
+            );
+
+            // No idle frame between undo and typing: pending focus must apply
+            // before the restored TextEdit consumes this frame's input.
+            h.frame(vec![
+                Event::Key {
+                    key: Key::Z,
+                    physical_key: None,
+                    pressed: true,
+                    repeat: false,
+                    modifiers: Modifiers::COMMAND,
+                },
+                Event::Text("Q".to_owned()),
+            ]);
+            assert_eq!(
+                h.texts(),
+                if merge {
+                    vec!["alpha", "Qbravo"]
+                } else {
+                    vec!["alphaQbravo"]
+                }
+            );
+            assert_eq!(h.app.page.meta.title, "Title");
+        }
+    }
+
+    #[test]
+    fn structural_history_maps_source_caret_without_cached_widget_focus() {
+        let mut h = Harness::new("Title", &[(BlockKind::Paragraph, "alphabravo")]);
+        let source = h.id(0);
+        h.app.focus = Focus::None;
+        h.app.cursors.clear();
+        h.app.split_block(source, (5, 5));
+        h.app.undo();
+        h.type_text("Q");
+        assert_eq!(h.texts(), vec!["alphaQbravo"]);
+
+        let mut h = Harness::new(
+            "Title",
+            &[
+                (BlockKind::Paragraph, "alpha"),
+                (BlockKind::Paragraph, "bravo"),
+            ],
+        );
+        let source = h.id(1);
+        h.caret_in(0, 5);
+        h.app.backspace_block(source);
+        h.app.undo();
+        h.type_text("Q");
+        assert_eq!(h.texts(), vec!["alpha", "Qbravo"]);
+    }
+
+    #[test]
+    fn typing_history_groups_until_focus_movement_or_pause() {
+        let mut h = Harness::new(
+            "Title",
+            &[(BlockKind::Paragraph, ""), (BlockKind::Paragraph, "")],
+        );
+        h.caret_in(0, 0);
+        for text in ["x", "y", "z"] {
+            h.app.now += 0.5;
+            h.type_text(text);
+        }
+        h.key(Key::Z, Modifiers::COMMAND);
+        h.idle();
+        assert_eq!(h.app.page.blocks[0].text, "");
+        assert_eq!(h.app.cursor_range_for(&h.ctx, h.id(0)), Some((0, 0)));
+        h.key(Key::Z, Modifiers::COMMAND | Modifiers::SHIFT);
+        h.idle();
+        assert_eq!(h.app.page.blocks[0].text, "xyz");
+        assert_eq!(h.app.cursor_range_for(&h.ctx, h.id(0)), Some((3, 3)));
+        h.click_in(1, 0);
+        h.type_text("y");
+        h.key(Key::Z, Modifiers::COMMAND);
+        h.idle();
+        assert_eq!(h.app.page.blocks[0].text, "xyz");
+        assert_eq!(h.app.page.blocks[1].text, "");
+        h.type_text("a");
+        h.app.now += 1.0;
+        h.type_text("b");
+        h.key(Key::Z, Modifiers::COMMAND);
+        assert_eq!(h.app.page.blocks[1].text, "a");
+    }
+
+    #[test]
+    fn history_restores_replaced_selection_and_limits_steps() {
+        let mut h = Harness::new("Title", &[(BlockKind::Paragraph, "alpha")]);
+        h.caret_in(0, 1);
+        h.key(Key::ArrowRight, Modifiers::SHIFT);
+        h.type_text("X");
+        h.app.undo();
+        h.idle();
+        assert_eq!(h.app.page.blocks[0].text, "alpha");
+        assert_eq!(h.app.cursor_range_for(&h.ctx, h.id(0)), Some((1, 2)));
+        let range = TextEditState::load(&h.ctx, block_te_id(h.id(0)))
+            .unwrap()
+            .cursor
+            .char_range()
+            .unwrap();
+        assert_eq!((range.primary.index.0, range.secondary.index.0), (2, 1));
+        h.app.redo();
+        h.idle();
+        assert_eq!(h.app.page.blocks[0].text, "aXpha");
+        assert_eq!(h.app.cursor_range_for(&h.ctx, h.id(0)), Some((2, 2)));
+        for _ in 0..55 {
+            h.app.now += 1.0;
+            h.type_text("q");
+        }
+        assert_eq!(h.app.history.undo.len(), 50);
     }
 
     #[test]

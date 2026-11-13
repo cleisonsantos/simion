@@ -197,6 +197,9 @@ pub struct Snapshot {
     pub title: String,
     pub icon: String,
     pub blocks: Vec<Block>,
+    pub focus: Focus,
+    pub cursors: HashMap<u64, (usize, usize)>,
+    pub title_cursor: Option<(usize, usize)>,
 }
 
 pub struct History {
@@ -205,8 +208,10 @@ pub struct History {
     pub last: Snapshot,
     pub hash: u64,
     pub pushed_at: f64,
+    pub typing: Option<Focus>,
 }
 
+const EDIT_HISTORY_LIMIT: usize = 50;
 const PAGE_MOVE_HISTORY_LIMIT: usize = 50;
 
 /// Onde uma pagina estava: pai, `sort` gravado e posicao efetiva entre as
@@ -241,6 +246,7 @@ impl History {
             last: snapshot_of(page),
             hash: hash_page(page),
             pushed_at: now,
+            typing: None,
         }
     }
 }
@@ -250,6 +256,9 @@ pub fn snapshot_of(page: &Page) -> Snapshot {
         title: page.meta.title.clone(),
         icon: page.meta.icon.clone(),
         blocks: page.blocks.clone(),
+        focus: Focus::None,
+        cursors: HashMap::new(),
+        title_cursor: None,
     }
 }
 
@@ -366,9 +375,13 @@ impl App {
                     title: String::new(),
                     icon: String::new(),
                     blocks: Vec::new(),
+                    focus: Focus::None,
+                    cursors: HashMap::new(),
+                    title_cursor: None,
                 },
                 hash: 0,
                 pushed_at: 0.0,
+                typing: None,
             },
             scroll_to: None,
             reset_scroll: true,
@@ -1264,6 +1277,8 @@ impl App {
 
     pub fn begin_change(&mut self) {
         self.flush_history(true);
+        self.history.typing = None;
+        self.history.last = self.editor_snapshot();
     }
 
     pub fn end_change(&mut self) {
@@ -1272,24 +1287,77 @@ impl App {
         self.flush_history(true);
     }
 
+    pub fn editor_snapshot(&self) -> Snapshot {
+        let mut snapshot = snapshot_of(&self.page);
+        snapshot.focus = self.focus;
+        snapshot.cursors = self.cursors.clone();
+        snapshot.title_cursor = self.title_cursor;
+        if let Some(pending) = &self.pending {
+            snapshot.focus = pending.target;
+            if let Some((a, b)) = pending.range {
+                match pending.target {
+                    Focus::Block(id) => {
+                        snapshot.cursors.insert(id, (b, a));
+                    }
+                    Focus::Title => snapshot.title_cursor = Some((b, a)),
+                    Focus::None => {}
+                }
+            }
+        }
+        snapshot
+    }
+
+    pub fn record_text_change(&mut self, before: Snapshot, typing: bool) {
+        let continuation = typing
+            && self.history.typing == Some(before.focus)
+            && before.cursors == self.history.last.cursors
+            && self.now - self.history.pushed_at <= 0.9;
+        if !continuation {
+            self.history.undo.push(before);
+            if self.history.undo.len() > EDIT_HISTORY_LIMIT {
+                self.history.undo.remove(0);
+            }
+        }
+        self.history.redo.clear();
+        self.history.typing = typing.then_some(self.focus);
+        self.history.last = self.editor_snapshot();
+        self.history.hash = hash_page(&self.page);
+        self.history.pushed_at = self.now;
+    }
+
     pub fn flush_history(&mut self, force: bool) {
         let hash = hash_page(&self.page);
-        if hash == self.history.hash {
-            return;
-        }
-        if force || self.now - self.history.pushed_at > 0.9 {
+        if hash != self.history.hash {
             self.history.undo.push(self.history.last.clone());
-            if self.history.undo.len() > 200 {
+            if self.history.undo.len() > EDIT_HISTORY_LIMIT {
                 self.history.undo.remove(0);
             }
             self.history.redo.clear();
-            self.history.last = snapshot_of(&self.page);
+            self.history.last = self.editor_snapshot();
             self.history.hash = hash;
             self.history.pushed_at = self.now;
+            self.history.typing = None;
+        } else if force {
+            self.history.last = self.editor_snapshot();
         }
     }
 
     fn apply_snapshot(&mut self, snapshot: Snapshot) {
+        // A stale widget id may refer to a block removed by a structural edit.
+        // Preserve its document position before replacing the block list.
+        let fallback_index = match snapshot.focus {
+            Focus::Block(id) => self.index_of(id),
+            _ => None,
+        }
+        .or_else(|| match self.focus {
+            Focus::Block(id) => self.index_of(id),
+            _ => None,
+        })
+        .unwrap_or(0);
+        let fallback_cursor = match snapshot.focus {
+            Focus::Block(id) => snapshot.cursors.get(&id).copied(),
+            _ => None,
+        };
         self.text_span = None;
         self.text_anchor = None;
         self.text_dragging = false;
@@ -1309,12 +1377,44 @@ impl App {
         self.block_rows.clear();
         self.block_rects.clear();
         self.block_galleys.clear();
-        self.cursors.clear();
-        if let Focus::Block(id) = self.focus {
-            if self.index_of(id).is_none() {
-                self.focus = Focus::None;
-            }
+        self.cursors = snapshot.cursors;
+        self.title_cursor = snapshot.title_cursor;
+        self.focus = snapshot.focus;
+        if self.focus == Focus::None
+            || matches!(self.focus, Focus::Block(id) if self.index_of(id).is_none())
+        {
+            let block = &self.page.blocks[fallback_index.min(self.page.blocks.len() - 1)];
+            self.focus = Focus::Block(block.id);
+            self.cursors
+                .entry(block.id)
+                .or_insert(fallback_cursor.unwrap_or((0, 0)));
         }
+        if let Focus::Block(id) = self.focus {
+            let chars = self.page.blocks[self.index_of(id).unwrap()]
+                .text
+                .chars()
+                .count();
+            let cursor = self.cursors.entry(id).or_insert((0, 0));
+            cursor.0 = cursor.0.min(chars);
+            cursor.1 = cursor.1.min(chars);
+        }
+        self.block_selection = None;
+        self.slash = None;
+        self.history.typing = None;
+        let range = match self.focus {
+            Focus::Block(id) => self.cursors.get(&id).map(|&(a, b)| (b, a)),
+            Focus::Title => self.title_cursor.map(|(a, b)| (b, a)),
+            Focus::None => None,
+        };
+        self.pending = Some(PendingFocus {
+            target: self.focus,
+            range,
+            select_all: false,
+        });
+        self.scroll_to = match self.focus {
+            Focus::Block(id) => Some(id),
+            _ => None,
+        };
     }
 
     pub fn undo(&mut self) {
@@ -1322,9 +1422,9 @@ impl App {
         let Some(previous) = self.history.undo.pop() else {
             return;
         };
-        self.history.redo.push(snapshot_of(&self.page));
+        self.history.redo.push(self.editor_snapshot());
         self.apply_snapshot(previous);
-        self.history.last = snapshot_of(&self.page);
+        self.history.last = self.editor_snapshot();
         self.history.hash = hash_page(&self.page);
         self.history.pushed_at = self.now;
         self.dirty = true;
@@ -1336,9 +1436,9 @@ impl App {
         let Some(next) = self.history.redo.pop() else {
             return;
         };
-        self.history.undo.push(snapshot_of(&self.page));
+        self.history.undo.push(self.editor_snapshot());
         self.apply_snapshot(next);
-        self.history.last = snapshot_of(&self.page);
+        self.history.last = self.editor_snapshot();
         self.history.hash = hash_page(&self.page);
         self.history.pushed_at = self.now;
         self.dirty = true;
@@ -1778,7 +1878,8 @@ impl App {
         !text_focused
     }
 
-    fn handle_keys(&mut self, ctx: &Context) {
+    pub(crate) fn handle_keys(&mut self, ctx: &Context) {
+        self.sync_editor_cursor(ctx);
         // Ctrl+Shift+V: pede o clipboard ao eframe e marca o proximo
         // `Event::Paste` para passar direto ao `TextEdit` focado, sem o
         // parser de Markdown.
