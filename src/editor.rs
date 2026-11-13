@@ -42,9 +42,6 @@ impl App {
             scroll = scroll.vertical_scroll_offset(0.0);
         }
 
-        let full_height = ui.available_height();
-        let _ = full_height;
-
         scroll.show_viewport(ui, |ui, viewport| {
             self.editor_content(ui, viewport, actions);
         });
@@ -55,14 +52,18 @@ impl App {
         let inner_width = (full_width - 64.0).clamp(280.0, MAX_CONTENT_WIDTH);
         let left = ((full_width - inner_width) / 2.0).max(22.0);
 
-        // PageUp/PageDown scroll the page; the text fields must not see them.
+        // Page keys move the caret as well as revealing its destination.
         if !self.search.open && self.slash.is_none() && self.code_lang_menu.is_none() {
             let page = viewport.height() * 0.8;
             if self.consume_pub(ui.ctx(), Key::PageDown, Modifiers::NONE) {
-                ui.scroll_with_delta(vec2(0.0, -page));
+                if !self.focus_page(ui.ctx(), true, page, inner_width) {
+                    ui.scroll_with_delta(vec2(0.0, -page));
+                }
             }
             if self.consume_pub(ui.ctx(), Key::PageUp, Modifiers::NONE) {
-                ui.scroll_with_delta(vec2(0.0, page));
+                if !self.focus_page(ui.ctx(), false, page, inner_width) {
+                    ui.scroll_with_delta(vec2(0.0, page));
+                }
             }
         }
 
@@ -405,7 +406,7 @@ impl App {
                 let caret = outcome.cursor.map(|(a, b)| a.max(b));
                 self.after_text_change(index, caret, actions);
             }
-            if outcome.focused {
+            if outcome.focused && self.block_selection.is_none() {
                 self.focus = Focus::Block(id);
             }
             if let Some(range) = outcome.cursor {
@@ -907,7 +908,7 @@ impl App {
         }
 
         let _ = base_size;
-        if focused {
+        if focused && self.block_selection.is_none() {
             self.focus = Focus::Block(id);
         }
 
@@ -1183,8 +1184,7 @@ impl App {
             .as_ref()
             .is_none_or(|(galley, _)| caret_row(galley, caret) + 1 >= galley.rows.len());
         if on_last_row && self.consume_pub(ctx, Key::ArrowDown, Modifiers::NONE) {
-            let x = galley.map(|(galley, pos)| pos.x + caret_x(&galley, caret));
-            self.focus_first_block(x);
+            self.focus_first_block(None);
         }
     }
 
@@ -1273,10 +1273,7 @@ impl App {
             }
             None => {
                 let length = self.page.meta.title.chars().count();
-                let caret = x
-                    .zip(self.title_galley.as_ref())
-                    .map_or(length, |(x, laid)| last_row_at(x, laid));
-                self.focus_title(caret);
+                self.focus_title(length);
             }
         }
     }
@@ -1390,14 +1387,15 @@ impl App {
         // Shift+↑/↓ selects this block when no text is selected, or when the
         // text selection already reaches the start / end of the block. The
         // range comes from the text field's own state, not `self.cursors`.
-        let text_selection = self.cursor_range_for(ctx, id).filter(|(a, b)| a != b);
-        if text_selection.is_none_or(|(start, _)| start == 0)
+        let cursor_range = self.cursor_range_for(ctx, id);
+        let empty_selection = cursor_range.is_none_or(|(a, b)| a == b);
+        if (empty_selection || cursor_range.is_some_and(|(start, _)| start == 0))
             && self.consume_pub(ctx, Key::ArrowUp, Modifiers::SHIFT)
         {
             self.start_block_selection(ctx, id);
             return;
         }
-        if text_selection.is_none_or(|(_, end)| end >= text_len)
+        if (empty_selection || cursor_range.is_some_and(|(_, end)| end >= text_len))
             && self.consume_pub(ctx, Key::ArrowDown, Modifiers::SHIFT)
         {
             self.start_block_selection(ctx, id);
@@ -1766,10 +1764,79 @@ impl App {
     // Block selection (Shift+↑/↓)
     // -----------------------------------------------------------------------
 
+    /// Collapse both the persistent TextEdit cursor and our cached range.
+    fn clear_block_text_selection(&mut self, ctx: &egui::Context, id: u64) {
+        let mut state = TextEditState::load(ctx, block_te_id(id)).unwrap_or_default();
+        state
+            .cursor
+            .set_char_range(Some(CCursorRange::one(CCursor::new(0))));
+        state.store(ctx, block_te_id(id));
+        self.cursors.insert(id, (0, 0));
+    }
+
+    fn focus_page(&mut self, ctx: &egui::Context, down: bool, distance: f32, width: f32) -> bool {
+        let (mut index, caret) = match self.focus {
+            Focus::Block(id) => {
+                let Some(index) = self.index_of(id) else {
+                    return false;
+                };
+                let caret = TextEditState::load(ctx, block_te_id(id))
+                    .and_then(|state| state.cursor.char_range())
+                    .map_or(0, |range| range.primary.index.0);
+                (index, caret)
+            }
+            Focus::Title if down => {
+                self.focus_first_block(None);
+                return true;
+            }
+            _ => return false,
+        };
+        let source = self.page.blocks[index].id;
+        let column = self
+            .block_galleys
+            .get(&source)
+            .map(|(galley, _)| caret_x(galley, CCursor::new(caret)));
+        let mut traveled = 0.0;
+        loop {
+            let next = if down {
+                self.next_text_block(index)
+            } else {
+                self.prev_text_block(index)
+            };
+            let Some(next) = next else {
+                break;
+            };
+            let (lo, hi) = (index.min(next), index.max(next));
+            traveled += self.page.blocks[lo..hi]
+                .iter()
+                .map(|block| {
+                    self.block_heights
+                        .get(&block.id)
+                        .copied()
+                        .unwrap_or_else(|| block.estimated_height(width - GUTTER, self.zoom))
+                        + 2.0
+                })
+                .sum::<f32>();
+            index = next;
+            if traveled >= distance {
+                break;
+            }
+        }
+        let block = &self.page.blocks[index];
+        let target = column
+            .zip(self.block_galleys.get(&block.id))
+            .map_or(caret.min(block.text.chars().count()), |(x, (galley, _))| {
+                caret_at_row_x(galley, 0, x)
+            });
+        self.focus_block(block.id, target);
+        true
+    }
+
     fn start_block_selection(&mut self, ctx: &egui::Context, id: u64) {
         // The text field lets go of the keyboard so typing does not edit a
         // block while several are selected.
-        ctx.memory_mut(|memory| memory.surrender_focus(Id::unique(("simion-block", id))));
+        self.clear_block_text_selection(ctx, id);
+        ctx.memory_mut(|memory| memory.surrender_focus(block_te_id(id)));
         self.focus = Focus::None;
         self.pending = None;
         self.slash = None;
@@ -1804,12 +1871,12 @@ impl App {
             return false;
         }
         let extent_kind = self.page.blocks[extent_index].kind;
-        // Esc / Enter go back to editing the block at the moving end.
+        // Escape restores the anchor; Enter edits the moving end.
         if self.consume_pub(ctx, Key::Escape, Modifiers::NONE) {
             self.block_selection = None;
-            if extent_kind.accepts_text() {
-                self.focus_block(extent, 0);
-            }
+            self.clear_block_text_selection(ctx, anchor);
+            self.clear_block_text_selection(ctx, extent);
+            self.focus_block(anchor, 0);
             return true;
         }
         if self.consume_pub(ctx, Key::Enter, Modifiers::NONE) {
@@ -2315,6 +2382,31 @@ mod tests {
             self.idle();
         }
 
+        fn click_in(&mut self, index: usize, caret: usize) {
+            let (galley, origin) = self.app.block_galleys[&self.id(index)].clone();
+            let pos = origin
+                + galley
+                    .pos_from_cursor(CCursor::new(caret))
+                    .center()
+                    .to_vec2();
+            self.frame(vec![
+                Event::PointerMoved(pos),
+                Event::PointerButton {
+                    pos,
+                    button: egui::PointerButton::Primary,
+                    pressed: true,
+                    modifiers: Modifiers::NONE,
+                },
+            ]);
+            self.frame(vec![Event::PointerButton {
+                pos,
+                button: egui::PointerButton::Primary,
+                pressed: false,
+                modifiers: Modifiers::NONE,
+            }]);
+            self.idle();
+        }
+
         fn texts(&self) -> Vec<&str> {
             self.app
                 .page
@@ -2494,6 +2586,81 @@ mod tests {
         assert_eq!(h.app.block_selection, None);
         h.type_text("Q");
         assert_eq!(h.texts(), ["a", "b", "Qc"]);
+    }
+
+    #[test]
+    fn escape_restores_anchor_and_collapses_text_selection() {
+        let mut h = Harness::new(
+            "title",
+            &[
+                (BlockKind::Paragraph, "alpha one"),
+                (BlockKind::Paragraph, "bravo two"),
+                (BlockKind::Paragraph, "charlie three"),
+            ],
+        );
+        h.click_in(1, 4);
+        h.key(Key::ArrowDown, Modifiers::SHIFT);
+        assert_eq!(h.app.block_selection, Some((h.id(1), h.id(1))));
+        h.key(Key::ArrowDown, Modifiers::SHIFT);
+        h.key(Key::Escape, Modifiers::NONE);
+        assert_eq!(h.app.focus, Focus::Block(h.id(1)));
+        assert_eq!(h.app.cursor_range_for(&h.ctx, h.id(1)), Some((0, 0)));
+        assert!(
+            h.ctx
+                .memory(|memory| memory.has_focus(block_te_id(h.id(1))))
+        );
+        h.type_text("Q");
+        assert_eq!(h.texts(), ["alpha one", "Qbravo two", "charlie three"]);
+    }
+
+    #[test]
+    fn first_shift_arrow_selects_and_deletes_only_the_current_block() {
+        for key in [Key::ArrowUp, Key::ArrowDown] {
+            let mut h = Harness::new(
+                "title",
+                &[
+                    (BlockKind::Paragraph, "alpha one"),
+                    (BlockKind::Paragraph, "bravo two"),
+                    (BlockKind::Paragraph, "charlie three"),
+                ],
+            );
+            h.click_in(1, 4);
+            h.key(key, Modifiers::SHIFT);
+            h.key(Key::Backspace, Modifiers::NONE);
+            assert_eq!(h.texts(), ["alpha one", "charlie three"]);
+        }
+    }
+
+    #[test]
+    fn first_row_up_reaches_title_end_and_down_reaches_block_start() {
+        let mut h = Harness::new("title", &[(BlockKind::Paragraph, "alpha one")]);
+        h.click_in(0, 5);
+        h.key(Key::ArrowUp, Modifiers::NONE);
+        h.type_text("Q");
+        assert_eq!(h.app.page.meta.title, "titleQ");
+        h.key(Key::End, Modifiers::NONE);
+        h.key(Key::ArrowDown, Modifiers::NONE);
+        h.type_text("R");
+        assert_eq!(h.texts(), ["Ralpha one"]);
+    }
+
+    #[test]
+    fn page_keys_move_focus_and_preserve_column() {
+        let blocks = vec![(BlockKind::Paragraph, "alpha one"); 60];
+        let mut h = Harness::new("title", &blocks);
+        h.caret_in(0, 3);
+        h.key(Key::PageDown, Modifiers::NONE);
+        let Focus::Block(target) = h.app.focus else {
+            panic!("missing block focus")
+        };
+        assert_ne!(target, h.id(0));
+        h.type_text("Q");
+        assert_eq!(
+            h.app.page.blocks[h.app.index_of(target).unwrap()].text,
+            "alpQha one"
+        );
+        h.key(Key::PageUp, Modifiers::NONE);
+        assert_eq!(h.app.focus, Focus::Block(h.id(0)));
     }
 
     #[test]
