@@ -210,6 +210,28 @@ pub fn file(p: &Painter, rect: Rect, color: Color32, w: f32) {
     }
 }
 
+pub fn folder(p: &Painter, rect: Rect, color: Color32, w: f32) {
+    let (c, s) = geometry(rect);
+    let left = c.x - s * 0.31;
+    let right = c.x + s * 0.31;
+    let top = c.y - s * 0.22;
+    let bottom = c.y + s * 0.23;
+    let shoulder = top + s * 0.12;
+    let tab_right = left + s * 0.26;
+    p.add(Shape::closed_line(
+        vec![
+            Pos2::new(left, shoulder),
+            Pos2::new(left, top),
+            Pos2::new(tab_right, top),
+            Pos2::new(tab_right + s * 0.08, shoulder),
+            Pos2::new(right, shoulder),
+            Pos2::new(right, bottom),
+            Pos2::new(left, bottom),
+        ],
+        Stroke::new(w, color),
+    ));
+}
+
 pub fn smile(p: &Painter, rect: Rect, color: Color32, w: f32) {
     let (c, s) = geometry(rect);
     let r = s * 0.3;
