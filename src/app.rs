@@ -51,6 +51,7 @@ pub struct Toast {
 
 #[derive(Debug)]
 pub enum Action {
+    BlockContext(crate::editor::BlockContextAction),
     SelectPage(PageId),
     NewPage {
         parent: Option<PageId>,
@@ -1198,6 +1199,7 @@ impl App {
 
     fn apply_action(&mut self, action: Action, ctx: &Context) {
         match action {
+            Action::BlockContext(action) => self.apply_block_context(action, ctx),
             Action::SelectPage(id) => self.open_page(id),
             Action::NewPage { parent } => self.create_page(parent),
             Action::NewFolder { parent } => self.create_folder(parent),
@@ -1745,6 +1747,23 @@ impl App {
             || self.slash.is_some()
             || self.confirm_delete.is_some();
         if overlays_open {
+            return;
+        }
+        if self.block_selection_range().is_some() {
+            let mut pasted = None;
+            ctx.input_mut(|input| {
+                input.events.retain(|event| {
+                    if let egui::Event::Paste(text) = event {
+                        pasted = Some(text.clone());
+                        false
+                    } else {
+                        true
+                    }
+                })
+            });
+            if let Some(text) = pasted {
+                self.paste_block_selection(&text);
+            }
             return;
         }
         let Focus::Block(block_id) = self.focus else {
