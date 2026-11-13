@@ -204,6 +204,29 @@ pub fn danger_button(ui: &mut Ui, label: &str, p: &Palette) -> Response {
     response
 }
 
+/// One half of a segmented control: filled with the accent when selected.
+pub fn segment_button(ui: &mut Ui, label: &str, selected: bool, p: &Palette) -> Response {
+    let text = if selected { p.bg } else { p.text };
+    let galley = ui.painter().layout_no_wrap(
+        label.to_owned(),
+        FontId::new(13.5, family(FONT_MEDIUM)),
+        text,
+    );
+    let size = vec2((galley.size().x + 28.0).max(88.0), 32.0);
+    let (rect, response) = ui.allocate_exact_size(size, Sense::click());
+    if selected {
+        ui.painter().rect_filled(rect, 8, p.accent);
+    } else if response.hovered() {
+        ui.painter().rect_filled(rect, 8, p.hover);
+    } else {
+        ui.painter()
+            .rect_stroke(rect, 8, Stroke::new(1.0, p.border), StrokeKind::Inside);
+    }
+    ui.painter()
+        .galley(rect.center() - galley.size() / 2.0, galley, text);
+    response
+}
+
 pub fn ghost_button(ui: &mut Ui, label: &str, p: &Palette) -> Response {
     let galley = ui.painter().layout_no_wrap(
         label.to_owned(),

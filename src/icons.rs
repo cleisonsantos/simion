@@ -245,6 +245,21 @@ pub fn keyboard(p: &Painter, rect: Rect, color: Color32, w: f32) {
     );
 }
 
+pub fn gear(p: &Painter, rect: Rect, color: Color32, w: f32) {
+    let (c, s) = geometry(rect);
+    let ring = s * 0.22;
+    p.circle_stroke(c, s * 0.09, Stroke::new(w, color));
+    p.circle_stroke(c, ring, Stroke::new(w, color));
+    for i in 0..8 {
+        let angle = i as f32 * std::f32::consts::TAU / 8.0;
+        let dir = vec2(angle.cos(), angle.sin());
+        p.line_segment(
+            [c + dir * ring, c + dir * (s * 0.33)],
+            Stroke::new(w * 1.6, color),
+        );
+    }
+}
+
 /// The Simion mark: a rounded square with a white S.
 pub const BRAND: Color32 = Color32::from_rgb(0x0F, 0x83, 0x6B);
 pub const BRAND_CREAM: Color32 = Color32::from_rgb(0xF8, 0xF5, 0xEA);

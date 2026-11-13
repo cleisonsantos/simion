@@ -2,15 +2,18 @@
 
 use eframe::egui::{
     self, Align, Align2, Color32, Context, FontFamily, FontId, Id, Layout, Margin, Modal, Order,
-    Pos2, Rect, RichText, ScrollArea, Sense, Stroke, StrokeKind, Ui, pos2, vec2,
+    Pos2, ProgressBar, Rect, RichText, ScrollArea, Sense, Stroke, StrokeKind, Ui, pos2, vec2,
 };
 
 use crate::app::{Action, App, Focus, PendingFocus};
 use crate::markdown;
 use crate::model::{Block, BlockKind};
 use crate::syntax;
-use crate::theme::{FONT_BODY, FONT_MEDIUM, FONT_MONO, FONT_SEMIBOLD, GUTTER, Palette, family};
+use crate::theme::{
+    FONT_BODY, FONT_MEDIUM, FONT_MONO, FONT_SEMIBOLD, GUTTER, Mode, Palette, family,
+};
 use crate::ui as widgets;
+use crate::updater::UpdateStatus;
 
 const EMOJIS: [&str; 48] = [
     "📄", "📝", "📚", "📌", "💡", "✅", "🚀", "⭐", "❤", "🎯", "🔥", "🌱", "🍀", "🌊", "☀", "🌙",
@@ -28,6 +31,7 @@ impl App {
         self.emoji_overlay(ctx, &mut actions);
         self.slash_overlay(ctx);
         self.shortcuts_overlay(ctx);
+        self.settings_overlay(ctx, &mut actions);
         self.markdown_overlay(ctx, &mut actions);
         self.delete_overlay(ctx, &mut actions);
         self.toast_overlay(ctx);
@@ -727,6 +731,7 @@ impl App {
                             ("Ctrl S", "Salvar agora"),
                             ("Ctrl \\", "Mostrar ou ocultar a barra lateral"),
                             ("Ctrl /", "Esta lista de atalhos"),
+                            ("Ctrl ,", "Configurações"),
                         ],
                         &p,
                     );
@@ -784,6 +789,246 @@ impl App {
         });
         if close || response.should_close() {
             self.shortcuts_open = false;
+        }
+    }
+
+    fn settings_overlay(&mut self, ctx: &Context, actions: &mut Vec<Action>) {
+        if !self.settings_open {
+            return;
+        }
+        let p = self.palette;
+        let mode = self.mode;
+        let zoom = self.zoom;
+        let mut sidebar_visible = self.sidebar_visible;
+        let update = self.update.clone();
+        let db_path = self.store.as_ref().map(|store| store.path().to_path_buf());
+        let page_count = self.pages.len();
+        let block_count = self.settings_block_count;
+        let mut close = false;
+        let width = (ctx.content_rect().width() - 48.0).min(620.0);
+        let modal = Modal::new(Id::unique("simion-settings"))
+            .backdrop_color(if p.dark {
+                Color32::from_black_alpha(150)
+            } else {
+                Color32::from_black_alpha(40)
+            })
+            .frame(
+                widgets::popup_frame(&p)
+                    .inner_margin(Margin::same(18))
+                    .corner_radius(14),
+            );
+        let response = modal.show(ctx, |ui| {
+            ui.set_width(width);
+            ui.horizontal(|ui| {
+                ui.label(
+                    RichText::new("Configurações")
+                        .size(19.0)
+                        .font(FontId::new(19.0, family(FONT_SEMIBOLD)))
+                        .color(p.text),
+                );
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    widgets::key_hint(ui, "Ctrl ,", &p);
+                });
+            });
+            ui.add_space(6.0);
+            ScrollArea::vertical()
+                .max_height((ctx.content_rect().height() * 0.62).clamp(240.0, 560.0))
+                .auto_shrink([false, true])
+                .id_salt("simion-settings-scroll")
+                .show(ui, |ui| {
+                    settings_section(ui, "Aparência", &p);
+                    setting_row(ui, "Tema", &p, |ui| {
+                        ui.spacing_mut().item_spacing.x = 6.0;
+                        for (label, value) in [("Claro", Mode::Light), ("Escuro", Mode::Dark)] {
+                            if widgets::segment_button(ui, label, mode == value, &p).clicked() {
+                                actions.push(Action::SetTheme(value));
+                            }
+                        }
+                    });
+                    setting_row(ui, "Zoom", &p, |ui| {
+                        ui.spacing_mut().item_spacing.x = 6.0;
+                        let minus = ui.add_enabled_ui(zoom > 0.75 + 0.001, |ui| {
+                            widgets::ghost_button(ui, "−", &p)
+                        });
+                        if minus.inner.clicked() {
+                            actions.push(Action::SetZoom(zoom - 0.1));
+                        }
+                        ui.add_sized(
+                            vec2(56.0, 32.0),
+                            egui::Label::new(
+                                RichText::new(format!("{:.0} %", zoom * 100.0))
+                                    .font(FontId::new(13.5, family(FONT_MEDIUM)))
+                                    .color(p.text),
+                            ),
+                        );
+                        let plus = ui.add_enabled_ui(zoom < 1.6 - 0.001, |ui| {
+                            widgets::ghost_button(ui, "+", &p)
+                        });
+                        if plus.inner.clicked() {
+                            actions.push(Action::SetZoom(zoom + 0.1));
+                        }
+                        ui.add_space(6.0);
+                        if widgets::ghost_button(ui, "Redefinir", &p).clicked() {
+                            actions.push(Action::SetZoom(1.0));
+                        }
+                    });
+                    setting_row(ui, "Barra lateral", &p, |ui| {
+                        if ui
+                            .checkbox(&mut sidebar_visible, "Mostrar barra lateral")
+                            .changed()
+                        {
+                            actions.push(Action::ToggleSidebar);
+                        }
+                    });
+
+                    settings_section(ui, "Atualizações", &p);
+                    let mut auto = update.auto_enabled && !update.env_disabled;
+                    ui.horizontal(|ui| {
+                        let checkbox = ui.add_enabled(
+                            !update.env_disabled,
+                            egui::Checkbox::new(
+                                &mut auto,
+                                "Verificar atualizações automaticamente",
+                            ),
+                        );
+                        if checkbox.changed() {
+                            actions.push(Action::SetAutoUpdate(auto));
+                        }
+                        if update.env_disabled {
+                            ui.label(
+                                RichText::new("Desativado pelo ambiente")
+                                    .size(11.5)
+                                    .color(p.faint),
+                            )
+                            .on_hover_text("SIMION_NO_UPDATE_CHECK está definido");
+                        }
+                    });
+                    ui.add_space(4.0);
+                    ui.label(
+                        RichText::new(format!(
+                            "Última verificação: {}",
+                            crate::app::format_check_time(update.last_check)
+                        ))
+                        .size(12.0)
+                        .color(p.muted),
+                    );
+                    ui.add_space(6.0);
+                    update_status(ui, &update.status, &p, actions);
+                    ui.add_space(6.0);
+                    let busy = matches!(
+                        update.status,
+                        UpdateStatus::Checking | UpdateStatus::Downloading { .. }
+                    );
+                    let check = ui.add_enabled_ui(!busy, |ui| {
+                        widgets::ghost_button(ui, "Verificar agora", &p)
+                    });
+                    if check.inner.clicked() {
+                        actions.push(Action::CheckUpdates);
+                    }
+
+                    settings_section(ui, "Sobre", &p);
+                    ui.label(
+                        RichText::new(format!("Simion {}", env!("CARGO_PKG_VERSION")))
+                            .size(15.0)
+                            .font(FontId::new(15.0, family(FONT_SEMIBOLD)))
+                            .color(p.text),
+                    );
+                    let mut build =
+                        format!("{} · {}", std::env::consts::OS, std::env::consts::ARCH);
+                    if cfg!(debug_assertions) {
+                        build.push_str(" · build local");
+                    }
+                    ui.label(RichText::new(build).size(12.0).color(p.muted));
+                    ui.add_space(10.0);
+                    ui.label(
+                        RichText::new("Onde ficam os dados")
+                            .size(12.5)
+                            .font(FontId::new(12.5, family(FONT_MEDIUM)))
+                            .color(p.text),
+                    );
+                    ui.add_space(2.0);
+                    if let Some(path) = &db_path {
+                        let full = path.display().to_string();
+                        ui.label(
+                            RichText::new(crate::app::truncate_middle(&full, 64))
+                                .font(FontId::new(11.5, family(FONT_MONO)))
+                                .color(p.muted),
+                        )
+                        .on_hover_text(&full);
+                        ui.add_space(4.0);
+                        ui.horizontal(|ui| {
+                            ui.spacing_mut().item_spacing.x = 6.0;
+                            if widgets::ghost_button(ui, "Copiar caminho", &p).clicked() {
+                                actions.push(Action::CopyText(full.clone()));
+                            }
+                            if widgets::ghost_button(ui, "Abrir pasta", &p).clicked() {
+                                let dir = path.parent().unwrap_or(path);
+                                actions.push(Action::OpenExternal(dir.display().to_string()));
+                            }
+                        });
+                    }
+                    ui.add_space(6.0);
+                    ui.label(
+                        RichText::new(format!("{page_count} páginas · {block_count} blocos"))
+                            .size(12.0)
+                            .color(p.muted),
+                    );
+                    ui.add_space(8.0);
+                    egui::Frame::new()
+                        .fill(p.accent_soft)
+                        .corner_radius(8)
+                        .inner_margin(Margin::symmetric(12, 8))
+                        .show(ui, |ui| {
+                            ui.set_width(ui.available_width());
+                            ui.label(
+                                RichText::new("Suas anotações nunca saem deste computador.")
+                                    .size(13.0)
+                                    .font(FontId::new(13.0, family(FONT_MEDIUM)))
+                                    .color(p.accent_text),
+                            );
+                        });
+                    ui.add_space(8.0);
+                    ui.horizontal(|ui| {
+                        ui.spacing_mut().item_spacing.x = 6.0;
+                        if widgets::ghost_button(ui, "Repositório", &p).clicked() {
+                            actions.push(Action::OpenExternal(REPO_URL.to_owned()));
+                        }
+                        if widgets::ghost_button(ui, "Releases", &p).clicked() {
+                            actions.push(Action::OpenExternal(format!("{REPO_URL}/releases")));
+                        }
+                    });
+
+                    ui.add_space(12.0);
+                    egui::CollapsingHeader::new(
+                        RichText::new("Avançado").size(12.0).color(p.muted),
+                    )
+                    .id_salt("simion-settings-advanced")
+                    .default_open(false)
+                    .show(ui, |ui| {
+                        ui.horizontal(|ui| {
+                            ui.spacing_mut().item_spacing.x = 6.0;
+                            if widgets::ghost_button(ui, "Salvar agora", &p).clicked() {
+                                actions.push(Action::SaveNow);
+                            }
+                            if widgets::ghost_button(ui, "Ver Markdown da página atual", &p)
+                                .clicked()
+                            {
+                                actions.push(Action::OpenMarkdown);
+                            }
+                        });
+                    });
+                });
+            ui.add_space(12.0);
+            ui.horizontal(|ui| {
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    if widgets::primary_button(ui, "Fechar", &p).clicked() {
+                        close = true;
+                    }
+                });
+            });
+        });
+        if close || response.should_close() {
+            actions.push(Action::CloseSettings);
         }
     }
 
@@ -1103,6 +1348,80 @@ fn clicked_outside(ctx: &Context, rect: Rect) -> bool {
                 .interact_pos()
                 .is_some_and(|position| !rect.contains(position))
     })
+}
+
+const REPO_URL: &str = "https://github.com/cleisonsantos/simion";
+
+fn settings_section(ui: &mut Ui, title: &str, p: &Palette) {
+    ui.add_space(14.0);
+    ui.label(
+        RichText::new(title)
+            .size(11.0)
+            .font(FontId::new(11.0, family(FONT_SEMIBOLD)))
+            .color(p.muted),
+    );
+    ui.add_space(4.0);
+    widgets::hairline(ui, p);
+    ui.add_space(8.0);
+}
+
+/// Label column + controls, so the rows of a section line up.
+fn setting_row(ui: &mut Ui, label: &str, p: &Palette, add: impl FnOnce(&mut Ui)) {
+    ui.horizontal(|ui| {
+        ui.add_sized(
+            vec2(120.0, 32.0),
+            egui::Label::new(RichText::new(label).size(13.0).color(p.text)),
+        );
+        add(ui);
+    });
+    ui.add_space(4.0);
+}
+
+fn update_status(ui: &mut Ui, status: &UpdateStatus, p: &Palette, actions: &mut Vec<Action>) {
+    let text = |ui: &mut Ui, text: String, color: Color32| {
+        ui.label(RichText::new(text).size(13.0).color(color));
+    };
+    match status {
+        UpdateStatus::Idle => text(ui, "Sem verificação nesta sessão".to_owned(), p.muted),
+        UpdateStatus::Checking => text(ui, "Verificando…".to_owned(), p.muted),
+        UpdateStatus::UpToDate => text(ui, "Você está na versão mais recente".to_owned(), p.text),
+        UpdateStatus::Available(release) => {
+            ui.horizontal(|ui| {
+                text(ui, format!("v{} disponível", release.version), p.text);
+                ui.add_space(6.0);
+                if widgets::ghost_button(ui, "Baixar", p).clicked() {
+                    actions.push(Action::StartDownload);
+                }
+            });
+        }
+        UpdateStatus::Downloading { release, progress } => {
+            text(ui, format!("Baixando v{}…", release.version), p.muted);
+            ui.horizontal(|ui| {
+                ui.add(ProgressBar::new(*progress).desired_width(260.0));
+                text(ui, format!("{:.0} %", progress * 100.0), p.muted);
+            });
+        }
+        UpdateStatus::Ready { release, .. } => {
+            ui.horizontal(|ui| {
+                text(
+                    ui,
+                    format!("v{} pronto para instalar", release.version),
+                    p.text,
+                );
+                ui.add_space(6.0);
+                if widgets::primary_button(ui, "Reiniciar e instalar", p).clicked() {
+                    actions.push(Action::ApplyUpdate);
+                }
+            });
+        }
+        UpdateStatus::Error(err) => {
+            ui.add(egui::Label::new(RichText::new(err).size(12.5).color(p.danger)).wrap());
+            ui.add_space(4.0);
+            if widgets::ghost_button(ui, "Tentar de novo", p).clicked() {
+                actions.push(Action::CheckUpdates);
+            }
+        }
+    }
 }
 
 fn shortcut_group(ui: &mut Ui, title: &str, rows: &[(&str, &str)], p: &Palette) {
