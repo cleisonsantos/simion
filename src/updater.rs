@@ -658,6 +658,10 @@ pub struct UpdateState {
     pub last_check: i64,
     /// `true` quando a checagem foi automática; controla o silêncio dos erros.
     pub auto: bool,
+    /// Preferência do usuário (`settings.auto_update_check`).
+    pub auto_enabled: bool,
+    /// `SIMION_NO_UPDATE_CHECK` desliga a checagem automática e trava a preferência.
+    pub env_disabled: bool,
     /// Versão cuja faixa o usuário escondeu com “Depois”.
     pub dismissed: Option<String>,
 }
@@ -668,6 +672,8 @@ impl Default for UpdateState {
             status: UpdateStatus::Idle,
             last_check: 0,
             auto: true,
+            auto_enabled: true,
+            env_disabled: false,
             dismissed: None,
         }
     }

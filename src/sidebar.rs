@@ -105,7 +105,7 @@ impl App {
         widgets::section_label(ui, "Páginas", &p);
 
         let avail = ui.available_height();
-        let footer_space = 100.0;
+        let footer_space = 130.0;
         let list_height = (avail - footer_space).max(80.0);
         ScrollArea::vertical()
             .auto_shrink([false, false])
@@ -140,14 +140,25 @@ impl App {
 
         ui.with_layout(Layout::bottom_up(Align::LEFT), |ui| {
             ui.add_space(2.0);
-            let version = ui.label(
-                RichText::new("Simion 0.1 · local")
-                    .size(10.5)
-                    .color(p.faint),
+            let db_path = self
+                .store
+                .as_ref()
+                .map(|store| store.path().display().to_string())
+                .unwrap_or_default();
+            let version = ui.add(
+                egui::Label::new(
+                    RichText::new(format!("Simion {} · local", env!("CARGO_PKG_VERSION")))
+                        .size(10.5)
+                        .color(p.faint),
+                )
+                .sense(Sense::click()),
             );
-            version.on_hover_text(
-                "Banco de dados local em SQLite.\nSuas anotações nunca saem deste computador.",
-            );
+            if version.clicked() {
+                actions.push(Action::OpenSettings);
+            }
+            version.on_hover_text(format!(
+                "Banco de dados local em SQLite:\n{db_path}\nSuas anotações nunca saem deste computador."
+            ));
 
             let check = ui.small_button(
                 RichText::new("Verificar atualizações")
@@ -169,6 +180,18 @@ impl App {
             );
             if shortcuts.clicked() {
                 actions.push(Action::OpenShortcuts);
+            }
+
+            let settings = action_row(
+                ui,
+                "Configurações",
+                Some("Ctrl ,"),
+                None,
+                &p,
+                |painter, rect, color| icons::gear(painter, rect, color, 1.3),
+            );
+            if settings.clicked() {
+                actions.push(Action::OpenSettings);
             }
 
             let theme_label = if self.mode == crate::theme::Mode::Light {

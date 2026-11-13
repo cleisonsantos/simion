@@ -462,6 +462,12 @@ impl Store {
         )?;
         Ok(())
     }
+
+    pub fn block_count(&self) -> Result<i64> {
+        self.conn
+            .query_row("SELECT COUNT(*) FROM blocks", [], |row| row.get(0))
+            .map_err(Into::into)
+    }
 }
 
 pub fn fold(text: &str) -> String {
@@ -657,6 +663,36 @@ mod tests {
         assert!(store.page_meta(parent.id).unwrap().is_none());
         assert!(store.page_meta(child.id).unwrap().is_none());
         assert!(store.page_meta(grandchild.id).unwrap().is_none());
+        drop(store);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn auto_update_setting_round_trips() {
+        use crate::app::{auto_update_value, parse_auto_update};
+        let (mut store, path) = temp_store();
+        let key = "auto_update_check";
+        assert_eq!(store.setting(key).unwrap(), None);
+        assert!(parse_auto_update(store.setting(key).unwrap().as_deref()));
+
+        for _ in 0..2 {
+            store.set_setting(key, auto_update_value(false)).unwrap();
+            assert_eq!(store.setting(key).unwrap().as_deref(), Some("0"));
+            assert!(!parse_auto_update(store.setting(key).unwrap().as_deref()));
+        }
+        for _ in 0..2 {
+            store.set_setting(key, auto_update_value(true)).unwrap();
+            assert_eq!(store.setting(key).unwrap().as_deref(), Some("1"));
+            assert!(parse_auto_update(store.setting(key).unwrap().as_deref()));
+        }
+        drop(store);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn counts_blocks() {
+        let (store, path) = temp_store();
+        assert!(store.block_count().unwrap() > 0);
         drop(store);
         let _ = std::fs::remove_file(path);
     }

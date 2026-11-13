@@ -52,7 +52,9 @@ pub struct Toast {
 #[derive(Debug)]
 pub enum Action {
     SelectPage(PageId),
-    NewPage { parent: Option<PageId> },
+    NewPage {
+        parent: Option<PageId>,
+    },
     AskDelete(PageId),
     DeletePage(PageId),
     DuplicatePage(PageId),
@@ -64,6 +66,15 @@ pub enum Action {
     OpenSearch,
     OpenShortcuts,
     OpenMarkdown,
+    OpenSettings,
+    CloseSettings,
+    SetTheme(Mode),
+    SetZoom(f32),
+    SetAutoUpdate(bool),
+    SaveNow,
+    CopyText(String),
+    /// Abre um caminho ou URL com o programa padrão do sistema.
+    OpenExternal(String),
     CheckUpdates,
     StartDownload,
     ApplyUpdate,
@@ -83,7 +94,10 @@ pub enum Action {
     DeleteBlock(u64),
     MoveBlock(u64, i32),
     CopyBlock(u64),
-    FocusBlock { id: u64, range: (usize, usize) },
+    FocusBlock {
+        id: u64,
+        range: (usize, usize),
+    },
 }
 
 pub struct App {
@@ -138,6 +152,9 @@ pub struct App {
     pub search: SearchState,
     pub shortcuts_open: bool,
     pub markdown_open: bool,
+    pub settings_open: bool,
+    /// Total de blocos no SQLite, recalculado ao abrir as configurações.
+    pub settings_block_count: i64,
     pub confirm_delete: Option<PageId>,
 
     pub toast: Option<Toast>,
@@ -279,6 +296,8 @@ impl App {
             search: SearchState::default(),
             shortcuts_open: false,
             markdown_open: false,
+            settings_open: false,
+            settings_block_count: 0,
             confirm_delete: None,
             toast: None,
             update: UpdateState::default(),
@@ -640,6 +659,35 @@ impl App {
         }
     }
 
+    fn set_theme(&mut self, mode: Mode) {
+        if self.mode == mode {
+            return;
+        }
+        self.mode = mode;
+        self.theme_applied = None;
+        if let Some(store) = self.store.as_mut() {
+            let _ = store.set_setting("theme", self.mode.as_str());
+        }
+    }
+
+    /// Passo de 0.1 entre 0.75 e 1.6; sempre força reaplicar as fontes.
+    pub(crate) fn set_zoom(&mut self, zoom: f32) {
+        self.zoom = ((zoom * 100.0).round() / 100.0).clamp(0.75, 1.6);
+        self.theme_applied = None;
+    }
+
+    fn open_settings(&mut self) {
+        self.settings_open = true;
+        self.page_menu = None;
+        self.refresh_block_count();
+    }
+
+    fn refresh_block_count(&mut self) {
+        if let Some(store) = self.store.as_ref() {
+            self.settings_block_count = store.block_count().unwrap_or(0);
+        }
+    }
+
     pub fn toast(&mut self, text: impl Into<String>) {
         let text = text.into();
         self.toast = Some(Toast {
@@ -653,18 +701,16 @@ impl App {
     // -----------------------------------------------------------------------
 
     fn init_updater(&mut self, ctx: &Context) {
-        let enabled = self
+        let stored = self
             .store
             .as_ref()
-            .and_then(|store| store.setting("auto_update_check").ok().flatten())
-            .map(|value| {
-                let value = value.trim();
-                value != "0" && !value.eq_ignore_ascii_case("false")
-            })
-            .unwrap_or(true);
+            .and_then(|store| store.setting("auto_update_check").ok().flatten());
+        let enabled = parse_auto_update(stored.as_deref());
         let disabled_by_env = std::env::var("SIMION_NO_UPDATE_CHECK")
             .map(|value| value == "1" || value.eq_ignore_ascii_case("true"))
             .unwrap_or(false);
+        self.update.auto_enabled = enabled;
+        self.update.env_disabled = disabled_by_env;
         self.update.auto = enabled && !disabled_by_env;
         self.update.last_check = self
             .store
@@ -1109,13 +1155,28 @@ impl App {
                 }
             }
             Action::ToggleSidebar => self.sidebar_visible = !self.sidebar_visible,
-            Action::ToggleTheme => {
-                self.mode = self.mode.toggled();
-                self.theme_applied = None;
+            Action::ToggleTheme => self.set_theme(self.mode.toggled()),
+            Action::SetTheme(mode) => self.set_theme(mode),
+            Action::SetZoom(zoom) => self.set_zoom(zoom),
+            Action::SetAutoUpdate(on) => {
                 if let Some(store) = self.store.as_mut() {
-                    let _ = store.set_setting("theme", self.mode.as_str());
+                    let _ = store.set_setting("auto_update_check", auto_update_value(on));
                 }
+                self.update.auto_enabled = on;
+                self.update.auto = on && !self.update.env_disabled;
             }
+            Action::OpenSettings => self.open_settings(),
+            Action::CloseSettings => self.settings_open = false,
+            Action::SaveNow => {
+                self.save_now();
+                self.toast("Salvo");
+                self.refresh_block_count();
+            }
+            Action::CopyText(text) => {
+                ctx.copy_text(text);
+                self.toast("Copiado");
+            }
+            Action::OpenExternal(target) => open_external(&target),
             Action::OpenSearch => {
                 self.open_search();
             }
@@ -1125,6 +1186,7 @@ impl App {
             }
             Action::OpenMarkdown => {
                 self.markdown_open = true;
+                self.settings_open = false;
                 self.page_menu = None;
             }
             Action::CheckUpdates => self.start_update_check(ctx, true),
@@ -1372,6 +1434,14 @@ impl App {
             }
             return;
         }
+        if self.settings_open {
+            if self.consume(ctx, Key::Escape, Modifiers::NONE)
+                || self.consume(ctx, Key::Comma, Modifiers::COMMAND)
+            {
+                self.settings_open = false;
+            }
+            return;
+        }
         if self.search.open {
             self.search_keys(ctx);
             return;
@@ -1424,6 +1494,10 @@ impl App {
             self.shortcuts_open = true;
             return;
         }
+        if self.consume(ctx, Key::Comma, Modifiers::COMMAND) {
+            self.open_settings();
+            return;
+        }
         if self.consume(ctx, Key::Z, Modifiers::COMMAND | Modifiers::SHIFT) {
             self.redo();
             return;
@@ -1441,28 +1515,90 @@ impl App {
             return;
         }
         if self.consume(ctx, Key::Equals, Modifiers::COMMAND) {
-            self.zoom = (self.zoom + 0.1).min(1.6);
-            self.theme_applied = None;
+            self.set_zoom(self.zoom + 0.1);
             return;
         }
         if self.consume(ctx, Key::Minus, Modifiers::COMMAND) {
-            self.zoom = (self.zoom - 0.1).max(0.75);
-            self.theme_applied = None;
+            self.set_zoom(self.zoom - 0.1);
             return;
         }
         if self.consume(ctx, Key::Num0, Modifiers::COMMAND) {
-            self.zoom = 1.0;
-            self.theme_applied = None;
+            self.set_zoom(1.0);
             return;
         }
         if self.consume(ctx, Key::S, Modifiers::COMMAND) {
-            self.save_now();
-            self.toast("Salvo");
+            self.apply_action(Action::SaveNow, ctx);
             return;
         }
 
         self.editor_keys(ctx);
     }
+}
+
+/// `settings.auto_update_check`: ausente liga; "0"/"false" desliga.
+pub(crate) fn parse_auto_update(value: Option<&str>) -> bool {
+    value
+        .map(|value| {
+            let value = value.trim();
+            value != "0" && !value.eq_ignore_ascii_case("false")
+        })
+        .unwrap_or(true)
+}
+
+pub(crate) fn auto_update_value(on: bool) -> &'static str {
+    if on { "1" } else { "0" }
+}
+
+/// "dd/mm/aaaa hh:mm UTC". Sem dependência de fuso: descobrir o offset local
+/// exigiria libc/chrono, então a data fica em UTC e diz isso.
+pub(crate) fn format_check_time(ts: i64) -> String {
+    if ts <= 0 {
+        return "nunca".to_owned();
+    }
+    // civil_from_days (Howard Hinnant).
+    let days = ts.div_euclid(86_400);
+    let secs = ts.rem_euclid(86_400);
+    let z = days + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let day = doy - (153 * mp + 2) / 5 + 1;
+    let month = if mp < 10 { mp + 3 } else { mp - 9 };
+    let year = yoe + era * 400 + i64::from(month <= 2);
+    format!(
+        "{day:02}/{month:02}/{year:04} {:02}:{:02} UTC",
+        secs / 3600,
+        secs % 3600 / 60
+    )
+}
+
+/// Encurta no meio, preservando o começo e o nome do arquivo.
+pub(crate) fn truncate_middle(text: &str, max_chars: usize) -> String {
+    let chars: Vec<char> = text.chars().collect();
+    if chars.len() <= max_chars || max_chars < 3 {
+        return text.to_owned();
+    }
+    let keep = max_chars - 1;
+    let head = keep / 2;
+    let tail = keep - head;
+    let mut out: String = chars[..head].iter().collect();
+    out.push('…');
+    out.extend(&chars[chars.len() - tail..]);
+    out
+}
+
+/// Abre caminho ou URL no programa padrão; falhas são ignoradas.
+fn open_external(target: &str) {
+    let program = if cfg!(target_os = "windows") {
+        "explorer"
+    } else if cfg!(target_os = "macos") {
+        "open"
+    } else {
+        "xdg-open"
+    };
+    let _ = std::process::Command::new(program).arg(target).spawn();
 }
 
 /// O clipboard do Windows 11 (Edge/Word/Notepad) entrega `CF_HTML` *e* texto
@@ -1501,6 +1637,7 @@ impl App {
         let overlays_open = self.search.open
             || self.shortcuts_open
             || self.markdown_open
+            || self.settings_open
             || self.block_menu.is_some()
             || self.code_lang_menu.is_some()
             || self.page_menu.is_some()
@@ -1925,5 +2062,36 @@ fn slugify(title: &str) -> String {
         "pagina".to_owned()
     } else {
         trimmed.chars().take(60).collect()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn auto_update_parsing() {
+        assert!(parse_auto_update(None));
+        assert!(parse_auto_update(Some("1")));
+        assert!(!parse_auto_update(Some("0")));
+        assert!(!parse_auto_update(Some(" FALSE ")));
+        assert_eq!(auto_update_value(true), "1");
+        assert_eq!(auto_update_value(false), "0");
+    }
+
+    #[test]
+    fn formats_last_check() {
+        assert_eq!(format_check_time(0), "nunca");
+        assert_eq!(format_check_time(86_399), "01/01/1970 23:59 UTC");
+        assert_eq!(format_check_time(951_782_400), "29/02/2000 00:00 UTC");
+        assert_eq!(format_check_time(1_700_000_000), "14/11/2023 22:13 UTC");
+        assert_eq!(format_check_time(1_798_761_600), "01/01/2027 00:00 UTC");
+    }
+
+    #[test]
+    fn truncates_in_the_middle() {
+        assert_eq!(truncate_middle("abc", 10), "abc");
+        assert_eq!(truncate_middle("abcdefghij", 5), "ab…ij");
+        assert_eq!(truncate_middle("/home/ção/simion.db", 9).chars().count(), 9);
     }
 }
