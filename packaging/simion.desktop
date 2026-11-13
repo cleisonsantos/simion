@@ -1,12 +1,14 @@
 [Desktop Entry]
 Type=Application
 Name=Simion
-GenericName=Notes
-Comment=Local, lightweight block-based notes
-Comment[pt_BR]=Anotações locais, leves e em blocos
+GenericName=Bloco de notas
+GenericName[en]=Note taking
+Comment=Caderno de blocos local, com Markdown, tarefas e SQLite
+Comment[en]=Local block-based notebook with Markdown, tasks and SQLite
+X-GNOME-FullName=Simion — caderno de blocos local
 Exec=simion
 Icon=simion
 Terminal=false
 Categories=Office;Utility;
-Keywords=notes;notion;markdown;local;sqlite;blocks;
+Keywords=anotações;notas;markdown;tarefas;sqlite;local;notes;notion;
 StartupWMClass=simion

@@ -101,6 +101,9 @@ fn main() -> eframe::Result {
                 std::process::exit(2);
             }
         };
+        if updater::replaces_running_app(&path) {
+            println!("Fechando e reabrindo o Simion {}…", release.version);
+        }
         match updater::apply_update(&path) {
             Ok(updater::ApplyOutcome::InstallerOpened) => {
                 println!("Instalador aberto — conclua a instalação");

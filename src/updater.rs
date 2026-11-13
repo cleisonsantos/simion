@@ -7,7 +7,7 @@
 use std::fs;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use serde::Deserialize;
@@ -312,6 +312,82 @@ pub fn user_agent() -> String {
     format!("Simion/{}", env!("CARGO_PKG_VERSION"))
 }
 
+/// Chave de `settings` onde o download pronto é persistido entre sessões.
+pub const PENDING_UPDATE_KEY: &str = "pending_update";
+
+/// Formato persistido em `settings.pending_update`: uma linha com versão e
+/// caminho separados por `\t`.
+pub fn format_pending_update(version: &str, path: &Path) -> String {
+    format!("{version}\t{}", path.display())
+}
+
+/// Lê o valor persistido; devolve `None` para versões ou caminhos inválidos.
+pub fn parse_pending_update(value: &str) -> Option<(String, PathBuf)> {
+    let (version, path) = value.split_once('\t')?;
+    let version = version.trim();
+    let path = path.trim();
+    if parse_version(version).is_none() || path.is_empty() {
+        return None;
+    }
+    Some((version.to_owned(), PathBuf::from(path)))
+}
+
+/// Release mínima para reoferecer um download já concluído sem consultar a API.
+pub fn pending_release(version: &str) -> Release {
+    Release {
+        version: version.to_owned(),
+        tag_name: format!("v{version}"),
+        html_url: format!("https://github.com/{REPO}"),
+        assets: Vec::new(),
+    }
+}
+
+/// `true` quando aplicar o download substitui e reabre este executável.
+pub fn replaces_running_app(path: &Path) -> bool {
+    let name = path
+        .file_name()
+        .map(|name| name.to_string_lossy().to_ascii_lowercase())
+        .unwrap_or_default();
+    name.ends_with(".appimage") || name.ends_with(".tar.xz")
+}
+
+/// Inicia `exe` de forma desacoplada, sobrevivendo ao `exit` deste processo.
+fn respawn_detached(exe: &Path) -> Result<(), String> {
+    #[cfg(unix)]
+    {
+        // Um `sleep` curto evita disputar o executável com o processo que vai
+        // sair. `exec` mantém só o processo alvo vivo, já fora da GUI.
+        Command::new("sh")
+            .arg("-c")
+            .arg("sleep 1; exec \"$1\"")
+            .arg("sh")
+            .arg(exe)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .map(|_| ())
+            .map_err(|err| format!("Não foi possível reabrir {}: {err}", exe.display()))
+    }
+
+    #[cfg(windows)]
+    {
+        Command::new(exe)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .map(|_| ())
+            .map_err(|err| format!("Não foi possível reabrir {}: {err}", exe.display()))
+    }
+
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = exe;
+        Err("Relançar o Simion não é suportado nesta plataforma".to_owned())
+    }
+}
+
 /// Endpoint da API. `SIMION_UPDATE_API` pode apontar para um servidor local,
 /// completo (`.../releases/latest`) ou apenas a raiz (`http://127.0.0.1:8080`).
 pub fn api_url() -> String {
@@ -491,13 +567,22 @@ fn apply_appimage(download: &Path) -> Result<(), String> {
         .ok_or_else(|| "APPIMAGE não está definido; não sei qual AppImage substituir".to_owned())?;
 
     replace_file(download, &target)?;
-    Command::new(&target)
-        .spawn()
-        .map_err(|err| format!("Falha ao reiniciar o AppImage: {err}"))?;
+    // Só encerra depois que o processo auxiliar foi iniciado. Se o respawn
+    // falhar, o app continua aberto e a UI mostra o erro.
+    respawn_detached(&target)?;
     std::process::exit(0);
 }
 
 fn apply_portable_tar(download: &Path) -> Result<(), String> {
+    let current = std::env::current_exe()
+        .map_err(|err| format!("Não foi possível localizar o executável atual: {err}"))?;
+    apply_portable_tar_at(download, &current)?;
+    std::process::exit(0);
+}
+
+/// Extrai e substitui `current`; separado para os testes usarem um alvo de
+/// scratch em vez do binário real.
+fn apply_portable_tar_at(download: &Path, current: &Path) -> Result<(), String> {
     let stamp = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|duration| duration.as_secs())
@@ -525,15 +610,16 @@ fn apply_portable_tar(download: &Path) -> Result<(), String> {
         let _ = fs::remove_dir_all(&dir);
         return Err("O pacote .tar.xz não contém o binário simion".to_owned());
     };
-    let current = std::env::current_exe()
-        .map_err(|err| format!("Não foi possível localizar o executável atual: {err}"))?;
-    replace_file(&binary, &current)?;
+    if let Err(err) = replace_file(&binary, current) {
+        // A pasta temporária também precisa sair no caminho de erro.
+        let _ = fs::remove_dir_all(&dir);
+        return Err(err);
+    }
     let _ = fs::remove_dir_all(&dir);
 
-    Command::new(&current)
-        .spawn()
-        .map_err(|err| format!("Falha ao reiniciar o Simion: {err}"))?;
-    std::process::exit(0);
+    // Ordem importa: respawn primeiro; `exit` só depois de sucesso, no
+    // chamador (o helper não encerra para poder ser testado).
+    respawn_detached(current)
 }
 
 fn find_named(dir: &Path, name: &str, depth: usize) -> Option<PathBuf> {
@@ -932,5 +1018,138 @@ mod tests {
         assert!(check_due(now - CHECK_INTERVAL_SECS - 1, now));
         assert!(!check_due(now - CHECK_INTERVAL_SECS + 1, now));
         assert!(!check_due(now + 60, now));
+    }
+
+    #[test]
+    fn pending_update_round_trips_as_one_line() {
+        let path = Path::new("/tmp/simion-update/simion_0.1.11_linux_x86_64.tar.xz");
+        let value = format_pending_update("0.1.11", path);
+        assert_eq!(
+            value,
+            "0.1.11\t/tmp/simion-update/simion_0.1.11_linux_x86_64.tar.xz"
+        );
+        assert_eq!(
+            parse_pending_update(&value),
+            Some(("0.1.11".to_owned(), path.to_path_buf()))
+        );
+    }
+
+    #[test]
+    fn pending_update_rejects_invalid_values() {
+        assert_eq!(parse_pending_update(""), None);
+        assert_eq!(parse_pending_update("0.1.11"), None);
+        assert_eq!(parse_pending_update("invalida\t/tmp/arquivo.tar.xz"), None);
+        assert_eq!(parse_pending_update("0.1.11\t"), None);
+        assert_eq!(parse_pending_update("0.1.11\t   "), None);
+    }
+
+    #[test]
+    fn pending_release_is_minimal_but_usable() {
+        let release = pending_release("0.1.11");
+        assert_eq!(release.version, "0.1.11");
+        assert_eq!(release.tag_name, "v0.1.11");
+        assert_eq!(release.html_url, "https://github.com/cleisonsantos/simion");
+        assert!(release.assets.is_empty());
+        assert_eq!(release, pending_release("0.1.11"));
+    }
+
+    #[test]
+    fn portable_downloads_replace_the_running_app() {
+        assert!(replaces_running_app(Path::new(
+            "Simion-0.1.10-x86_64.AppImage"
+        )));
+        assert!(replaces_running_app(Path::new(
+            "simion_0.1.10_linux_x86_64.tar.xz"
+        )));
+        assert!(!replaces_running_app(Path::new("simion_0.1.10_amd64.deb")));
+        assert!(!replaces_running_app(Path::new(
+            "Simion-Setup-0.1.10-x64.msi"
+        )));
+        assert!(!replaces_running_app(Path::new(
+            "Simion-0.1.10-universal.dmg"
+        )));
+    }
+
+    #[cfg(unix)]
+    fn scratch_dir(label: &str) -> PathBuf {
+        let stamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|duration| duration.as_nanos())
+            .unwrap_or(0);
+        let dir = std::env::temp_dir().join(format!(
+            "simion-test-{label}-{}-{stamp}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[cfg(unix)]
+    fn write_script(path: &Path, body: &str) {
+        use std::os::unix::fs::PermissionsExt;
+        fs::write(path, body).unwrap();
+        fs::set_permissions(path, fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
+    #[cfg(unix)]
+    fn wait_for(path: &Path, timeout: Duration) -> bool {
+        let start = std::time::Instant::now();
+        while start.elapsed() < timeout {
+            if path.exists() {
+                return true;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        path.exists()
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn respawn_detached_runs_the_new_executable() {
+        let dir = scratch_dir("respawn");
+        let script = dir.join("simion.sh");
+        let marker = dir.join("started");
+        write_script(
+            &script,
+            &format!("#!/bin/sh\nprintf ok > '{}'\n", marker.display()),
+        );
+
+        respawn_detached(&script).unwrap();
+
+        assert!(wait_for(&marker, Duration::from_secs(3)));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn portable_tar_replaces_binary_and_respawns_it() {
+        let dir = scratch_dir("portable");
+        let payload = dir.join("payload");
+        fs::create_dir_all(&payload).unwrap();
+
+        let target = dir.join("simion");
+        write_script(&target, "#!/bin/sh\nexit 0\n");
+
+        let marker = dir.join("reopened");
+        let new_script = format!("#!/bin/sh\nprintf novo > '{}'\n", marker.display());
+        write_script(&payload.join("simion"), &new_script);
+
+        let archive = dir.join("simion_0.1.11_linux_x86_64.tar.xz");
+        let status = Command::new("tar")
+            .arg("-cJf")
+            .arg(&archive)
+            .arg("-C")
+            .arg(&payload)
+            .arg("simion")
+            .status()
+            .unwrap();
+        assert!(status.success());
+
+        apply_portable_tar_at(&archive, &target).unwrap();
+
+        assert_eq!(fs::read_to_string(&target).unwrap(), new_script);
+        assert!(wait_for(&marker, Duration::from_secs(3)));
+        let _ = fs::remove_dir_all(&dir);
     }
 }
