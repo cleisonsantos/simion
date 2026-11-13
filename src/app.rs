@@ -464,12 +464,13 @@ impl App {
         let mut copy = self.page.blocks[index].clone();
         copy.id = self.ids.next();
         let copy_id = copy.id;
+        let caret = copy.text.chars().count();
         self.page.blocks.insert(index + 1, copy);
         self.end_change();
         self.focus = Focus::Block(copy_id);
         self.pending = Some(PendingFocus {
             target: Focus::Block(copy_id),
-            range: Some((0, 0)),
+            range: Some((caret, caret)),
             select_all: false,
         });
         self.scroll_to = Some(copy_id);
