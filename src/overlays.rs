@@ -9,6 +9,7 @@ use crate::app::{Action, App, Focus, PendingFocus};
 use crate::markdown;
 use crate::model::{Block, BlockKind};
 use crate::syntax;
+use crate::text::plural;
 use crate::theme::{
     FONT_BODY, FONT_MEDIUM, FONT_MONO, FONT_SEMIBOLD, GUTTER, Mode, Palette, family,
 };
@@ -986,9 +987,13 @@ impl App {
                     }
                     ui.add_space(6.0);
                     ui.label(
-                        RichText::new(format!("{page_count} páginas · {block_count} blocos"))
-                            .size(12.0)
-                            .color(p.muted),
+                        RichText::new(format!(
+                            "{} · {}",
+                            plural(page_count, "página", "páginas"),
+                            plural(block_count.max(0) as usize, "bloco", "blocos")
+                        ))
+                        .size(12.0)
+                        .color(p.muted),
                     );
                     ui.add_space(8.0);
                     egui::Frame::new()

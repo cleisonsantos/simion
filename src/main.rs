@@ -11,6 +11,7 @@ mod search;
 mod sidebar;
 mod store;
 mod syntax;
+mod text;
 mod theme;
 mod ui;
 mod updater;

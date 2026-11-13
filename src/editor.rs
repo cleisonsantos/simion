@@ -16,6 +16,7 @@ use crate::icons;
 use crate::markdown::{self, InlineLayout};
 use crate::model::BlockKind;
 use crate::syntax;
+use crate::text::plural;
 use crate::theme::{
     FONT_BODY, FONT_ITALIC, FONT_MEDIUM, FONT_MONO, FONT_SEMIBOLD, FONT_SEMIBOLD_ITALIC, GUTTER,
     INDENT_WIDTH, MAX_CONTENT_WIDTH, Palette, family,
@@ -3260,7 +3261,7 @@ pub fn status_bar(app: &mut App, ui: &mut Ui) {
             ui.label(RichText::new(format!("{zoom}%")).size(11.5).color(p.faint));
             ui.label(RichText::new("·").size(11.5).color(p.faint));
             ui.label(
-                RichText::new(format!("{words} palavras"))
+                RichText::new(plural(words, "palavra", "palavras"))
                     .size(11.5)
                     .color(p.faint),
             );
