@@ -187,6 +187,7 @@ pub struct App {
     pub reset_scroll: bool,
     pub file_hover: bool,
     pub window_title: String,
+    pub pending_paste: Option<(u64, String)>,
     pub plain_paste_pending: bool,
     pub plain_paste_until: f64,
 }
@@ -373,6 +374,7 @@ impl App {
             reset_scroll: true,
             file_hover: false,
             window_title: String::new(),
+            pending_paste: None,
             plain_paste_pending: false,
             plain_paste_until: 0.0,
         }
@@ -2019,7 +2021,7 @@ pub(crate) fn should_parse_paste(text: &str) -> bool {
 }
 
 impl App {
-    fn handle_paste(&mut self, ctx: &Context) {
+    pub(crate) fn handle_paste(&mut self, ctx: &Context) {
         if self.plain_paste_pending {
             if self.now > self.plain_paste_until {
                 self.plain_paste_pending = false;
@@ -2071,6 +2073,22 @@ impl App {
         let Focus::Block(block_id) = self.focus else {
             return;
         };
+        // Preserve line breaks and the caret; the editor owns block splitting.
+        ctx.input_mut(|input| {
+            input.events.retain(|event| {
+                if let egui::Event::Paste(text) = event
+                    && text.contains('\n')
+                {
+                    self.pending_paste = Some((block_id, text.clone()));
+                    false
+                } else {
+                    true
+                }
+            });
+        });
+        if self.pending_paste.is_some() {
+            return;
+        }
         let mut pasted: Option<String> = None;
         ctx.input(|input| {
             for event in &input.events {
