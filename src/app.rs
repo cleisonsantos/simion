@@ -51,6 +51,7 @@ pub struct Toast {
 
 #[derive(Debug)]
 pub enum Action {
+    BlockContext(crate::editor::BlockContextAction),
     SelectPage(PageId),
     NewPage {
         parent: Option<PageId>,
@@ -149,6 +150,10 @@ pub struct App {
     pub hover_block: Option<u64>,
     /// Blocks selected with Shift+↑/↓: (anchor, extent) block ids.
     pub block_selection: Option<(u64, u64)>,
+    pub text_span: Option<crate::editor::TextSpan>,
+    pub text_anchor: Option<(usize, usize)>,
+    pub text_dragging: bool,
+    pub native_drag_origin: Option<(usize, usize)>,
 
     pub slash: Option<SlashState>,
     pub block_menu: Option<(u64, Pos2)>,
@@ -328,6 +333,10 @@ impl App {
             title_cursor: None,
             hover_block: None,
             block_selection: None,
+            text_span: None,
+            text_anchor: None,
+            text_dragging: false,
+            native_drag_origin: None,
             slash: None,
             block_menu: None,
             block_menu_transform: false,
@@ -548,6 +557,10 @@ impl App {
         self.cursors.clear();
         self.hover_block = None;
         self.block_selection = None;
+        self.text_span = None;
+        self.text_anchor = None;
+        self.text_dragging = false;
+        self.native_drag_origin = None;
         self.slash = None;
         self.block_menu = None;
         self.code_lang_menu = None;
@@ -1275,6 +1288,10 @@ impl App {
     }
 
     fn apply_snapshot(&mut self, snapshot: Snapshot) {
+        self.text_span = None;
+        self.text_anchor = None;
+        self.text_dragging = false;
+        self.native_drag_origin = None;
         self.page.meta.title = snapshot.title;
         self.page.meta.icon = snapshot.icon;
         self.page.blocks = snapshot.blocks;
@@ -1442,6 +1459,7 @@ impl App {
 
     fn apply_action(&mut self, action: Action, ctx: &Context) {
         match action {
+            Action::BlockContext(action) => self.apply_block_context(action, ctx),
             Action::SelectPage(id) => self.open_page(id),
             Action::NewPage { parent } => self.create_page(parent),
             Action::NewFolder { parent } => self.create_folder(parent),
@@ -2031,6 +2049,23 @@ impl App {
             || self.slash.is_some()
             || self.confirm_delete.is_some();
         if overlays_open {
+            return;
+        }
+        if self.block_selection_range().is_some() {
+            let mut pasted = None;
+            ctx.input_mut(|input| {
+                input.events.retain(|event| {
+                    if let egui::Event::Paste(text) = event {
+                        pasted = Some(text.clone());
+                        false
+                    } else {
+                        true
+                    }
+                })
+            });
+            if let Some(text) = pasted {
+                self.paste_block_selection(&text);
+            }
             return;
         }
         let Focus::Block(block_id) = self.focus else {

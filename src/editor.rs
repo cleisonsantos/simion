@@ -22,6 +22,29 @@ use crate::theme::{
 };
 use crate::ui as widgets;
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TextSpan {
+    pub anchor: (usize, usize),
+    pub head: (usize, usize),
+}
+
+impl TextSpan {
+    fn ordered(self) -> ((usize, usize), (usize, usize)) {
+        (self.anchor.min(self.head), self.anchor.max(self.head))
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+pub enum BlockContextAction {
+    Cut,
+    Copy,
+    Paste,
+    Duplicate,
+    Delete,
+    Transform(BlockKind),
+    Move(i32),
+}
+
 impl App {
     pub fn editor(&mut self, ui: &mut Ui, actions: &mut Vec<Action>) {
         let p = self.palette;
@@ -348,9 +371,13 @@ impl App {
         let column_left = ui.cursor().left();
         ui.spacing_mut().item_spacing.y = 0.0;
         self.hover_block = None;
+        self.block_rects.clear();
 
         // Any click in the editor drops the block selection.
-        if self.block_selection.is_some() && ui.input(|input| input.pointer.any_pressed()) {
+        if self.block_selection.is_some()
+            && !egui::Popup::is_any_open(ui.ctx())
+            && ui.input(|input| input.pointer.primary_pressed())
+        {
             self.block_selection = None;
         }
 
@@ -399,7 +426,7 @@ impl App {
                 );
                 ui.painter().set(
                     selection_shape,
-                    Shape::rect_filled(rect, 4, self.palette.hover),
+                    Shape::rect_filled(rect, 4, self.palette.selection),
                 );
             }
             if outcome.changed {
@@ -421,6 +448,14 @@ impl App {
                 Some(galley) => self.block_galleys.insert(id, galley),
                 None => self.block_galleys.remove(&id),
             };
+            self.paint_span(
+                ui,
+                index,
+                column_left,
+                text_width,
+                outcome.rect,
+                outcome.span_shape,
+            );
             content_top += measured + 2.0;
             if self.scroll_to == Some(id) {
                 if !viewport.contains_rect(outcome.rect) {
@@ -539,6 +574,7 @@ impl App {
         let hint_font = FontId::new(base_size, family(base_family));
 
         let shape_idx = ui.painter().add(Shape::Noop);
+        let span_shape = ui.painter().add(Shape::Noop);
         let row_start = ui.cursor().min;
         let mut new_text = text.clone();
         let mut changed = false;
@@ -741,6 +777,8 @@ impl App {
                 }))
                 .desired_width(available)
                 .desired_rows(1)
+                // The document selection owns painting and clipboard events.
+                .interactive(self.text_span.is_none())
                 // Tab indents the block (see `block_keys`); without the lock
                 // egui would move keyboard focus to the next widget.
                 .lock_focus(true);
@@ -752,9 +790,18 @@ impl App {
             };
 
             let output = te.layouter(&mut layouter).show(ui);
+            // Keep the native text widget as the drag target. The document-level
+            // controller uses its cached rect/galley before TextEdit handles events,
+            // so a drag continues beyond this widget's bounds.
+            let response = output.response.clone().interact(Sense::click_and_drag());
+            self.block_context_menu(ui, &response, id, actions);
             te_rect = output.response.rect;
             rows = output.galley.rows.len().max(1);
-            galley = Some((output.galley.clone(), output.galley_pos));
+            // Anchor to this frame's widget geometry, including the text inset.
+            // A detached/cached galley origin must not turn screen-space y into
+            // a position below every wrapped row (and select the last row).
+            let text_origin = te_rect.min + vec2(margin_left as f32, margin_top as f32);
+            galley = Some((output.galley.clone(), text_origin));
             if output.response.changed() {
                 changed = true;
             }
@@ -769,7 +816,7 @@ impl App {
             let command = ui.input(|input| input.modifiers.command || input.modifiers.ctrl);
             if command && output.response.hovered() {
                 if let Some(pointer) = ui.input(|input| input.pointer.hover_pos()) {
-                    let local = pointer - output.galley_pos;
+                    let local = pointer - text_origin;
                     let ccursor = output.galley.cursor_from_pos(local);
                     let byte = markdown::char_to_byte(&new_text, ccursor.index.0);
                     let layout = markdown::parse_inline(&new_text);
@@ -948,6 +995,7 @@ impl App {
         BlockOutcome {
             changed,
             focused,
+            span_shape,
             cursor: cursor_range,
             rect: row_rect,
             rows,
@@ -966,8 +1014,9 @@ impl App {
         let p = self.palette;
         let zoom = self.zoom;
         let row_start = ui.cursor().min;
-        let (rect, _response) =
+        let (rect, response) =
             ui.allocate_exact_size(vec2(text_width, 24.0 * zoom), Sense::click());
+        self.block_context_menu(ui, &response, id, actions);
         let y = rect.center().y;
         ui.painter().rect_filled(
             Rect::from_min_size(pos2(rect.left(), y - 0.75), vec2(rect.width(), 1.5)),
@@ -979,6 +1028,7 @@ impl App {
         BlockOutcome {
             changed: false,
             focused: false,
+            span_shape: ui.painter().add(Shape::Noop),
             cursor: None,
             rect: row_rect,
             rows: 1,
@@ -1162,6 +1212,10 @@ impl App {
     // -----------------------------------------------------------------------
 
     pub fn editor_keys(&mut self, ctx: &egui::Context) {
+        self.span_pointer(ctx);
+        if self.span_keys(ctx) {
+            return;
+        }
         if self.block_selection.is_some() && self.selection_keys(ctx) {
             return;
         }
@@ -1170,7 +1224,13 @@ impl App {
             // selection and Esc / Enter go back to editing.
             match self.focus {
                 Focus::Block(id) if self.index_of(id).is_some() => {
-                    self.start_block_selection(ctx, id);
+                    if let Some((a, b)) = self.cursor_range_for(ctx, id)
+                        && a != b
+                    {
+                        self.focus_block(id, b);
+                    } else {
+                        self.start_block_selection(ctx, id);
+                    }
                 }
                 _ => self.focus = Focus::None,
             }
@@ -1341,6 +1401,29 @@ impl App {
         let has_selection = selection_start != selection_end;
         let caret = selection_end.min(text_len);
 
+        for (key, forward) in [(Key::ArrowRight, true), (Key::ArrowLeft, false)] {
+            let range = self.cursor_range_for(ctx, id).unwrap_or((caret, caret));
+            let head = range.0;
+            if ((forward && head == text_len && index + 1 < self.page.blocks.len())
+                || (!forward && head == 0 && index > 0))
+                && self.consume_pub(ctx, key, Modifiers::SHIFT)
+            {
+                let next = if forward { index + 1 } else { index - 1 };
+                let offset = if forward {
+                    0
+                } else {
+                    self.page.blocks[next].text.chars().count()
+                };
+                self.activate_span(
+                    ctx,
+                    TextSpan {
+                        anchor: (index, range.1),
+                        head: (next, offset),
+                    },
+                );
+                return;
+            }
+        }
         if kind.accepts_text() {
             if self.consume_pub(ctx, Key::B, Modifiers::COMMAND) {
                 self.inline_toggle("**", id, (selection_start, selection_end));
@@ -1723,6 +1806,196 @@ impl App {
         });
     }
 
+    fn block_context_menu(
+        &mut self,
+        ui: &Ui,
+        response: &egui::Response,
+        id: u64,
+        actions: &mut Vec<Action>,
+    ) {
+        if response.secondary_clicked() {
+            if !self.index_of(id).is_some_and(|i| self.block_selected(i)) {
+                self.start_block_selection(ui.ctx(), id);
+            }
+            self.slash = None;
+        }
+        let p = self.palette;
+        let mut chosen = None;
+        egui::Popup::context_menu(response)
+            .frame(widgets::popup_frame(&p))
+            .show(|ui| {
+                ui.set_width(240.0);
+                for (label, action) in [
+                    ("Recortar", BlockContextAction::Cut),
+                    ("Copiar", BlockContextAction::Copy),
+                    ("Colar", BlockContextAction::Paste),
+                ] {
+                    if widgets::menu_row(ui, label, None, false, false, &p).clicked() {
+                        chosen = Some(action);
+                    }
+                }
+                ui.separator();
+                for (label, action) in [
+                    ("Duplicar", BlockContextAction::Duplicate),
+                    ("Excluir", BlockContextAction::Delete),
+                ] {
+                    if widgets::menu_row(ui, label, None, label == "Excluir", false, &p).clicked() {
+                        chosen = Some(action);
+                    }
+                }
+                ui.separator();
+                let common = self.block_selection_range().and_then(|(lo, hi)| {
+                    let kind = self.page.blocks[lo].kind;
+                    self.page.blocks[lo..=hi]
+                        .iter()
+                        .all(|b| b.kind == kind)
+                        .then_some(kind)
+                });
+                ui.menu_button("Transformar em", |ui| {
+                    ui.set_width(240.0);
+                    for kind in BlockKind::ALL {
+                        if widgets::menu_row(
+                            ui,
+                            &format!(
+                                "{}{}",
+                                if common == Some(kind) { "● " } else { "" },
+                                kind.label()
+                            ),
+                            None,
+                            false,
+                            common == Some(kind),
+                            &p,
+                        )
+                        .clicked()
+                        {
+                            chosen = Some(BlockContextAction::Transform(kind));
+                        }
+                    }
+                    if chosen.is_some() {
+                        ui.close();
+                    }
+                });
+                ui.separator();
+                for (label, delta) in [("Mover para cima", -1), ("Mover para baixo", 1)] {
+                    if widgets::menu_row(ui, label, None, false, false, &p).clicked() {
+                        chosen = Some(BlockContextAction::Move(delta));
+                    }
+                }
+                if chosen.is_some() {
+                    ui.close();
+                }
+            });
+        if let Some(action) = chosen {
+            actions.push(Action::BlockContext(action));
+        }
+    }
+
+    pub fn apply_block_context(&mut self, action: BlockContextAction, ctx: &egui::Context) {
+        let Some((lo, hi)) = self.block_selection_range() else {
+            return;
+        };
+        match action {
+            BlockContextAction::Copy | BlockContextAction::Cut => {
+                ctx.copy_text(markdown::to_markdown(&self.page.blocks[lo..=hi]));
+                if matches!(action, BlockContextAction::Cut) {
+                    self.delete_block_selection();
+                }
+            }
+            BlockContextAction::Paste => ctx.send_viewport_cmd(egui::ViewportCommand::RequestPaste),
+            BlockContextAction::Delete => self.delete_block_selection(),
+            BlockContextAction::Transform(kind) => self.transform_selection(kind),
+            BlockContextAction::Duplicate => {
+                self.begin_change();
+                let mut blocks = self.page.blocks[lo..=hi].to_vec();
+                for block in &mut blocks {
+                    block.id = self.ids.next();
+                }
+                self.page.blocks.splice(hi + 1..hi + 1, blocks);
+                self.end_change();
+            }
+            BlockContextAction::Move(delta) => {
+                if delta < 0 && lo > 0 {
+                    self.begin_change();
+                    self.page.blocks[lo - 1..=hi].rotate_left(1);
+                    self.end_change();
+                } else if delta > 0 && hi + 1 < self.page.blocks.len() {
+                    self.begin_change();
+                    self.page.blocks[lo..=hi + 1].rotate_right(1);
+                    self.end_change();
+                }
+            }
+        }
+        if let Some((anchor, _)) = self.block_selection {
+            self.restore_selection_focus(anchor);
+        }
+    }
+
+    fn restore_selection_focus(&mut self, id: u64) {
+        let (a, b) = self.cursors.get(&id).copied().unwrap_or((0, 0));
+        self.focus = Focus::Block(id);
+        self.pending = Some(PendingFocus {
+            target: Focus::Block(id),
+            range: Some((a, b)),
+            select_all: false,
+        });
+    }
+
+    pub fn paste_block_selection(&mut self, text: &str) {
+        let Some((lo, hi)) = self.block_selection_range() else {
+            return;
+        };
+        let drafts = markdown::parse_blocks(text, true);
+        if drafts.is_empty() {
+            return;
+        }
+        self.begin_change();
+        let blocks: Vec<_> = drafts
+            .into_iter()
+            .map(|draft| draft.into_block(self.ids.next()))
+            .collect();
+        let last = blocks.last().unwrap();
+        let (id, caret) = (last.id, last.text.chars().count());
+        self.page.blocks.splice(lo..=hi, blocks);
+        self.block_selection = None;
+        self.end_change();
+        self.focus_block(id, caret);
+    }
+
+    fn transform_selection(&mut self, kind: BlockKind) {
+        let Some((lo, hi)) = self.block_selection_range() else {
+            return;
+        };
+        if !self.page.blocks[lo..=hi]
+            .iter()
+            .any(|b| b.kind != BlockKind::Divider && (b.kind != kind || kind == BlockKind::Todo))
+        {
+            return;
+        }
+        self.begin_change();
+        for block in &mut self.page.blocks[lo..=hi] {
+            if block.kind == BlockKind::Divider {
+                continue;
+            }
+            block.kind = kind;
+            if kind == BlockKind::Divider {
+                block.text.clear();
+            }
+            if kind == BlockKind::Todo {
+                block.checked = false;
+            }
+            if kind == BlockKind::Callout && block.emoji.is_empty() {
+                block.emoji = "💡".to_owned();
+            }
+            if !kind.is_list() {
+                block.indent = 0;
+            }
+        }
+        self.end_change();
+        if let Some((anchor, _)) = self.block_selection {
+            self.restore_selection_focus(anchor);
+        }
+    }
+
     fn transform_block(&mut self, id: u64, kind: BlockKind) {
         let Some(index) = self.index_of(id) else {
             return;
@@ -1869,6 +2142,361 @@ impl App {
         true
     }
 
+    fn point_in_text(&self, pos: egui::Pos2, dragging: bool) -> Option<(usize, usize)> {
+        let (index, block) = self
+            .page
+            .blocks
+            .iter()
+            .enumerate()
+            .filter(|(_, b)| self.block_rects.contains_key(&b.id))
+            .filter(|(_, b)| dragging || self.block_rects[&b.id].contains(pos))
+            .min_by(|(_, a), (_, b)| {
+                let distance = |id| {
+                    let r = self.block_rects[&id];
+                    (pos.y - pos.y.clamp(r.top(), r.bottom())).abs()
+                };
+                distance(a.id).total_cmp(&distance(b.id))
+            })?;
+        // Non-text blocks have a row rect but no galley; their only valid
+        // text endpoint is offset zero.
+        let offset = self.block_galleys.get(&block.id).map_or(0, |(g, origin)| {
+            g.cursor_from_pos(pos - *origin)
+                .index
+                .0
+                .min(block.text.chars().count())
+        });
+        Some((index, offset))
+    }
+
+    fn activate_span(&mut self, ctx: &egui::Context, span: TextSpan) {
+        self.block_selection = None;
+        self.text_span = Some(span);
+        self.text_anchor = Some(span.anchor);
+        self.pending = None;
+        self.slash = None;
+        for block in &self.page.blocks {
+            ctx.memory_mut(|m| m.surrender_focus(block_te_id(block.id)));
+        }
+        self.focus = Focus::None;
+        self.scroll_to = self.page.blocks.get(span.head.0).map(|b| b.id);
+    }
+
+    fn span_pointer(&mut self, ctx: &egui::Context) {
+        let (press, down, released, pos) = ctx.input(|i| {
+            (
+                i.events.iter().find_map(|event| match event {
+                    egui::Event::PointerButton {
+                        pos,
+                        button: egui::PointerButton::Primary,
+                        pressed: true,
+                        modifiers,
+                    } => Some((*pos, modifiers.shift)),
+                    _ => None,
+                }),
+                i.pointer.primary_down(),
+                i.pointer.primary_released(),
+                i.pointer.interact_pos(),
+            )
+        });
+        // A press and movement can arrive in the same frame. The anchor must
+        // use the button event position, not the final pointer position.
+        if let Some((press_pos, shift)) = press {
+            self.text_dragging = false;
+            self.native_drag_origin = None;
+            if let Some(point) = self.point_in_text(press_pos, false) {
+                if shift {
+                    let anchor = self
+                        .text_span
+                        .map(|s| s.anchor)
+                        .or_else(|| match self.focus {
+                            Focus::Block(id) => self
+                                .index_of(id)
+                                .zip(self.cursor_range_for(ctx, id).map(|r| r.1)),
+                            _ => None,
+                        })
+                        .or(self.text_anchor)
+                        .unwrap_or(point);
+                    self.activate_span(
+                        ctx,
+                        TextSpan {
+                            anchor,
+                            head: point,
+                        },
+                    );
+                    self.text_dragging = true;
+                } else {
+                    self.text_span = None;
+                    self.text_anchor = Some(point);
+                    self.native_drag_origin = Some(point);
+                }
+            } else {
+                self.text_span = None;
+                self.text_anchor = None;
+            }
+        }
+        // TextEdit owns the entire gesture until the pointer leaves its block.
+        // In particular, wrapped vertical drags must keep their native cursor
+        // range, focus, clipboard handling, and selection painting.
+        let left_origin = self.native_drag_origin.is_some_and(|(index, _)| {
+            self.page.blocks.get(index).is_some_and(|block| {
+                self.block_rects
+                    .get(&block.id)
+                    .is_some_and(|rect| pos.is_some_and(|point| !rect.contains(point)))
+            })
+        });
+        if (down || released) && (self.text_dragging || left_origin) {
+            if let Some((anchor, head)) = self
+                .text_anchor
+                .zip(pos.and_then(|p| self.point_in_text(p, true)))
+            {
+                if anchor != head || self.text_dragging {
+                    self.text_dragging = true;
+                    self.activate_span(ctx, TextSpan { anchor, head });
+                }
+            }
+        }
+        if self.text_dragging {
+            ctx.input_mut(|i| {
+                i.events.retain(|e| {
+                    !matches!(
+                        e,
+                        egui::Event::PointerButton {
+                            button: egui::PointerButton::Primary,
+                            ..
+                        } | egui::Event::PointerMoved(_)
+                    )
+                })
+            });
+        }
+        if released {
+            self.text_dragging = false;
+            self.native_drag_origin = None;
+        }
+    }
+
+    fn replace_span(&mut self, replacement: &str) {
+        let Some(span) = self.text_span.take() else {
+            return;
+        };
+        let ((lo, a), (hi, b)) = span.ordered();
+        if hi >= self.page.blocks.len() {
+            return;
+        }
+        self.begin_change();
+        let first = self.page.blocks[lo].clone();
+        let last = self.page.blocks[hi].clone();
+        let prefix = &first.text[..markdown::char_to_byte(&first.text, a)];
+        let suffix = &last.text[markdown::char_to_byte(&last.text, b)..];
+        let mut merged = first.clone();
+        if !merged.kind.accepts_text() {
+            merged.kind = BlockKind::Paragraph;
+        }
+        merged.text = format!("{prefix}{replacement}{suffix}");
+        let caret = prefix.chars().count() + replacement.chars().count();
+        // Different textual kinds retain their respective formatting at the seam.
+        if lo != hi && first.kind != last.kind && last.kind.accepts_text() {
+            merged.text = format!("{prefix}{replacement}");
+            let mut tail = last.clone();
+            tail.text = suffix.to_owned();
+            self.page.blocks.splice(lo..=hi, [merged, tail]);
+        } else {
+            self.page.blocks.splice(lo..=hi, [merged]);
+        }
+        self.text_anchor = None;
+        self.end_change();
+        self.focus_block(first.id, caret);
+    }
+
+    fn span_keys(&mut self, ctx: &egui::Context) -> bool {
+        let Some(span) = self.text_span else {
+            return false;
+        };
+        let ((lo, a), (hi, b)) = span.ordered();
+        if hi >= self.page.blocks.len() {
+            self.text_span = None;
+            return false;
+        }
+        if self.consume_pub(ctx, Key::Escape, Modifiers::NONE) {
+            // Collapse at the document-order end, including for a reverse drag.
+            self.text_span = None;
+            self.text_anchor = Some((hi, b));
+            self.focus_block(self.page.blocks[hi].id, b);
+            return true;
+        }
+        let copy = take_event(ctx, |e| matches!(e, egui::Event::Copy))
+            || self.consume_pub(ctx, Key::C, Modifiers::COMMAND);
+        let cut = take_event(ctx, |e| matches!(e, egui::Event::Cut))
+            || self.consume_pub(ctx, Key::X, Modifiers::COMMAND);
+        if copy || cut {
+            let mut blocks = self.page.blocks[lo..=hi].to_vec();
+            let end = markdown::char_to_byte(&blocks[hi - lo].text, b);
+            blocks[hi - lo].text.truncate(end);
+            let start = markdown::char_to_byte(&blocks[0].text, a);
+            blocks[0].text.drain(..start);
+            ctx.copy_text(markdown::to_markdown(&blocks));
+            if cut {
+                self.replace_span("");
+            }
+            return true;
+        }
+        if self.consume_pub(ctx, Key::Backspace, Modifiers::NONE)
+            || self.consume_pub(ctx, Key::Delete, Modifiers::NONE)
+        {
+            self.replace_span("");
+            return true;
+        }
+        let mut replacement = String::new();
+        let mut typed = false;
+        ctx.input_mut(|i| {
+            i.events.retain(|e| {
+                if let egui::Event::Text(text) | egui::Event::Paste(text) = e {
+                    replacement.push_str(text);
+                    typed = true;
+                    false
+                } else {
+                    true
+                }
+            })
+        });
+        if typed {
+            self.replace_span(&replacement);
+            return true;
+        }
+        for (key, forward) in [(Key::ArrowRight, true), (Key::ArrowLeft, false)] {
+            if self.consume_pub(ctx, key, Modifiers::SHIFT) {
+                let (mut index, mut offset) = span.head;
+                let len = self.page.blocks[index].text.chars().count();
+                if forward {
+                    if offset < len {
+                        offset += 1;
+                    } else if index + 1 < self.page.blocks.len() {
+                        index += 1;
+                        offset = 0;
+                    }
+                } else if offset > 0 {
+                    offset -= 1;
+                } else if index > 0 {
+                    index -= 1;
+                    offset = self.page.blocks[index].text.chars().count();
+                }
+                self.activate_span(
+                    ctx,
+                    TextSpan {
+                        head: (index, offset),
+                        ..span
+                    },
+                );
+                return true;
+            }
+        }
+        for (key, down) in [(Key::ArrowUp, false), (Key::ArrowDown, true)] {
+            if self.consume_pub(ctx, key, Modifiers::SHIFT) {
+                let (mut index, offset) = span.head;
+                let mut target = offset;
+                if let Some((g, origin)) = self.block_galleys.get(&self.page.blocks[index].id) {
+                    let cursor = CCursor::new(offset);
+                    let row = caret_row(g, cursor);
+                    let x = origin.x + caret_x(g, cursor);
+                    if down && row + 1 < g.rows.len() {
+                        target = caret_at_row_x(g, row + 1, x - origin.x);
+                    } else if !down && row > 0 {
+                        target = caret_at_row_x(g, row - 1, x - origin.x);
+                    } else if (down && index + 1 < self.page.blocks.len()) || (!down && index > 0) {
+                        index = if down { index + 1 } else { index - 1 };
+                        target = self.block_galleys.get(&self.page.blocks[index].id).map_or(
+                            0,
+                            |(g, origin)| {
+                                caret_at_row_x(
+                                    g,
+                                    if down {
+                                        0
+                                    } else {
+                                        g.rows.len().saturating_sub(1)
+                                    },
+                                    x - origin.x,
+                                )
+                            },
+                        );
+                    }
+                }
+                self.activate_span(
+                    ctx,
+                    TextSpan {
+                        head: (index, target),
+                        ..span
+                    },
+                );
+                return true;
+            }
+        }
+        true
+    }
+
+    fn paint_span(
+        &self,
+        ui: &Ui,
+        index: usize,
+        left: f32,
+        width: f32,
+        rect: Rect,
+        shape: egui::layers::ShapeIdx,
+    ) {
+        let Some(span) = self.text_span else {
+            return;
+        };
+        let ((lo, a), (hi, b)) = span.ordered();
+        if index < lo || index > hi {
+            return;
+        }
+        let color = self.palette.selection;
+        if index > lo && index < hi || !self.page.blocks[index].kind.accepts_text() {
+            ui.painter().set(
+                shape,
+                Shape::rect_filled(
+                    Rect::from_min_size(pos2(left, rect.top()), vec2(width, rect.height())),
+                    4,
+                    color,
+                ),
+            );
+            return;
+        }
+        let Some((g, origin)) = self.block_galleys.get(&self.page.blocks[index].id) else {
+            return;
+        };
+        let start = if index == lo { a } else { 0 };
+        let end = if index == hi {
+            b
+        } else {
+            self.page.blocks[index].text.chars().count()
+        };
+        let mut shapes = Vec::new();
+        for col in start..end {
+            let cursor = g.pos_from_cursor(CCursor::new(col));
+            let next = g.pos_from_cursor(CCursor::new(col + 1));
+            let right = if next.top() == cursor.top() {
+                next.left()
+            } else {
+                g.size().x
+            };
+            let r = Rect::from_min_max(
+                cursor.min + origin.to_vec2(),
+                pos2(right.max(cursor.left() + 2.0), cursor.bottom()) + origin.to_vec2(),
+            );
+            shapes.push(Shape::rect_filled(r, 0, color));
+        }
+        if span.head.0 == index {
+            let caret = g.pos_from_cursor(CCursor::new(span.head.1));
+            shapes.push(Shape::line_segment(
+                [
+                    caret.min + origin.to_vec2(),
+                    caret.left_bottom() + origin.to_vec2(),
+                ],
+                Stroke::new(1.0, self.palette.text),
+            ));
+        }
+        ui.painter().set(shape, Shape::Vec(shapes));
+    }
+
     fn start_block_selection(&mut self, ctx: &egui::Context, id: u64) {
         // The text field lets go of the keyboard so typing does not edit a
         // block while several are selected.
@@ -1877,6 +2505,8 @@ impl App {
         self.focus = Focus::None;
         self.pending = None;
         self.slash = None;
+        self.text_span = None;
+        self.text_anchor = None;
         self.block_selection = Some((id, id));
     }
 
@@ -1908,6 +2538,18 @@ impl App {
             return false;
         }
         let extent_kind = self.page.blocks[extent_index].kind;
+        for (key, kind) in [
+            (Key::Num1, BlockKind::Heading1),
+            (Key::Num2, BlockKind::Heading2),
+            (Key::Num3, BlockKind::Heading3),
+            (Key::Num0, BlockKind::Paragraph),
+        ] {
+            if self.consume_pub(ctx, key, Modifiers::COMMAND | Modifiers::ALT) {
+                self.transform_selection(kind);
+                return true;
+            }
+        }
+
         // Escape restores the anchor; Enter edits the moving end.
         if self.consume_pub(ctx, Key::Escape, Modifiers::NONE) {
             self.block_selection = None;
@@ -2062,14 +2704,15 @@ fn caret_at_row_x(galley: &egui::Galley, row: usize, x: f32) -> usize {
     else {
         return 0;
     };
-    let index = galley
-        .cursor_from_pos(vec2(x, placed.rect().center().y))
-        .index
-        .0;
-    index.min(galley.text().chars().count())
+    let start: usize = galley.rows[..row.min(galley.rows.len() - 1)]
+        .iter()
+        .map(|row| row.char_count_including_newline().0)
+        .sum();
+    (start + placed.char_at(x - placed.pos.x).0).min(galley.text().chars().count())
 }
 
 pub struct BlockOutcome {
+    pub span_shape: egui::layers::ShapeIdx,
     pub changed: bool,
     pub focused: bool,
     pub cursor: Option<(usize, usize)>,
@@ -2336,6 +2979,7 @@ mod tests {
         ctx: egui::Context,
         copied: Vec<String>,
         last_actions: Vec<Action>,
+        selection_rects: Vec<Rect>,
     }
 
     impl Harness {
@@ -2358,6 +3002,7 @@ mod tests {
                 ctx,
                 copied: Vec::new(),
                 last_actions: Vec::new(),
+                selection_rects: Vec::new(),
             };
             harness.idle();
             harness
@@ -2377,6 +3022,25 @@ mod tests {
                 app.editor(ui, &mut actions);
             });
             self.last_actions = actions;
+            fn selection_rects(shape: &Shape, color: Color32, rects: &mut Vec<Rect>) {
+                match shape {
+                    Shape::Vec(shapes) => {
+                        for shape in shapes {
+                            selection_rects(shape, color, rects);
+                        }
+                    }
+                    Shape::Rect(rect) if rect.fill == color => rects.push(rect.rect),
+                    _ => {}
+                }
+            }
+            self.selection_rects.clear();
+            for shape in &output.shapes {
+                selection_rects(
+                    &shape.shape,
+                    self.app.palette.selection,
+                    &mut self.selection_rects,
+                );
+            }
             // No renderer here: the font atlas updates are dropped on purpose.
             output.textures_delta.clear();
             for command in output.platform_output.commands {
@@ -2481,6 +3145,413 @@ mod tests {
             .map(|i| format!("word{i:02}"))
             .collect::<Vec<_>>()
             .join(" ")
+    }
+
+    fn drag_text(h: &mut Harness, a: (usize, usize), b: (usize, usize)) {
+        let point = |h: &Harness, (index, col)| {
+            let (g, origin) = &h.app.block_galleys[&h.id(index)];
+            *origin + g.pos_from_cursor(CCursor::new(col)).center().to_vec2()
+        };
+        let start = point(h, a);
+        let end = point(h, b);
+        h.frame(vec![
+            Event::PointerMoved(start),
+            Event::PointerButton {
+                pos: start,
+                button: egui::PointerButton::Primary,
+                pressed: true,
+                modifiers: Modifiers::NONE,
+            },
+        ]);
+        h.frame(vec![Event::PointerMoved(end)]);
+        h.frame(vec![Event::PointerButton {
+            pos: end,
+            button: egui::PointerButton::Primary,
+            pressed: false,
+            modifiers: Modifiers::NONE,
+        }]);
+        h.idle();
+    }
+
+    #[test]
+    fn context_menu_keeps_inside_selection_and_retargets_outside() {
+        let mut h = Harness::new(
+            "",
+            &[
+                (BlockKind::Paragraph, "A"),
+                (BlockKind::Paragraph, "B"),
+                (BlockKind::Paragraph, "C"),
+            ],
+        );
+        let selection = Some((h.id(0), h.id(1)));
+        h.app.block_selection = selection;
+        for index in [1, 2] {
+            let pos = h.app.block_rects[&h.id(index)].center();
+            h.frame(vec![
+                Event::PointerMoved(pos),
+                Event::PointerButton {
+                    pos,
+                    button: egui::PointerButton::Secondary,
+                    pressed: true,
+                    modifiers: Modifiers::NONE,
+                },
+            ]);
+            h.frame(vec![Event::PointerButton {
+                pos,
+                button: egui::PointerButton::Secondary,
+                pressed: false,
+                modifiers: Modifiers::NONE,
+            }]);
+            assert!(egui::Popup::is_any_open(&h.ctx));
+            assert_eq!(
+                h.app.block_selection,
+                if index == 1 {
+                    selection
+                } else {
+                    Some((h.id(2), h.id(2)))
+                }
+            );
+            egui::Popup::close_all(&h.ctx);
+            h.idle();
+        }
+    }
+
+    #[test]
+    fn batch_transform_preserves_structure_selection_and_undo() {
+        let mut h = Harness::new(
+            "",
+            &[
+                (BlockKind::Paragraph, "A"),
+                (BlockKind::Divider, ""),
+                (BlockKind::Bullet, "B"),
+                (BlockKind::Todo, "C"),
+            ],
+        );
+        h.app.page.blocks[2].indent = 2;
+        h.app.page.blocks[3].checked = true;
+        let selection = Some((h.id(0), h.id(3)));
+        h.app.block_selection = selection;
+        h.app.begin_change();
+        let before = h.app.page.blocks.clone();
+        let undo_count = h.app.history.undo.len();
+        h.app.transform_selection(BlockKind::Todo);
+        assert_eq!(h.app.history.undo.len(), undo_count + 1);
+        assert_eq!(h.app.block_selection, selection);
+        assert_eq!(h.app.page.blocks[1].kind, BlockKind::Divider);
+        assert_eq!(h.app.page.blocks[2].indent, 2);
+        for i in [0, 2, 3] {
+            assert_eq!(h.app.page.blocks[i].kind, BlockKind::Todo);
+            assert!(!h.app.page.blocks[i].checked);
+            assert_eq!(h.app.page.blocks[i].text, before[i].text);
+        }
+        h.app.undo();
+        assert_eq!(
+            markdown::to_markdown(&h.app.page.blocks),
+            markdown::to_markdown(&before)
+        );
+    }
+
+    #[test]
+    fn selection_duplicate_move_and_paste() {
+        let mut h = Harness::new(
+            "",
+            &[
+                (BlockKind::Paragraph, "A"),
+                (BlockKind::Bullet, "B"),
+                (BlockKind::Paragraph, "C"),
+            ],
+        );
+        h.app.block_selection = Some((h.id(0), h.id(1)));
+        let selection = h.app.block_selection;
+        h.app
+            .apply_block_context(BlockContextAction::Duplicate, &h.ctx);
+        assert_eq!(h.texts(), vec!["A", "B", "A", "B", "C"]);
+        let ids: std::collections::HashSet<_> = h.app.page.blocks.iter().map(|b| b.id).collect();
+        assert_eq!(ids.len(), 5);
+        h.app
+            .apply_block_context(BlockContextAction::Move(1), &h.ctx);
+        assert_eq!(h.texts(), vec!["A", "A", "B", "B", "C"]);
+        assert_eq!(h.app.block_selection, selection);
+        h.app.paste_block_selection("replacement");
+        assert_eq!(h.texts(), vec!["A", "replacement", "B", "C"]);
+        assert!(h.app.block_selection.is_none());
+    }
+
+    #[test]
+    fn selection_heading_shortcut_and_divider_only_noop() {
+        let mut h = Harness::new(
+            "",
+            &[(BlockKind::Paragraph, "A"), (BlockKind::Paragraph, "B")],
+        );
+        h.app.block_selection = Some((h.id(0), h.id(1)));
+        h.key(Key::Num2, Modifiers::COMMAND | Modifiers::ALT);
+        assert!(
+            h.app
+                .page
+                .blocks
+                .iter()
+                .all(|b| b.kind == BlockKind::Heading2)
+        );
+        h.app.transform_selection(BlockKind::Divider);
+        let count = h.app.history.undo.len();
+        h.app.transform_selection(BlockKind::Paragraph);
+        assert_eq!(h.app.history.undo.len(), count);
+        assert!(
+            h.app
+                .page
+                .blocks
+                .iter()
+                .all(|b| b.kind == BlockKind::Divider)
+        );
+    }
+
+    #[test]
+    fn batched_drag_paints_and_copies_both_endpoints() {
+        for reverse in [false, true] {
+            let mut h = Harness::new(
+                "",
+                &[
+                    (BlockKind::Paragraph, "alpha one"),
+                    (BlockKind::Paragraph, "bravo two"),
+                ],
+            );
+            batched_drag(&mut h, (0, 5), (1, 2), reverse);
+            assert_eq!(h.app.text_span.unwrap().ordered(), ((0, 5), (1, 2)));
+            for index in 0..2 {
+                let (g, origin) = &h.app.block_galleys[&h.id(index)];
+                let col = if index == 0 { 6 } else { 1 };
+                let caret = g
+                    .pos_from_cursor(CCursor::new(col))
+                    .translate(origin.to_vec2());
+                assert!(h.selection_rects.iter().any(|r| r.intersects(caret)));
+            }
+            h.event(Event::Copy);
+            assert_eq!(h.copied.last().unwrap(), " one\n\nbr\n");
+            h.key(Key::Backspace, Modifiers::NONE);
+            assert_eq!(h.texts(), vec!["alphaavo two"]);
+        }
+    }
+
+    fn batched_drag(h: &mut Harness, a: (usize, usize), b: (usize, usize), reverse: bool) {
+        let point = |(index, col)| {
+            let (g, origin) = &h.app.block_galleys[&h.id(index)];
+            *origin + g.pos_from_cursor(CCursor::new(col)).center().to_vec2()
+        };
+        let (start, end) = if reverse {
+            (point(b), point(a))
+        } else {
+            (point(a), point(b))
+        };
+        h.frame(vec![
+            Event::PointerMoved(start),
+            Event::PointerButton {
+                pos: start,
+                button: egui::PointerButton::Primary,
+                pressed: true,
+                modifiers: Modifiers::NONE,
+            },
+            Event::PointerMoved(end),
+            Event::PointerButton {
+                pos: end,
+                button: egui::PointerButton::Primary,
+                pressed: false,
+                modifiers: Modifiers::NONE,
+            },
+        ]);
+        h.idle();
+    }
+
+    #[test]
+    fn native_drag_within_single_and_wrapped_paragraphs() {
+        for text in [
+            "bravo two".to_owned(),
+            (1..=60)
+                .map(|i| format!("w{i:02}"))
+                .collect::<Vec<_>>()
+                .join(" "),
+        ] {
+            let mut h = Harness::new("", &[(BlockKind::Paragraph, &text)]);
+            let end = if text.len() > 20 {
+                let (g, origin) = &h.app.block_galleys[&h.id(0)];
+                assert!(g.rows.len() > 1);
+                // Same x, next visual row: exercise y -> row -> character.
+                let start = g.pos_from_cursor(CCursor::new(2));
+                h.app
+                    .point_in_text(
+                        *origin + vec2(start.center().x, g.rows[1].min_y() + 2.0),
+                        true,
+                    )
+                    .unwrap()
+                    .1
+            } else {
+                5
+            };
+            drag_text(&mut h, (0, 2), (0, end));
+            assert!(h.app.text_span.is_none());
+            h.event(Event::Copy);
+            assert_eq!(h.copied.last().unwrap(), &text[2..end]);
+            assert_eq!(h.app.cursor_range_for(&h.ctx, h.id(0)), Some((2, end)));
+            h.type_text("Q");
+            assert_eq!(h.texts(), vec![format!("{}Q{}", &text[..2], &text[end..])]);
+        }
+    }
+
+    #[test]
+    fn wrapped_drag_uses_pointer_row_and_column() {
+        let text = (1..=60)
+            .map(|i| format!("w{i:02}"))
+            .collect::<Vec<_>>()
+            .join(" ");
+        for reverse in [false, true] {
+            for x in [80.0, 160.0, 500.0] {
+                for target_row in [1, 2, usize::MAX] {
+                    let mut h = Harness::new(
+                        "",
+                        &[(BlockKind::Paragraph, &text), (BlockKind::Paragraph, "fim")],
+                    );
+                    let g = h.app.block_galleys[&h.id(0)].0.clone();
+                    // Use visible block geometry, independently of the cached
+                    // galley origin under test. Keep the paragraph unfocused.
+                    let rect = h.app.block_rects[&h.id(0)];
+                    let origin =
+                        rect.min + vec2(GUTTER, BlockKind::Paragraph.vertical_margins().0.round());
+                    assert!(origin.y > g.rows.last().unwrap().max_y());
+                    assert!(g.rows.len() > 1);
+                    let row = target_row.min(g.rows.len() - 1);
+                    let column = g.rows[0].char_at(x - g.rows[0].pos.x).0;
+                    let end = g.rows[..row]
+                        .iter()
+                        .map(|r| r.char_count_including_newline().0)
+                        .sum::<usize>()
+                        + g.rows[row].char_at(x - g.rows[row].pos.x).0;
+                    assert!(end > column);
+                    if row < g.rows.len() - 1 {
+                        assert!(end < text.len());
+                    }
+                    let a = origin + vec2(x, g.rows[0].rect().center().y);
+                    let b = origin + vec2(x, g.rows[row].rect().center().y);
+                    assert_eq!(h.app.point_in_text(a, false), Some((0, column)));
+                    assert_eq!(h.app.point_in_text(b, true), Some((0, end)));
+                    let (start, finish) = if reverse { (b, a) } else { (a, b) };
+                    h.frame(vec![
+                        Event::PointerMoved(start),
+                        Event::PointerButton {
+                            pos: start,
+                            button: egui::PointerButton::Primary,
+                            pressed: true,
+                            modifiers: Modifiers::NONE,
+                        },
+                    ]);
+                    h.frame(vec![Event::PointerMoved(finish)]);
+                    h.frame(vec![Event::PointerButton {
+                        pos: finish,
+                        button: egui::PointerButton::Primary,
+                        pressed: false,
+                        modifiers: Modifiers::NONE,
+                    }]);
+                    h.idle();
+                    assert!(h.app.text_span.is_none());
+                    h.event(Event::Copy);
+                    assert_eq!(h.copied.last().unwrap(), &text[column..end]);
+                    assert_eq!(h.app.cursor_range_for(&h.ctx, h.id(0)), Some((column, end)));
+                    h.type_text("Q");
+                    assert_eq!(
+                        h.texts(),
+                        vec![
+                            format!("{}Q{}", &text[..column], &text[end..]),
+                            "fim".to_owned()
+                        ]
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn drag_span_partial_endpoints_both_directions_and_copy() {
+        for reverse in [false, true] {
+            let mut h = Harness::new(
+                "",
+                &[
+                    (BlockKind::Paragraph, "alpha one"),
+                    (BlockKind::Divider, ""),
+                    (BlockKind::Paragraph, "bravo two"),
+                ],
+            );
+            let (a, b) = ((0, 6), (2, 6));
+            drag_text(
+                &mut h,
+                if reverse { b } else { a },
+                if reverse { a } else { b },
+            );
+            assert_eq!(h.app.text_span.unwrap().ordered(), (a, b));
+            h.event(Event::Copy);
+            assert_eq!(h.copied.last().unwrap(), "one\n\n---\n\nbravo\n");
+            h.key(Key::Backspace, Modifiers::NONE);
+            assert_eq!(h.texts(), vec!["alpha two"]);
+        }
+    }
+
+    #[test]
+    fn drag_span_wrapped_text_replacement_and_escape() {
+        let text = "a long paragraph with many words ".repeat(12);
+        let mut h = Harness::new("", &[(BlockKind::Paragraph, &text)]);
+        assert!(h.app.block_galleys[&h.id(0)].0.rows.len() > 1);
+        drag_text(&mut h, (0, 5), (0, 100));
+        h.type_text("Q");
+        assert_eq!(h.texts(), vec![format!("{}Q{}", &text[..5], &text[100..])]);
+        drag_text(&mut h, (0, 20), (0, 3));
+        h.key(Key::Escape, Modifiers::NONE);
+        h.type_text("Z");
+        assert_eq!(h.app.page.blocks[0].text.chars().nth(20), Some('Z'));
+    }
+
+    #[test]
+    fn shift_click_extends_anchor_and_cut_removes_unicode_span() {
+        let mut h = Harness::new(
+            "",
+            &[
+                (BlockKind::Paragraph, "áλpha"),
+                (BlockKind::Paragraph, "brávo"),
+            ],
+        );
+        h.click_in(0, 2);
+        let (g, origin) = &h.app.block_galleys[&h.id(1)];
+        let pos = *origin + g.pos_from_cursor(CCursor::new(2)).center().to_vec2();
+        for pressed in [true, false] {
+            h.frame(vec![
+                Event::PointerMoved(pos),
+                Event::PointerButton {
+                    pos,
+                    button: egui::PointerButton::Primary,
+                    pressed,
+                    modifiers: Modifiers::SHIFT,
+                },
+            ]);
+        }
+        assert_eq!(h.app.text_span.unwrap().ordered(), ((0, 2), (1, 2)));
+        h.event(Event::Cut);
+        assert_eq!(h.copied.last().unwrap(), "pha\n\nbr\n");
+        assert_eq!(h.texts(), vec!["áλávo"]);
+    }
+
+    #[test]
+    fn shift_right_crosses_block_and_replaces() {
+        let mut h = Harness::new(
+            "",
+            &[
+                (BlockKind::Paragraph, "alpha"),
+                (BlockKind::Paragraph, "bravo"),
+            ],
+        );
+        h.caret_in(0, 5);
+        h.key(Key::ArrowRight, Modifiers::SHIFT);
+        assert_eq!(h.app.text_span.unwrap().head, (1, 0));
+        h.key(Key::ArrowRight, Modifiers::SHIFT);
+        h.type_text("Q");
+        assert_eq!(h.texts(), vec!["alphaQravo"]);
+        h.app.undo();
+        assert_eq!(h.texts(), vec!["alpha", "bravo"]);
     }
 
     #[test]
