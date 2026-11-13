@@ -774,6 +774,17 @@ impl App {
                     ui.add_space(8.0);
                     shortcut_group(
                         ui,
+                        "Páginas",
+                        &[
+                            ("Alt ↑ ↓", "Mover entre irmãs"),
+                            ("Alt ⇧ ↑", "Aninhar sob a irmã anterior"),
+                            ("Alt ⇧ ↓", "Mover para o nível do pai"),
+                        ],
+                        &p,
+                    );
+                    ui.add_space(8.0);
+                    shortcut_group(
+                        ui,
                         "Navegação",
                         &[
                             ("↑ ↓", "Mover entre blocos"),

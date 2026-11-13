@@ -123,6 +123,10 @@ pub struct App {
     pub current: Option<PageId>,
     pub collapsed: HashSet<PageId>,
     pub drag_page: Option<PageId>,
+    /// Row the sidebar should scroll into view on the next frame.
+    pub sidebar_scroll_to: Option<PageId>,
+    /// Movimentos de pagina para Ctrl+Z / Ctrl+Shift+Z na barra lateral.
+    pub page_moves: PageMoveHistory,
 
     pub ids: IdGen,
     pub dirty: bool,
@@ -158,6 +162,9 @@ pub struct App {
     pub emoji_picker: Option<Pos2>,
 
     pub sidebar_visible: bool,
+    /// Ultimo rect da barra lateral (coordenadas de tela), usado para saber
+    /// se o ponteiro esta sobre ela nos gestos de pagina.
+    pub sidebar_rect: Option<Rect>,
     pub search: SearchState,
     pub shortcuts_open: bool,
     pub markdown_open: bool,
@@ -192,6 +199,32 @@ pub struct History {
     pub last: Snapshot,
     pub hash: u64,
     pub pushed_at: f64,
+}
+
+const PAGE_MOVE_HISTORY_LIMIT: usize = 50;
+
+/// Onde uma pagina estava: pai, `sort` gravado e posicao efetiva entre as
+/// irmas. O `sort` sozinho nao basta: paginas criadas sem nenhum movimento
+/// comecam em 1,2,3..., nao em 0 (ver `Store::create_page`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PageSpot {
+    pub parent: Option<PageId>,
+    pub sort: u32,
+    pub index: usize,
+}
+
+/// Um movimento de pagina, para desfazer/refazer com `move_page`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PageMove {
+    pub id: PageId,
+    pub from: PageSpot,
+    pub to: PageSpot,
+}
+
+#[derive(Default)]
+pub struct PageMoveHistory {
+    pub undo: Vec<PageMove>,
+    pub redo: Vec<PageMove>,
 }
 
 impl History {
@@ -277,6 +310,8 @@ impl App {
             current: None,
             collapsed: HashSet::new(),
             drag_page: None,
+            sidebar_scroll_to: None,
+            page_moves: PageMoveHistory::default(),
             ids: IdGen::default(),
             dirty: false,
             last_edit: 0.0,
@@ -303,6 +338,7 @@ impl App {
             page_menu: None,
             emoji_picker: None,
             sidebar_visible: true,
+            sidebar_rect: None,
             search: SearchState::default(),
             shortcuts_open: false,
             markdown_open: false,
@@ -350,6 +386,22 @@ impl App {
             let _ = store.create_page(None, "", "", unix_now());
             self.pages = store.list_pages().unwrap_or_default();
         }
+
+        // Expandir/recolher vive em `settings.collapsed_pages`; ids que nao
+        // existem mais no banco sao descartados (e limpos da tabela).
+        let known: HashSet<PageId> = self.pages.iter().map(|page| page.id).collect();
+        let stored =
+            parse_collapsed_pages(store.setting("collapsed_pages").ok().flatten().as_deref());
+        let filtered: HashSet<PageId> = stored
+            .iter()
+            .copied()
+            .filter(|id| known.contains(id))
+            .collect();
+        if filtered.len() != stored.len() {
+            let value = format_collapsed_pages(&filtered);
+            let _ = store.set_setting("collapsed_pages", &value);
+        }
+        self.collapsed = filtered;
 
         let saved = store
             .setting("last_page")
@@ -550,7 +602,7 @@ impl App {
                 self.reload_pages();
                 self.load_page_from_db(meta.id);
                 if let Some(parent) = parent {
-                    self.collapsed.remove(&parent);
+                    self.expand_page(parent);
                 }
                 self.pending = Some(PendingFocus {
                     target: Focus::Title,
@@ -627,6 +679,12 @@ impl App {
             self.toast(format!("Erro ao excluir: {err}"));
             return;
         }
+        self.page_moves
+            .undo
+            .retain(|entry| !removed.contains(&entry.id));
+        self.page_moves
+            .redo
+            .retain(|entry| !removed.contains(&entry.id));
         self.reload_pages();
         if affected_current {
             self.current = None;
@@ -649,6 +707,208 @@ impl App {
         if let Some(store) = self.store.as_ref() {
             self.pages = store.list_pages().unwrap_or_default();
         }
+        self.prune_collapsed();
+    }
+
+    /// Chamadas que mudam a arvore passam por aqui: ajusta `collapsed` ao
+    /// banco (ids sumidos) e persiste se algo mudou.
+    fn prune_collapsed(&mut self) {
+        let known: HashSet<PageId> = self.pages.iter().map(|page| page.id).collect();
+        let before = self.collapsed.len();
+        self.collapsed.retain(|id| known.contains(id));
+        if self.collapsed.len() != before {
+            self.persist_collapsed();
+        }
+    }
+
+    fn persist_collapsed(&mut self) {
+        let value = format_collapsed_pages(&self.collapsed);
+        if let Some(store) = self.store.as_mut() {
+            let _ = store.set_setting("collapsed_pages", &value);
+        }
+    }
+
+    fn toggle_collapsed(&mut self, id: PageId) {
+        if !self.collapsed.remove(&id) {
+            self.collapsed.insert(id);
+        }
+        self.persist_collapsed();
+    }
+
+    fn expand_page(&mut self, id: PageId) {
+        if self.collapsed.remove(&id) {
+            self.persist_collapsed();
+        }
+    }
+
+    /// Abre os ancestrais para o item movido aparecer na arvore.
+    fn reveal_page(&mut self, id: PageId) {
+        let ancestors: Vec<PageId> = self
+            .path_to(id)
+            .into_iter()
+            .filter(|ancestor| *ancestor != id)
+            .collect();
+        let mut changed = false;
+        for ancestor in ancestors {
+            changed |= self.collapsed.remove(&ancestor);
+        }
+        if changed {
+            self.persist_collapsed();
+        }
+    }
+
+    fn page_spot(&self, id: PageId) -> Option<PageSpot> {
+        let meta = self.meta_of(id)?;
+        let mut siblings: Vec<&PageMeta> = self
+            .pages
+            .iter()
+            .filter(|sibling| sibling.parent == meta.parent)
+            .collect();
+        // Mesma ordem de `Store::sibling_ids` (sort, id); `move_page` usa ela.
+        siblings.sort_by_key(|sibling| (sibling.sort, sibling.id));
+        let index = siblings.iter().position(|sibling| sibling.id == id)?;
+        Some(PageSpot {
+            parent: meta.parent,
+            sort: meta.sort.max(0) as u32,
+            index,
+        })
+    }
+
+    /// Indice de insercao que devolve `id` ao lugar antigo. As irmas restantes
+    /// mantem a ordem relativa, entao o indice gravado antes do movimento
+    /// continua valendo (com clamp para sorts burados por exclusoes).
+    fn index_for_spot(&self, id: PageId, spot: PageSpot) -> usize {
+        let siblings = self
+            .pages
+            .iter()
+            .filter(|meta| meta.parent == spot.parent && meta.id != id)
+            .count();
+        spot.index.min(siblings)
+    }
+
+    fn record_page_move(&mut self, id: PageId, before: PageSpot) {
+        let Some(after) = self.page_spot(id) else {
+            return;
+        };
+        if before == after {
+            return;
+        }
+        self.page_moves.undo.push(PageMove {
+            id,
+            from: before,
+            to: after,
+        });
+        if self.page_moves.undo.len() > PAGE_MOVE_HISTORY_LIMIT {
+            self.page_moves.undo.remove(0);
+        }
+        self.page_moves.redo.clear();
+    }
+
+    fn after_page_move(&mut self, id: PageId, before: Option<PageSpot>, remember: bool) {
+        self.reload_pages();
+        if remember {
+            if let Some(before) = before {
+                self.record_page_move(id, before);
+            }
+        }
+        if let Some(parent) = self.meta_of(id).and_then(|meta| meta.parent) {
+            self.expand_page(parent);
+        }
+        self.reveal_page(id);
+        self.sidebar_scroll_to = Some(id);
+    }
+
+    /// Move a pagina e registra o movimento no historico da sidebar.
+    pub(crate) fn apply_page_move(
+        &mut self,
+        id: PageId,
+        parent: Option<PageId>,
+        index: usize,
+    ) -> bool {
+        let before = self.page_spot(id);
+        let Some(store) = self.store.as_mut() else {
+            return false;
+        };
+        match store.move_page(id, parent, index) {
+            Ok(()) => {
+                self.after_page_move(id, before, true);
+                true
+            }
+            Err(err) => {
+                self.toast(format!("Não foi possível mover: {err}"));
+                false
+            }
+        }
+    }
+
+    /// Executa um gesto de navegacao do `Store` (Alt+setas) com o mesmo
+    /// bookkeeping de historico/expansao do arrasto.
+    pub(crate) fn apply_page_gesture(
+        &mut self,
+        id: PageId,
+        gesture: impl FnOnce(&mut Store) -> anyhow::Result<bool>,
+    ) -> bool {
+        let before = self.page_spot(id);
+        let Some(store) = self.store.as_mut() else {
+            return false;
+        };
+        match gesture(store) {
+            Ok(true) => {
+                self.after_page_move(id, before, true);
+                true
+            }
+            Ok(false) => false,
+            Err(err) => {
+                self.toast(format!("Não foi possível mover: {err}"));
+                false
+            }
+        }
+    }
+
+    /// Reposiciona sem criar entrada nova (usado por undo/redo).
+    fn restore_page_spot(&mut self, id: PageId, spot: PageSpot) -> bool {
+        let index = self.index_for_spot(id, spot);
+        let Some(store) = self.store.as_mut() else {
+            return false;
+        };
+        match store.move_page(id, spot.parent, index) {
+            Ok(()) => {
+                self.after_page_move(id, None, false);
+                true
+            }
+            Err(err) => {
+                self.toast(format!("Não foi possível mover: {err}"));
+                false
+            }
+        }
+    }
+
+    fn undo_page_move(&mut self) {
+        let Some(entry) = self.page_moves.undo.pop() else {
+            return;
+        };
+        if !self.restore_page_spot(entry.id, entry.from) {
+            return;
+        }
+        self.page_moves.redo.push(entry);
+        if self.page_moves.redo.len() > PAGE_MOVE_HISTORY_LIMIT {
+            self.page_moves.redo.remove(0);
+        }
+        self.toast("Movimento desfeito");
+    }
+
+    fn redo_page_move(&mut self) {
+        let Some(entry) = self.page_moves.redo.pop() else {
+            return;
+        };
+        if !self.restore_page_spot(entry.id, entry.to) {
+            return;
+        }
+        self.page_moves.undo.push(entry);
+        if self.page_moves.undo.len() > PAGE_MOVE_HISTORY_LIMIT {
+            self.page_moves.undo.remove(0);
+        }
+        self.toast("Movimento refeito");
     }
 
     pub fn save_now(&mut self) {
@@ -1186,17 +1446,8 @@ impl App {
             Action::NewPage { parent } => self.create_page(parent),
             Action::NewFolder { parent } => self.create_folder(parent),
             Action::MovePage { id, parent, index } => {
-                let result = self.store.as_mut().map(|s| s.move_page(id, parent, index));
-                match result {
-                    Some(Ok(())) => {
-                        self.reload_pages();
-                        if let Some(parent) = parent {
-                            self.collapsed.remove(&parent);
-                        }
-                        self.toast("Página movida");
-                    }
-                    Some(Err(err)) => self.toast(format!("Não foi possível mover: {err}")),
-                    None => {}
+                if self.apply_page_move(id, parent, index) {
+                    self.toast("Página movida");
                 }
             }
             Action::AskDelete(id) => {
@@ -1233,11 +1484,7 @@ impl App {
                 }
                 self.page_menu = None;
             }
-            Action::ToggleCollapsed(id) => {
-                if !self.collapsed.remove(&id) {
-                    self.collapsed.insert(id);
-                }
-            }
+            Action::ToggleCollapsed(id) => self.toggle_collapsed(id),
             Action::ToggleSidebar => self.sidebar_visible = !self.sidebar_visible,
             Action::ToggleTheme => self.set_theme(self.mode.toggled()),
             Action::SetTheme(mode) => self.set_theme(mode),
@@ -1488,6 +1735,29 @@ impl App {
         })
     }
 
+    /// Gestos da arvore (Alt+setas, Ctrl+Z/Ctrl+Shift+Z de movimento) vivem
+    /// na barra lateral. O criterio antigo (`self.focus == Focus::None`) nunca
+    /// valia no uso real: abrir uma pagina foca o titulo ou o bloco. Agora o
+    /// ponteiro sobre a sidebar basta; fora dela, so quando nenhum campo de
+    /// texto tem o teclado, para Alt+setas continuar sendo do editor.
+    pub(crate) fn sidebar_hotkeys_allowed(&self, ctx: &Context) -> bool {
+        if !self.sidebar_visible {
+            return false;
+        }
+        // O ponteiro manda: com ele sobre a arvore o usuario esta trabalhando
+        // na pagina, inclusive logo depois de clicar numa linha (o foco cai
+        // no titulo ou no primeiro bloco). Fora dela, so sem foco de texto.
+        let pointer_on_sidebar = self.sidebar_rect.is_some_and(|rect| {
+            ctx.pointer_hover_pos()
+                .is_some_and(|position| rect.contains(position))
+        });
+        if pointer_on_sidebar {
+            return true;
+        }
+        let text_focused = ctx.memory(|memory| memory.focused()).is_some();
+        !text_focused
+    }
+
     fn handle_keys(&mut self, ctx: &Context) {
         // Ctrl+Shift+V: pede o clipboard ao eframe e marca o proximo
         // `Event::Paste` para passar direto ao `TextEdit` focado, sem o
@@ -1582,6 +1852,20 @@ impl App {
             self.open_settings();
             return;
         }
+        if self.sidebar_hotkeys_allowed(ctx)
+            && !self.page_moves.redo.is_empty()
+            && self.consume(ctx, Key::Z, Modifiers::COMMAND | Modifiers::SHIFT)
+        {
+            self.redo_page_move();
+            return;
+        }
+        if self.sidebar_hotkeys_allowed(ctx)
+            && !self.page_moves.undo.is_empty()
+            && self.consume(ctx, Key::Z, Modifiers::COMMAND)
+        {
+            self.undo_page_move();
+            return;
+        }
         if self.consume(ctx, Key::Z, Modifiers::COMMAND | Modifiers::SHIFT) {
             self.redo();
             return;
@@ -1615,8 +1899,26 @@ impl App {
             return;
         }
 
+        if self.sidebar_hotkeys_allowed(ctx) && self.sidebar_keys(ctx) {
+            return;
+        }
         self.editor_keys(ctx);
     }
+}
+
+pub(crate) fn parse_collapsed_pages(value: Option<&str>) -> HashSet<PageId> {
+    value
+        .unwrap_or_default()
+        .split(',')
+        .filter_map(|part| part.trim().parse::<PageId>().ok())
+        .collect()
+}
+
+pub(crate) fn format_collapsed_pages(ids: &HashSet<PageId>) -> String {
+    let mut sorted: Vec<PageId> = ids.iter().copied().collect();
+    sorted.sort_unstable();
+    let parts: Vec<String> = sorted.iter().map(PageId::to_string).collect();
+    parts.join(",")
 }
 
 /// `settings.auto_update_check`: ausente liga; "0"/"false" desliga.
@@ -2047,7 +2349,7 @@ impl eframe::App for App {
         let p = self.palette;
 
         if self.sidebar_visible {
-            Panel::left("simion-sidebar")
+            let sidebar = Panel::left("simion-sidebar")
                 .resizable(true)
                 .default_size(252.0)
                 .min_size(196.0)
@@ -2062,6 +2364,9 @@ impl eframe::App for App {
                 .show(ui, |ui| {
                     self.sidebar(ui, &mut actions);
                 });
+            self.sidebar_rect = Some(sidebar.response.rect);
+        } else {
+            self.sidebar_rect = None;
         }
 
         self.draw_update_banner(ui, &mut actions);
@@ -2152,6 +2457,377 @@ fn slugify(title: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn collapsed_setting_round_trips_sorted() {
+        let parsed = parse_collapsed_pages(Some(" 12,3, abc,,7 "));
+        assert_eq!(parsed, HashSet::from([3, 7, 12]));
+        assert_eq!(format_collapsed_pages(&parsed), "3,7,12");
+        assert!(parse_collapsed_pages(None).is_empty());
+        assert!(parse_collapsed_pages(Some("")).is_empty());
+        assert_eq!(format_collapsed_pages(&HashSet::new()), "");
+    }
+
+    fn page_order(app: &App, parent: Option<PageId>) -> Vec<PageId> {
+        let mut pages: Vec<&PageMeta> = app
+            .pages
+            .iter()
+            .filter(|meta| meta.parent == parent)
+            .collect();
+        pages.sort_by_key(|meta| (meta.sort, meta.id));
+        pages.into_iter().map(|meta| meta.id).collect()
+    }
+
+    fn test_meta(id: PageId, parent: Option<PageId>, sort: i64) -> PageMeta {
+        PageMeta {
+            id,
+            parent,
+            title: format!("P{id}"),
+            icon: String::new(),
+            favorite: false,
+            sort,
+            updated_at: 0,
+        }
+    }
+
+    /// App com raiz `A B C` e sem as paginas de exemplo do Store.
+    fn seeded_root_app(label: &str) -> (App, PathBuf, PageId, PageId, PageId) {
+        let mut path = std::env::temp_dir();
+        path.push(format!(
+            "simion-app-{label}-{}-{}.db",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let mut store = Store::open(&path).unwrap();
+        for page in store.list_pages().unwrap() {
+            store.delete_page(page.id).unwrap();
+        }
+        let now = unix_now();
+        let a = store.create_page(None, "A", "", now).unwrap();
+        let b = store.create_page(None, "B", "", now).unwrap();
+        let c = store.create_page(None, "C", "", now).unwrap();
+
+        let mut app = App::blank();
+        app.store = Some(store);
+        app.reload_pages();
+        app.current = Some(b.id);
+        (app, path, a.id, b.id, c.id)
+    }
+
+    /// Roda `handle_keys` com um ponteiro e uma tecla, mantendo um TextEdit
+    /// (o titulo aberto) com o teclado, como no uso real.
+    fn press_with_focus(
+        app: &mut App,
+        pointer: Pos2,
+        focus: egui::Id,
+        key: Key,
+        modifiers: Modifiers,
+    ) {
+        let ctx = Context::default();
+        ctx.memory_mut(|memory| memory.request_focus(focus));
+        let input = egui::RawInput {
+            screen_rect: Some(Rect::from_min_size(Pos2::ZERO, egui::vec2(900.0, 700.0))),
+            events: vec![
+                egui::Event::PointerMoved(pointer),
+                egui::Event::Key {
+                    key,
+                    physical_key: None,
+                    pressed: true,
+                    repeat: false,
+                    modifiers,
+                },
+            ],
+            ..Default::default()
+        };
+        let mut output = ctx.run_ui(input, |ui| app.handle_keys(ui.ctx()));
+        output.textures_delta.clear();
+    }
+
+    fn title_focus_id(app: &App) -> egui::Id {
+        egui::Id::unique(("simion-title", app.current.unwrap()))
+    }
+
+    /// Um frame completo do app, com sidebar e editor de verdade. Usado para
+    /// conferir o caminho real (rect da sidebar + foco do titulo).
+    fn real_ui_frame(ctx: &Context, app: &mut App, events: Vec<egui::Event>) {
+        let input = egui::RawInput {
+            screen_rect: Some(Rect::from_min_size(Pos2::ZERO, egui::vec2(900.0, 700.0))),
+            events,
+            ..Default::default()
+        };
+        let mut frame = eframe::Frame::_new_kittest();
+        let mut output = ctx.run_ui(input, |ui| {
+            <App as eframe::App>::ui(app, ui, &mut frame);
+        });
+        output.textures_delta.clear();
+    }
+
+    #[test]
+    fn sidebar_alt_down_works_with_open_title_focused() {
+        let (mut app, path, a, b, c) = seeded_root_app("sidebar-title-focus");
+        let ctx = Context::default();
+        crate::theme::install_fonts(&ctx);
+        // Abrir a pagina atual pede foco no titulo, como o clique na linha faz.
+        app.open_page(b);
+        real_ui_frame(&ctx, &mut app, Vec::new());
+        real_ui_frame(&ctx, &mut app, Vec::new());
+        assert_eq!(app.focus, Focus::Title);
+        assert!(ctx.memory(|memory| memory.focused()).is_some());
+        let sidebar = app.sidebar_rect.expect("sidebar renderizada");
+        assert!(sidebar.contains(Pos2::new(120.0, 120.0)));
+
+        real_ui_frame(
+            &ctx,
+            &mut app,
+            vec![
+                egui::Event::PointerMoved(Pos2::new(120.0, 120.0)),
+                egui::Event::Key {
+                    key: Key::ArrowDown,
+                    physical_key: None,
+                    pressed: true,
+                    repeat: false,
+                    modifiers: Modifiers::ALT,
+                },
+            ],
+        );
+
+        assert_eq!(page_order(&app, None), vec![a, c, b]);
+        drop(app);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn sidebar_alt_shift_moves_with_open_title_focused() {
+        let (mut app, path, a, b, c) = seeded_root_app("sidebar-indent");
+        let ctx = Context::default();
+        crate::theme::install_fonts(&ctx);
+        app.open_page(b);
+        real_ui_frame(&ctx, &mut app, Vec::new());
+        real_ui_frame(&ctx, &mut app, Vec::new());
+        assert_eq!(app.focus, Focus::Title);
+        let pointer = Pos2::new(120.0, 120.0);
+
+        real_ui_frame(
+            &ctx,
+            &mut app,
+            vec![
+                egui::Event::PointerMoved(pointer),
+                egui::Event::Key {
+                    key: Key::ArrowUp,
+                    physical_key: None,
+                    pressed: true,
+                    repeat: false,
+                    modifiers: Modifiers::ALT | Modifiers::SHIFT,
+                },
+            ],
+        );
+        // B vira a ultima filha do irmao anterior (A).
+        assert_eq!(page_order(&app, Some(a)), vec![b]);
+        assert_eq!(page_order(&app, None), vec![a, c]);
+
+        real_ui_frame(
+            &ctx,
+            &mut app,
+            vec![
+                egui::Event::PointerMoved(pointer),
+                egui::Event::Key {
+                    key: Key::ArrowDown,
+                    physical_key: None,
+                    pressed: true,
+                    repeat: false,
+                    modifiers: Modifiers::ALT | Modifiers::SHIFT,
+                },
+            ],
+        );
+        // Alt+Shift+↓ desfaz: B volta para a raiz, logo depois de A.
+        assert_eq!(page_order(&app, Some(a)), Vec::<PageId>::new());
+        assert_eq!(page_order(&app, None), vec![a, b, c]);
+
+        drop(app);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn sidebar_page_move_undo_redo_work_with_title_focused() {
+        let (mut app, path, a, b, c) = seeded_root_app("sidebar-undo");
+        let ctx = Context::default();
+        crate::theme::install_fonts(&ctx);
+        app.open_page(b);
+        real_ui_frame(&ctx, &mut app, Vec::new());
+        real_ui_frame(&ctx, &mut app, Vec::new());
+        assert_eq!(app.focus, Focus::Title);
+        let pointer = Pos2::new(120.0, 120.0);
+
+        for (key, modifiers) in [
+            (Key::ArrowDown, Modifiers::ALT),
+            (Key::Z, Modifiers::COMMAND),
+            (Key::Z, Modifiers::COMMAND | Modifiers::SHIFT),
+        ] {
+            real_ui_frame(
+                &ctx,
+                &mut app,
+                vec![
+                    egui::Event::PointerMoved(pointer),
+                    egui::Event::Key {
+                        key,
+                        physical_key: None,
+                        pressed: true,
+                        repeat: false,
+                        modifiers,
+                    },
+                ],
+            );
+            let expected = match (key, modifiers) {
+                (Key::ArrowDown, _) => vec![a, c, b],
+                (Key::Z, Modifiers::COMMAND) => vec![a, b, c],
+                _ => vec![a, c, b],
+            };
+            assert_eq!(page_order(&app, None), expected);
+        }
+
+        drop(app);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn sidebar_gestures_do_not_steal_alt_from_focused_editor() {
+        let (mut app, path, a, b, c) = seeded_root_app("sidebar-editor-focus");
+        let sidebar = Rect::from_min_size(Pos2::ZERO, egui::vec2(252.0, 700.0));
+        app.sidebar_rect = Some(sidebar);
+        app.focus = Focus::Title;
+        let focus = title_focus_id(&app);
+
+        // Ponteiro no editor e um TextEdit com o teclado: o gesto e do editor.
+        press_with_focus(
+            &mut app,
+            Pos2::new(600.0, 300.0),
+            focus,
+            Key::ArrowDown,
+            Modifiers::ALT,
+        );
+        assert_eq!(page_order(&app, None), vec![a, b, c]);
+
+        // Ponteiro sobre a sidebar vence o foco do bloco: o usuario clicou na
+        // arvore e Alt+setas move a pagina.
+        let allowed_over_sidebar =
+            sidebar_hotkeys_with_block_focus(&mut app, Pos2::new(120.0, 120.0));
+        assert!(allowed_over_sidebar);
+
+        // Fora da sidebar o bloco com o caret mantem Alt+setas para si.
+        let allowed_outside = sidebar_hotkeys_with_block_focus(&mut app, Pos2::new(600.0, 300.0));
+        assert!(!allowed_outside);
+
+        drop(app);
+        let _ = std::fs::remove_file(path);
+    }
+
+    /// Foco num bloco (caret no editor) e ponteiro em `pointer`; devolve o gate
+    /// dos gestos da arvore.
+    fn sidebar_hotkeys_with_block_focus(app: &mut App, pointer: Pos2) -> bool {
+        let ctx = Context::default();
+        ctx.memory_mut(|memory| memory.request_focus(egui::Id::unique(("simion-block", 7u64))));
+        app.focus = Focus::Block(7);
+        let input = egui::RawInput {
+            screen_rect: Some(Rect::from_min_size(Pos2::ZERO, egui::vec2(900.0, 700.0))),
+            events: vec![egui::Event::PointerMoved(pointer)],
+            ..Default::default()
+        };
+        let mut allowed = true;
+        let mut output = ctx.run_ui(input, |ui| {
+            allowed = app.sidebar_hotkeys_allowed(ui.ctx());
+        });
+        output.textures_delta.clear();
+        allowed
+    }
+
+    #[test]
+    fn undo_index_uses_saved_position_not_raw_sort() {
+        let mut app = App::blank();
+        // Depois de mover C para cima: A(0), C(1), B(2).
+        app.pages = vec![
+            test_meta(1, None, 0),
+            test_meta(3, None, 1),
+            test_meta(2, None, 2),
+        ];
+        // C estava na posicao 2 antes do movimento.
+        assert_eq!(
+            app.index_for_spot(
+                3,
+                PageSpot {
+                    parent: None,
+                    sort: 2,
+                    index: 2,
+                }
+            ),
+            2
+        );
+        assert_eq!(
+            app.index_for_spot(
+                3,
+                PageSpot {
+                    parent: None,
+                    sort: 0,
+                    index: 0,
+                }
+            ),
+            0
+        );
+        // Indice obsoleto (pagina removida) e limitado ao fim da lista.
+        assert_eq!(
+            app.index_for_spot(
+                3,
+                PageSpot {
+                    parent: None,
+                    sort: 99,
+                    index: 99,
+                }
+            ),
+            2
+        );
+    }
+
+    #[test]
+    fn undo_restores_moves_when_initial_sorts_are_not_zero_based() {
+        let mut path = std::env::temp_dir();
+        path.push(format!(
+            "simion-app-undo-{}-{}.db",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let mut store = Store::open(&path).unwrap();
+        for page in store.list_pages().unwrap() {
+            store.delete_page(page.id).unwrap();
+        }
+        let now = unix_now();
+        let pai = store.create_page(None, "Pai", "", now).unwrap();
+        let a = store.create_page(Some(pai.id), "A", "", now).unwrap();
+        let b = store.create_page(Some(pai.id), "B", "", now).unwrap();
+        let c = store.create_page(Some(pai.id), "C", "", now).unwrap();
+        // `create_page` usa MAX(sort)+1: as filhas nascem 1,2,3.
+        assert_eq!((a.sort, b.sort, c.sort), (1, 2, 3));
+
+        let mut app = App::blank();
+        app.store = Some(store);
+        app.reload_pages();
+        app.current = Some(b.id);
+        assert!(app.apply_page_gesture(b.id, |store| store.move_page_up(b.id)));
+        assert_eq!(page_order(&app, Some(pai.id)), vec![b.id, a.id, c.id]);
+
+        app.undo_page_move();
+        assert_eq!(page_order(&app, Some(pai.id)), vec![a.id, b.id, c.id]);
+
+        app.redo_page_move();
+        assert_eq!(page_order(&app, Some(pai.id)), vec![b.id, a.id, c.id]);
+
+        drop(app);
+        let _ = std::fs::remove_file(path);
+    }
 
     #[test]
     fn auto_update_parsing() {

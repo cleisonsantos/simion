@@ -3,8 +3,9 @@
 use std::collections::{HashMap, HashSet};
 
 use eframe::egui::{
-    self, Align, Color32, CursorIcon, FontFamily, FontId, Layout, Order, Painter, Pos2, Rect,
-    Response, RichText, ScrollArea, Sense, Stroke, StrokeKind, Ui, Vec2, pos2, vec2,
+    self, Align, Color32, Context, CursorIcon, FontFamily, FontId, Key, Layout, Modifiers, Order,
+    Painter, Pos2, Rect, Response, RichText, ScrollArea, Sense, Stroke, StrokeKind, Ui, Vec2, pos2,
+    vec2,
 };
 
 use crate::app::{Action, App};
@@ -48,6 +49,7 @@ impl App {
 
         let mut rows = Vec::new();
         let mut drag_started = None;
+        let scroll_target = self.sidebar_scroll_to;
 
         ui.take_available_width();
         ui.set_min_width(ui.available_width());
@@ -192,9 +194,18 @@ impl App {
                     actions,
                     &mut budget,
                 );
+                if let Some(target) = scroll_target {
+                    if let Some(row) = rows.iter().find(|row| row.id == target) {
+                        ui.scroll_to_rect(row.rect, Some(Align::Center));
+                    }
+                }
                 ui.add_space(4.0);
             });
         let list_rect = scroll.inner_rect;
+
+        if scroll_target.is_some() {
+            self.sidebar_scroll_to = None;
+        }
 
         if let Some(id) = drag_started {
             self.drag_page = Some(id);
@@ -335,6 +346,34 @@ impl App {
                 actions.push(Action::ToggleTheme);
             }
         });
+    }
+
+    /// Gestos de pagina da arvore. O gate fica em
+    /// [`App::sidebar_hotkeys_allowed`]: ponteiro sobre a sidebar ou nenhum
+    /// campo de texto com o teclado (blocos com caret sempre vencem). Consome
+    /// a tecla mesmo quando o gesto e no-op (borda da arvore), para o evento
+    /// nao vazar para o editor.
+    pub fn sidebar_keys(&mut self, ctx: &Context) -> bool {
+        let Some(id) = self.current else {
+            return false;
+        };
+        if self.consume_key(ctx, Key::ArrowUp, Modifiers::ALT | Modifiers::SHIFT) {
+            self.apply_page_gesture(id, |store| store.indent_page(id));
+            return true;
+        }
+        if self.consume_key(ctx, Key::ArrowDown, Modifiers::ALT | Modifiers::SHIFT) {
+            self.apply_page_gesture(id, |store| store.outdent_page(id));
+            return true;
+        }
+        if self.consume_key(ctx, Key::ArrowUp, Modifiers::ALT) {
+            self.apply_page_gesture(id, |store| store.move_page_up(id));
+            return true;
+        }
+        if self.consume_key(ctx, Key::ArrowDown, Modifiers::ALT) {
+            self.apply_page_gesture(id, |store| store.move_page_down(id));
+            return true;
+        }
+        false
     }
 }
 
