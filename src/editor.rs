@@ -2568,13 +2568,15 @@ impl App {
                     let anchor = self
                         .text_span
                         .map(|s| s.anchor)
+                        // The previous press owns the anchor; native widget
+                        // state may contain a different (or stale) range.
+                        .or(self.text_anchor)
                         .or_else(|| match self.focus {
                             Focus::Block(id) => self
                                 .index_of(id)
                                 .zip(self.cursor_range_for(ctx, id).map(|r| r.1)),
                             _ => None,
                         })
-                        .or(self.text_anchor)
                         .unwrap_or(point);
                     self.activate_span(
                         ctx,
@@ -3929,6 +3931,75 @@ mod tests {
         h.key(Key::Escape, Modifiers::NONE);
         h.type_text("Z");
         assert_eq!(h.app.page.blocks[0].text.chars().nth(20), Some('Z'));
+    }
+
+    #[test]
+    fn shift_click_uses_press_anchor_before_native_cursor() {
+        for (anchor, head, expected) in [
+            ((0, 3), (0, 15), vec!["alpQ", "delta two charlie"]),
+            ((0, 5), (0, 0), vec!["Q one bravo", "delta two charlie"]),
+            ((0, 6), (1, 10), vec!["alpha Qcharlie"]),
+            ((1, 10), (0, 6), vec!["alpha Qcharlie"]),
+        ] {
+            let mut h = Harness::new(
+                "",
+                &[
+                    (BlockKind::Paragraph, "alpha one bravo"),
+                    (BlockKind::Paragraph, "delta two charlie"),
+                ],
+            );
+            h.click_in(anchor.0, anchor.1);
+            assert_eq!(h.app.text_anchor, Some(anchor));
+            // A native range is widget state, not the previous press point.
+            // Even a cached zero range must not override the document anchor.
+            let id = h.id(anchor.0);
+            h.app.clear_block_text_selection(&h.ctx, id);
+            let (g, origin) = &h.app.block_galleys[&h.id(head.0)];
+            let pos = *origin + g.pos_from_cursor(CCursor::new(head.1)).center().to_vec2();
+            for pressed in [true, false] {
+                h.frame(vec![
+                    Event::PointerMoved(pos),
+                    Event::PointerButton {
+                        pos,
+                        button: egui::PointerButton::Primary,
+                        pressed,
+                        modifiers: Modifiers::SHIFT,
+                    },
+                ]);
+            }
+            assert_eq!(h.app.text_span, Some(TextSpan { anchor, head }));
+            h.type_text("Q");
+            assert_eq!(h.texts(), expected);
+        }
+    }
+
+    #[test]
+    fn shift_click_without_anchor_or_focus_starts_at_clicked_point() {
+        let mut h = Harness::new("", &[(BlockKind::Paragraph, "alpha one bravo")]);
+        assert_eq!(h.app.focus, Focus::None);
+        assert_eq!(h.app.text_anchor, None);
+        let (g, origin) = &h.app.block_galleys[&h.id(0)];
+        let pos = *origin + g.pos_from_cursor(CCursor::new(6)).center().to_vec2();
+        for pressed in [true, false] {
+            h.frame(vec![
+                Event::PointerMoved(pos),
+                Event::PointerButton {
+                    pos,
+                    button: egui::PointerButton::Primary,
+                    pressed,
+                    modifiers: Modifiers::SHIFT,
+                },
+            ]);
+        }
+        assert_eq!(
+            h.app.text_span,
+            Some(TextSpan {
+                anchor: (0, 6),
+                head: (0, 6),
+            })
+        );
+        h.type_text("Q");
+        assert_eq!(h.texts(), vec!["alpha Qone bravo"]);
     }
 
     #[test]
