@@ -36,6 +36,16 @@ CREATE TABLE IF NOT EXISTS blocks (
     PRIMARY KEY (page_id, ord)
 );
 
+CREATE TABLE IF NOT EXISTS assets (
+    id          INTEGER PRIMARY KEY,
+    page_id     INTEGER NOT NULL REFERENCES pages(id) ON DELETE CASCADE,
+    mime        TEXT NOT NULL,
+    bytes       BLOB NOT NULL,
+    width       INTEGER NOT NULL,
+    height      INTEGER NOT NULL,
+    created_at  INTEGER NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS settings (
     key     TEXT PRIMARY KEY,
     value   TEXT NOT NULL
@@ -53,6 +63,14 @@ pub struct SearchHit {
     pub title: String,
     pub icon: String,
     pub snippet: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Asset {
+    pub mime: String,
+    pub bytes: Vec<u8>,
+    pub width: u32,
+    pub height: u32,
 }
 
 const WELCOME_MD: &str = r#"Um caderno de blocos **local**, rápido e privado. Sem conta, sem nuvem e sem assinatura.
@@ -527,7 +545,7 @@ impl Store {
             let mut stmt = self.conn.prepare(
                 "SELECT p.id, p.title, p.icon, b.text
                  FROM blocks b JOIN pages p ON p.id = b.page_id
-                 WHERE instr(fold(b.text), ?1) > 0
+                 WHERE b.kind != 'image' AND instr(fold(b.text), ?1) > 0
                  ORDER BY p.updated_at DESC LIMIT ?2",
             )?;
             let rows = stmt.query_map(params![folded_query, limit * 4], |row| {
@@ -586,6 +604,76 @@ impl Store {
         self.conn
             .query_row("SELECT COUNT(*) FROM blocks", [], |row| row.get(0))
             .map_err(Into::into)
+    }
+
+    pub fn insert_asset(
+        &self,
+        page_id: PageId,
+        mime: &str,
+        bytes: &[u8],
+        width: u32,
+        height: u32,
+    ) -> Result<u64> {
+        self.conn.execute(
+            "INSERT INTO assets (page_id, mime, bytes, width, height, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![
+                page_id,
+                mime,
+                bytes,
+                width as i64,
+                height as i64,
+                unix_now()
+            ],
+        )?;
+        Ok(self.conn.last_insert_rowid() as u64)
+    }
+
+    pub fn asset(&self, id: u64) -> Result<Option<Asset>> {
+        self.conn
+            .query_row(
+                "SELECT mime, bytes, width, height FROM assets WHERE id = ?1",
+                params![id as i64],
+                |row| {
+                    Ok(Asset {
+                        mime: row.get(0)?,
+                        bytes: row.get(1)?,
+                        width: row.get::<_, i64>(2)?.clamp(0, u32::MAX as i64) as u32,
+                        height: row.get::<_, i64>(3)?.clamp(0, u32::MAX as i64) as u32,
+                    })
+                },
+            )
+            .optional()
+            .map_err(Into::into)
+    }
+
+    /// Copies an asset to another page (used when duplicating a page, so the
+    /// copy keeps its images after the original is deleted). `None` when the
+    /// source asset does not exist.
+    pub fn copy_asset(&self, id: u64, to_page: PageId) -> Result<Option<u64>> {
+        let copied = self.conn.execute(
+            "INSERT INTO assets (page_id, mime, bytes, width, height, created_at)
+             SELECT ?1, mime, bytes, width, height, ?2 FROM assets WHERE id = ?3",
+            params![to_page, unix_now(), id as i64],
+        )?;
+        Ok((copied == 1).then(|| self.conn.last_insert_rowid() as u64))
+    }
+
+    pub fn page_asset_sizes(&self, page_id: PageId) -> Result<Vec<(u64, u32, u32)>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT id, width, height FROM assets WHERE page_id = ?1 ORDER BY id ASC")?;
+        let rows = stmt.query_map(params![page_id], |row| {
+            let id = row.get::<_, i64>(0)?.max(0) as u64;
+            let width = row.get::<_, i64>(1)?.clamp(0, u32::MAX as i64) as u32;
+            let height = row.get::<_, i64>(2)?.clamp(0, u32::MAX as i64) as u32;
+            Ok((id, width, height))
+        })?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row?);
+        }
+        Ok(out)
     }
 }
 
@@ -1130,6 +1218,114 @@ mod tests {
         assert_eq!(child_ids(&store, Some(pai.id)), vec![c.id, b.id, d.id]);
         assert_eq!(child_sorts(&store, Some(pai.id)), vec![0, 1, 2]);
         assert_eq!(child_ids(&store, None).last().copied(), Some(e.id));
+        drop(store);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn inserts_and_reads_assets() {
+        let (mut store, path) = blank_store();
+        let now = unix_now();
+        let meta = store.create_page(None, "Com imagem", "", now).unwrap();
+        let bytes = vec![0x89, b'P', b'N', b'G', 1, 2, 3, 4];
+        let asset_id = store
+            .insert_asset(meta.id, "image/png", &bytes, 640, 480)
+            .unwrap();
+
+        let asset = store.asset(asset_id).unwrap().unwrap();
+        assert_eq!(asset.mime, "image/png");
+        assert_eq!(asset.bytes, bytes);
+        assert_eq!((asset.width, asset.height), (640, 480));
+        assert_eq!(
+            store.page_asset_sizes(meta.id).unwrap(),
+            vec![(asset_id, 640, 480)]
+        );
+
+        let page = Page {
+            meta,
+            blocks: vec![Block::with_text(1, BlockKind::Image, asset_id.to_string())],
+        };
+        store.save_page(&page).unwrap();
+        assert!(store.search(&asset_id.to_string(), 10).unwrap().is_empty());
+
+        drop(store);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn copied_asset_survives_deleting_the_source_page() {
+        let (mut store, path) = blank_store();
+        let now = unix_now();
+        let source = store.create_page(None, "Origem", "", now).unwrap();
+        let copy = store.create_page(None, "Cópia", "", now).unwrap();
+        let original = store
+            .insert_asset(source.id, "image/png", &[7, 8, 9], 3, 1)
+            .unwrap();
+
+        let copied = store.copy_asset(original, copy.id).unwrap().unwrap();
+        assert_ne!(copied, original);
+        assert_eq!(store.copy_asset(999_999, copy.id).unwrap(), None);
+
+        store.delete_page(source.id).unwrap();
+        assert!(store.asset(original).unwrap().is_none());
+        let asset = store.asset(copied).unwrap().unwrap();
+        assert_eq!(asset.bytes, vec![7, 8, 9]);
+        assert_eq!((asset.width, asset.height), (3, 1));
+
+        drop(store);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn page_asset_sizes_only_lists_the_requested_page() {
+        let (mut store, path) = blank_store();
+        let now = unix_now();
+        let first = store.create_page(None, "Primeira", "", now).unwrap();
+        let second = store.create_page(None, "Segunda", "", now).unwrap();
+        let first_asset = store
+            .insert_asset(first.id, "image/png", &[1, 2, 3], 10, 20)
+            .unwrap();
+        let second_asset = store
+            .insert_asset(second.id, "image/png", &[4, 5, 6], 30, 40)
+            .unwrap();
+
+        assert_eq!(
+            store.page_asset_sizes(first.id).unwrap(),
+            vec![(first_asset, 10, 20)]
+        );
+        assert_eq!(
+            store.page_asset_sizes(second.id).unwrap(),
+            vec![(second_asset, 30, 40)]
+        );
+
+        drop(store);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn deleting_a_page_cascades_to_its_assets_only() {
+        let (mut store, path) = blank_store();
+        let now = unix_now();
+        let gone = store.create_page(None, "Some", "", now).unwrap();
+        let kept = store.create_page(None, "Fica", "", now).unwrap();
+        let gone_asset = store
+            .insert_asset(gone.id, "image/png", &[1, 2, 3], 1, 2)
+            .unwrap();
+        let kept_asset = store
+            .insert_asset(kept.id, "image/png", &[4, 5, 6], 3, 4)
+            .unwrap();
+
+        store.delete_page(gone.id).unwrap();
+
+        assert!(store.asset(gone_asset).unwrap().is_none());
+        assert!(store.page_asset_sizes(gone.id).unwrap().is_empty());
+        let asset = store.asset(kept_asset).unwrap().unwrap();
+        assert_eq!(asset.bytes, vec![4, 5, 6]);
+        assert_eq!(
+            store.page_asset_sizes(kept.id).unwrap(),
+            vec![(kept_asset, 3, 4)]
+        );
+
         drop(store);
         let _ = std::fs::remove_file(path);
     }

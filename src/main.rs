@@ -4,6 +4,7 @@ mod app;
 mod editor;
 mod icon;
 mod icons;
+mod images;
 mod markdown;
 mod model;
 mod overlays;

@@ -11,6 +11,7 @@ use eframe::egui::{
     ProgressBar, Rect, RichText, Ui, ViewportCommand,
 };
 
+use crate::images;
 use crate::markdown;
 use crate::model::{Block, BlockKind, IdGen, Page, PageId, PageMeta};
 use crate::search::SearchState;
@@ -140,6 +141,12 @@ pub struct App {
     pub cursors: HashMap<u64, (usize, usize)>,
     pub block_rows: HashMap<u64, usize>,
     pub block_heights: HashMap<u64, f32>,
+    /// Dimensions of the assets owned by the current page.
+    pub asset_sizes: HashMap<u64, (u32, u32)>,
+    /// Image textures decoded lazily on the first frame they are visible.
+    pub textures: HashMap<u64, egui::TextureHandle>,
+    /// Assets that failed to load/decode; retried only after reopening the page.
+    pub broken_assets: HashSet<u64>,
     pub block_rects: HashMap<u64, Rect>,
     /// Last laid-out text of each visible block and where it was drawn
     /// (screen space), for ↑/↓ by visual row.
@@ -337,6 +344,9 @@ impl App {
             cursors: HashMap::new(),
             block_rows: HashMap::new(),
             block_heights: HashMap::new(),
+            asset_sizes: HashMap::new(),
+            textures: HashMap::new(),
+            broken_assets: HashSet::new(),
             block_rects: HashMap::new(),
             block_galleys: HashMap::new(),
             title_galley: None,
@@ -553,6 +563,11 @@ impl App {
             self.reload_pages();
             return;
         };
+        let assets = self
+            .store
+            .as_ref()
+            .and_then(|store| store.page_asset_sizes(id).ok())
+            .unwrap_or_default();
 
         for block in &mut page.blocks {
             block.id = self.ids.next();
@@ -565,6 +580,12 @@ impl App {
 
         self.current = Some(id);
         self.page = page;
+        self.asset_sizes = assets
+            .into_iter()
+            .map(|(asset_id, width, height)| (asset_id, (width, height)))
+            .collect();
+        self.textures.clear();
+        self.broken_assets.clear();
         self.history = History::new(&self.page, self.now);
         self.block_heights.clear();
         self.block_rows.clear();
@@ -668,6 +689,14 @@ impl App {
                     let mut blocks = blocks;
                     for block in &mut blocks {
                         block.id = self.ids.next();
+                        // Assets belong to a page (ON DELETE CASCADE): give the
+                        // copy its own, or deleting the original breaks it.
+                        if block.kind == BlockKind::Image
+                            && let Ok(asset_id) = block.text.parse::<u64>()
+                            && let Ok(Some(copy)) = store.copy_asset(asset_id, new_meta.id)
+                        {
+                            block.text = copy.to_string();
+                        }
                     }
                     if blocks.is_empty() {
                         blocks.push(Block::new(self.ids.next(), BlockKind::Paragraph));
@@ -1709,7 +1738,12 @@ impl App {
                 self.popup_guard = self.now + 0.2;
             }
             Action::Transform(id, kind) => {
-                if let Some(index) = self.index_of(id) {
+                // An image block keeps its asset id in `text`; transforming it
+                // would leave that id as visible text.
+                if let Some(index) = self
+                    .index_of(id)
+                    .filter(|&index| self.page.blocks[index].kind != BlockKind::Image)
+                {
                     self.begin_change();
                     let block = &mut self.page.blocks[index];
                     block.kind = kind;
@@ -2122,6 +2156,47 @@ pub(crate) fn should_parse_paste(text: &str) -> bool {
     text.contains('\n') || crate::markdown::looks_like_markdown(text)
 }
 
+/// Inserts an image block at `index` (replacing an empty paragraph) and finds
+/// the block that should receive the caret right after it.
+///
+/// Returns `(image_index, focus_block_id)`. A paragraph is appended when the
+/// image ends the page so the user can keep typing without touching the mouse.
+fn insert_image_block(
+    blocks: &mut Vec<Block>,
+    index: usize,
+    asset_id: u64,
+    ids: &mut IdGen,
+) -> (usize, u64) {
+    let replace = blocks
+        .get(index)
+        .is_some_and(|block| block.kind == BlockKind::Paragraph && block.text.trim().is_empty());
+    let image_index = if replace {
+        index
+    } else {
+        (index + 1).min(blocks.len())
+    };
+
+    let mut image = Block::new(ids.next(), BlockKind::Image);
+    image.text = asset_id.to_string();
+    if replace {
+        blocks[image_index] = image;
+    } else {
+        blocks.insert(image_index, image);
+    }
+
+    let focus = if blocks
+        .get(image_index + 1)
+        .is_some_and(|block| block.kind.accepts_text())
+    {
+        blocks[image_index + 1].id
+    } else {
+        let id = ids.next();
+        blocks.insert(image_index + 1, Block::new(id, BlockKind::Paragraph));
+        id
+    };
+    (image_index, focus)
+}
+
 impl App {
     pub(crate) fn handle_paste(&mut self, ctx: &Context) {
         if self.plain_paste_pending {
@@ -2153,6 +2228,27 @@ impl App {
             || self.slash.is_some()
             || self.confirm_delete.is_some();
         if overlays_open {
+            return;
+        }
+        // egui-winit turns Ctrl+V into `PasteImage` when the clipboard holds an
+        // image and no usable text. Remove the event every frame so no widget
+        // consumes it, and only turn it into a block for a focused block.
+        let mut pasted_image: Option<Arc<egui::ColorImage>> = None;
+        ctx.input_mut(|input| {
+            input.events.retain(|event| {
+                if let egui::Event::PasteImage(image) = event {
+                    pasted_image = Some(image.clone());
+                    false
+                } else {
+                    true
+                }
+            })
+        });
+        if let Some(image) = pasted_image
+            && self.block_selection_range().is_none()
+            && let Focus::Block(block_id) = self.focus
+        {
+            self.paste_image(&image, block_id);
             return;
         }
         if self.block_selection_range().is_some() {
@@ -2267,6 +2363,65 @@ impl App {
         });
         self.scroll_to = Some(last_id);
         self.toast("Markdown colado");
+    }
+
+    fn paste_image(&mut self, image: &egui::ColorImage, block_id: u64) {
+        let Some(index) = self.index_of(block_id) else {
+            return;
+        };
+        let (png, width, height) = match images::color_image_to_png(image) {
+            Ok(encoded) => encoded,
+            Err(_) => {
+                self.toast("Não foi possível colar a imagem");
+                return;
+            }
+        };
+        if let Err(err) = images::check_size(png.len()) {
+            self.toast(err);
+            return;
+        }
+        let Some(page_id) = self.current else {
+            self.toast("Não foi possível colar a imagem");
+            return;
+        };
+        // The assets foreign key needs a persisted page. Pages are saved when
+        // they are opened or created, but keep the guard for blank states.
+        let page_exists = self
+            .store
+            .as_ref()
+            .and_then(|store| store.page_meta(page_id).ok().flatten())
+            .is_some();
+        if !page_exists {
+            self.toast("Não foi possível colar a imagem");
+            return;
+        }
+
+        self.begin_change();
+        let asset = {
+            let Some(store) = self.store.as_ref() else {
+                return;
+            };
+            store.insert_asset(page_id, "image/png", &png, width, height)
+        };
+        let asset_id = match asset {
+            Ok(id) => id,
+            Err(err) => {
+                // The page was not touched yet, so history stays consistent.
+                self.toast(format!("Erro ao salvar imagem: {err}"));
+                return;
+            }
+        };
+        self.asset_sizes.insert(asset_id, (width, height));
+        let (_, focus_id) =
+            insert_image_block(&mut self.page.blocks, index, asset_id, &mut self.ids);
+        self.end_change();
+        self.focus = Focus::Block(focus_id);
+        self.pending = Some(PendingFocus {
+            target: Focus::Block(focus_id),
+            range: Some((0, 0)),
+            select_all: false,
+        });
+        self.scroll_to = Some(focus_id);
     }
 
     fn handle_files(&mut self, ctx: &Context) {
@@ -3008,5 +3163,75 @@ mod tests {
         assert_eq!(truncate_middle("abc", 10), "abc");
         assert_eq!(truncate_middle("abcdefghij", 5), "ab…ij");
         assert_eq!(truncate_middle("/home/ção/simion.db", 9).chars().count(), 9);
+    }
+
+    #[test]
+    fn image_replaces_an_empty_paragraph() {
+        let mut blocks = vec![Block::with_text(1, BlockKind::Paragraph, "")];
+        let mut ids = IdGen::default();
+        ids.observe(1);
+
+        let (index, focus) = insert_image_block(&mut blocks, 0, 9, &mut ids);
+
+        assert_eq!(index, 0);
+        assert_eq!(
+            blocks.iter().map(|block| block.kind).collect::<Vec<_>>(),
+            vec![BlockKind::Image, BlockKind::Paragraph]
+        );
+        assert_eq!(blocks[0].text, "9");
+        assert_eq!(blocks[0].lang, "");
+        assert_eq!(focus, blocks[1].id);
+    }
+
+    #[test]
+    fn image_after_text_inserts_and_creates_a_paragraph_at_the_end() {
+        let mut blocks = vec![Block::with_text(1, BlockKind::Paragraph, "texto")];
+        let mut ids = IdGen::default();
+        ids.observe(1);
+
+        let (index, focus) = insert_image_block(&mut blocks, 0, 12, &mut ids);
+
+        assert_eq!(index, 1);
+        assert_eq!(blocks[0].text, "texto");
+        assert_eq!(blocks[1].kind, BlockKind::Image);
+        assert_eq!(blocks[2].kind, BlockKind::Paragraph);
+        assert_eq!(focus, blocks[2].id);
+    }
+
+    #[test]
+    fn image_focuses_the_next_existing_text_block() {
+        let mut blocks = vec![
+            Block::with_text(1, BlockKind::Paragraph, "a"),
+            Block::with_text(2, BlockKind::Heading2, "b"),
+        ];
+        let mut ids = IdGen::default();
+        ids.observe(2);
+
+        let (index, focus) = insert_image_block(&mut blocks, 0, 7, &mut ids);
+
+        assert_eq!(index, 1);
+        assert_eq!(
+            blocks.iter().map(|block| block.kind).collect::<Vec<_>>(),
+            vec![BlockKind::Paragraph, BlockKind::Image, BlockKind::Heading2]
+        );
+        assert_eq!(focus, 2);
+    }
+
+    #[test]
+    fn image_replacing_an_empty_paragraph_focuses_the_existing_next_block() {
+        let mut blocks = vec![
+            Block::with_text(1, BlockKind::Paragraph, "   "),
+            Block::with_text(2, BlockKind::Heading1, "depois"),
+        ];
+        let mut ids = IdGen::default();
+        ids.observe(2);
+
+        let (index, focus) = insert_image_block(&mut blocks, 0, 5, &mut ids);
+
+        assert_eq!(index, 0);
+        assert_eq!(blocks.len(), 2);
+        assert_eq!(blocks[0].kind, BlockKind::Image);
+        assert_eq!(blocks[1].kind, BlockKind::Heading1);
+        assert_eq!(focus, 2);
     }
 }
