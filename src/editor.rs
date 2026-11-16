@@ -47,8 +47,335 @@ pub enum BlockContextAction {
     Move(i32),
 }
 
+#[derive(Clone, Default)]
+struct FormatBarState {
+    selection: Vec<(u64, usize, usize)>,
+    dismissed: bool,
+    rect: Option<Rect>,
+    buttons: Vec<Rect>,
+    // Keep the drawn position when formatting moves the selected label past markers.
+    anchor: Option<egui::Pos2>,
+}
+
+fn format_bar_id() -> Id {
+    Id::unique("floating-format-bar")
+}
+
+impl App {
+    fn format_selection(&self, ctx: &egui::Context) -> Vec<(u64, usize, usize)> {
+        let range = if let Some(span) = self.text_span.filter(|s| s.anchor != s.head) {
+            Some(span.ordered())
+        } else {
+            self.block_selection_range()
+                .map(|(lo, hi)| ((lo, 0), (hi, self.page.blocks[hi].text.chars().count())))
+        };
+        if let Some(((lo, a), (hi, b))) = range {
+            return (lo..=hi)
+                .filter_map(|index| {
+                    let block = self.page.blocks.get(index)?;
+                    let start = if index == lo { a } else { 0 };
+                    let end = if index == hi {
+                        b
+                    } else {
+                        block.text.chars().count()
+                    };
+                    (block.kind.accepts_text() && start < end).then_some((block.id, start, end))
+                })
+                .collect();
+        }
+        if let Focus::Block(id) = self.focus
+            && let Some(index) = self.index_of(id)
+            && self.page.blocks[index].kind.accepts_text()
+            && let Some((a, b)) = self.cursor_range_for(ctx, id)
+            && a != b
+        {
+            return vec![(id, a.min(b), a.max(b))];
+        }
+        Vec::new()
+    }
+
+    fn format_bar_pointer(ctx: &egui::Context) -> bool {
+        ctx.data(|d| d.get_temp::<FormatBarState>(format_bar_id()))
+            .and_then(|s| s.rect)
+            .is_some_and(|rect| {
+                ctx.input(|i| i.pointer.interact_pos().is_some_and(|p| rect.contains(p)))
+            })
+    }
+
+    /// Process dismissal before the editor can collapse a selection on Escape.
+    fn format_bar_input(&mut self, ctx: &egui::Context) -> bool {
+        let selection = self.format_selection(ctx);
+        let mut state = ctx
+            .data(|d| d.get_temp::<FormatBarState>(format_bar_id()))
+            .unwrap_or_default();
+        if state.selection != selection {
+            state.dismissed = false;
+            state.anchor = None;
+            state.selection = selection.clone();
+        }
+        if selection.is_empty() {
+            state.rect = None;
+        } else if self.consume_pub(ctx, Key::Escape, Modifiers::NONE) {
+            state.dismissed = true;
+            state.rect = None;
+            ctx.data_mut(|d| d.insert_temp(format_bar_id(), state));
+            return true;
+        } else if ctx.input(|i| {
+            i.events
+                .iter()
+                .any(|e| matches!(e, egui::Event::Text(_) | egui::Event::Paste(_)))
+        }) || ctx.input(|i| i.pointer.any_pressed()) && !Self::format_bar_pointer(ctx)
+        {
+            state.dismissed = true;
+            state.rect = None;
+        }
+        ctx.data_mut(|d| d.insert_temp(format_bar_id(), state));
+        Self::format_bar_pointer(ctx)
+            && ctx.input(|i| i.pointer.any_down() || i.pointer.any_released())
+    }
+
+    fn apply_format_bar(&mut self, ctx: &egui::Context, action: usize) {
+        let selection = self.format_selection(ctx);
+        let pending = self.pending.take();
+        let mut span = self.text_span;
+        for (id, a, b) in selection {
+            if action == 4 {
+                self.insert_link(id, (a, b));
+            } else {
+                self.inline_toggle(["**", "*", "~~", "`"][action], id, (a, b));
+            }
+            if let Some(range) = self.pending.take().and_then(|p| p.range) {
+                // Keep the label selected; insert_link normally selects its URL for keyboard editing.
+                let range = if action == 4 { (a + 1, b + 1) } else { range };
+                if let Some(index) = self.index_of(id) {
+                    if let Some(ref mut span) = span {
+                        let forward = span.anchor <= span.head;
+                        for (point, start) in
+                            [(&mut span.anchor, forward), (&mut span.head, !forward)]
+                        {
+                            if point.0 == index {
+                                point.1 = if start { range.0 } else { range.1 };
+                            }
+                        }
+                    } else if self.block_selection.is_none() {
+                        let mut state =
+                            TextEditState::load(ctx, block_te_id(id)).unwrap_or_default();
+                        let reverse = state
+                            .cursor
+                            .char_range()
+                            .is_some_and(|r| r.primary.index.0 < r.secondary.index.0);
+                        let (anchor, head) = if reverse { (range.1, range.0) } else { range };
+                        state.cursor.set_char_range(Some(CCursorRange::two(
+                            CCursor::new(anchor),
+                            CCursor::new(head),
+                        )));
+                        state.store(ctx, block_te_id(id));
+                        self.cursors.insert(id, range);
+                    }
+                }
+            }
+        }
+        self.text_span = span;
+        self.pending = pending;
+        let selection = self.format_selection(ctx);
+        ctx.data_mut(|d| {
+            let mut state = d
+                .get_temp::<FormatBarState>(format_bar_id())
+                .unwrap_or_default();
+            state.selection = selection;
+            state.anchor = state.rect.map(|rect| rect.min);
+            d.insert_temp(format_bar_id(), state);
+        });
+        ctx.request_repaint();
+    }
+
+    /// Foreground area emitted after all editor text and selection painting.
+    fn format_bar(&mut self, ctx: &egui::Context, viewport: Rect) {
+        let selection = self.format_selection(ctx);
+        let mut state = ctx
+            .data(|d| d.get_temp::<FormatBarState>(format_bar_id()))
+            .unwrap_or_default();
+        if state.selection != selection {
+            state.dismissed = false;
+            state.anchor = None;
+            state.selection = selection.clone();
+        }
+        state.rect = None;
+        state.buttons.clear();
+        if !selection.is_empty() && !state.dismissed {
+            let (id, start, _) = selection[0];
+            if let Some((galley, origin)) = self.block_galleys.get(&id)
+                && let Some(block_rect) = self.block_rects.get(&id)
+            {
+                let line = galley
+                    .pos_from_cursor(CCursor::new(start))
+                    .translate(origin.to_vec2());
+                if line.intersects(viewport) && block_rect.intersects(viewport) {
+                    let bounds = ctx.content_rect().shrink(4.0);
+                    let size = vec2(158.0, 40.0);
+                    let y = if line.top() - size.y - 6.0 >= bounds.top() {
+                        line.top() - size.y - 6.0
+                    } else {
+                        let (last_id, _, end) = *selection.last().unwrap();
+                        self.block_galleys
+                            .get(&last_id)
+                            .map_or(line.bottom(), |(g, origin)| {
+                                g.pos_from_cursor(CCursor::new(end)).bottom() + origin.y
+                            })
+                            + 6.0
+                    };
+                    // If neither side has room, do not cover selected text.
+                    if y + size.y > bounds.bottom() {
+                        ctx.data_mut(|d| d.insert_temp(format_bar_id(), state));
+                        return;
+                    }
+                    let anchor = state.anchor.unwrap_or(pos2(line.left(), y));
+                    let pos = pos2(
+                        anchor
+                            .x
+                            .clamp(bounds.left(), (bounds.right() - size.x).max(bounds.left())),
+                        anchor
+                            .y
+                            .clamp(bounds.top(), (bounds.bottom() - size.y).max(bounds.top())),
+                    );
+                    let active: Vec<bool> = (0..5)
+                        .map(|action| {
+                            selection.iter().all(|(id, a, b)| {
+                                let text = &self.page.blocks[self.index_of(*id).unwrap()].text;
+                                let start = markdown::char_to_byte(text, *a);
+                                let end = markdown::char_to_byte(text, *b);
+                                let parsed = markdown::parse_inline(text);
+                                // Ignore hidden delimiters, but require every selected content piece to carry the style.
+                                let pieces: Vec<_> = parsed
+                                    .pieces
+                                    .iter()
+                                    .filter(|p| {
+                                        !p.marker && p.range.start < end && p.range.end > start
+                                    })
+                                    .collect();
+                                !pieces.is_empty()
+                                    && pieces.iter().all(|p| {
+                                        parsed.styles.iter().any(|(r, s)| {
+                                            r.start <= p.range.start.max(start)
+                                                && r.end >= p.range.end.min(end)
+                                                && [s.bold, s.italic, s.strike, s.code, s.link]
+                                                    [action]
+                                        })
+                                    })
+                            })
+                        })
+                        .collect();
+                    let mut clicked = None;
+                    let p = self.palette;
+                    let output = egui::Area::new(format_bar_id())
+                        .order(egui::Order::Foreground)
+                        .movable(false)
+                        .sense(Sense::CLICK)
+                        .fixed_pos(pos)
+                        .show(ctx, |ui| {
+                            Frame::new()
+                                .fill(p.elevated)
+                                .stroke(Stroke::new(1.0, p.border))
+                                .corner_radius(7)
+                                .inner_margin(4)
+                                .shadow(egui::epaint::Shadow {
+                                    offset: [0, 2],
+                                    blur: 8,
+                                    spread: 0,
+                                    color: p.shadow,
+                                })
+                                .show(ui, |ui| {
+                                    ui.spacing_mut().item_spacing.x = 4.0;
+                                    ui.spacing_mut().interact_size.y = 26.0;
+                                    ui.horizontal(|ui| {
+                                        for (action, (label, tip)) in [
+                                            ("B", "Negrito (Ctrl B)"),
+                                            ("I", "Itálico (Ctrl I)"),
+                                            ("S", "Riscado (Ctrl ⇧ S)"),
+                                            ("</>", "Código inline (Ctrl E)"),
+                                            ("", "Link (Ctrl ⇧ K)"),
+                                        ]
+                                        .into_iter()
+                                        .enumerate()
+                                        {
+                                            let (rect, response) = ui.allocate_exact_size(
+                                                vec2(26.0, 26.0),
+                                                Sense::CLICK,
+                                            );
+                                            state.buttons.push(rect);
+                                            if active[action] || response.hovered() {
+                                                ui.painter().rect_filled(
+                                                    rect,
+                                                    4,
+                                                    if active[action] {
+                                                        p.accent_soft
+                                                    } else {
+                                                        p.hover
+                                                    },
+                                                );
+                                            }
+                                            let color =
+                                                if active[action] { p.accent } else { p.text };
+                                            if action == 4 {
+                                                // Two interlocking links, drawn with the app's vector palette.
+                                                for delta in [-3.0, 3.0] {
+                                                    ui.painter().rect_stroke(
+                                                        Rect::from_center_size(
+                                                            rect.center() + vec2(delta, -delta),
+                                                            vec2(10.0, 7.0),
+                                                        ),
+                                                        3,
+                                                        Stroke::new(1.3, color),
+                                                        egui::StrokeKind::Inside,
+                                                    );
+                                                }
+                                                ui.painter().line_segment(
+                                                    [
+                                                        rect.center() - vec2(3.0, -3.0),
+                                                        rect.center() + vec2(3.0, -3.0),
+                                                    ],
+                                                    Stroke::new(1.3, color),
+                                                );
+                                            } else {
+                                                ui.painter().text(
+                                                    rect.center(),
+                                                    Align2::CENTER_CENTER,
+                                                    label,
+                                                    FontId::proportional(14.0),
+                                                    color,
+                                                );
+                                            }
+                                            if response.clicked() {
+                                                clicked = Some(action);
+                                            }
+                                            response.on_hover_text(tip);
+                                        }
+                                    });
+                                });
+                        });
+                    state.rect = Some(output.response.rect);
+                    ctx.data_mut(|d| d.insert_temp(format_bar_id(), state.clone()));
+                    if let Some(action) = clicked {
+                        self.apply_format_bar(ctx, action);
+                        return;
+                    }
+                }
+            }
+        }
+        ctx.data_mut(|d| d.insert_temp(format_bar_id(), state));
+    }
+}
+
 impl App {
     pub fn editor(&mut self, ui: &mut Ui, actions: &mut Vec<Action>) {
+        // egui otherwise surrenders TextEdit focus on any click elsewhere,
+        // even when the clicked control itself is not focusable.
+        let surrender_focus_on = ui.ctx().options(|o| o.input_options.surrender_focus_on);
+        if Self::format_bar_pointer(ui.ctx()) {
+            ui.ctx().options_mut(|o| {
+                o.input_options.surrender_focus_on = egui::SurrenderFocusOn::Never
+            });
+        }
         let p = self.palette;
         let mut reset_scroll = false;
         if self.reset_scroll {
@@ -162,6 +489,9 @@ impl App {
                 ui.ctx().request_repaint();
             }
         }
+        self.format_bar(ui.ctx(), output.inner_rect);
+        ui.ctx()
+            .options_mut(|o| o.input_options.surrender_focus_on = surrender_focus_on);
     }
 
     fn editor_content(&mut self, ui: &mut Ui, viewport: Rect, actions: &mut Vec<Action>) {
@@ -457,6 +787,7 @@ impl App {
 
         // Any click in the editor drops the block selection.
         if self.block_selection.is_some()
+            && !Self::format_bar_pointer(ui.ctx())
             && !egui::Popup::is_any_open(ui.ctx())
             && ui.input(|input| input.pointer.primary_pressed())
         {
@@ -876,7 +1207,13 @@ impl App {
                 .interactive(self.text_span.is_none())
                 // Tab indents the block (see `block_keys`); without the lock
                 // egui would move keyboard focus to the next widget.
-                .lock_focus(true);
+                .event_filter(egui::EventFilter {
+                    tab: true,
+                    horizontal_arrows: true,
+                    vertical_arrows: true,
+                    // editor_keys owns Escape, including toolbar dismissal.
+                    escape: true,
+                });
 
             let te = if let Some(hint) = hint {
                 te.hint_text(RichText::new(hint).font(hint_font.clone()).color(p.faint))
@@ -1463,6 +1800,9 @@ impl App {
     }
 
     pub fn editor_keys(&mut self, ctx: &egui::Context) {
+        if self.format_bar_input(ctx) {
+            return;
+        }
         self.sync_editor_cursor(ctx);
         if ctx.input(|input| {
             input.events.iter().any(|event| {
@@ -3600,6 +3940,179 @@ mod tests {
         h.idle();
     }
 
+    fn bar_state(h: &Harness) -> FormatBarState {
+        h.ctx.data(|d| d.get_temp(format_bar_id())).unwrap()
+    }
+
+    fn selected_word() -> Harness {
+        let mut h = Harness::new("", &[(BlockKind::Paragraph, "palavra")]);
+        h.click_in(0, 0);
+        h.app.activate_span(
+            &h.ctx,
+            TextSpan {
+                anchor: (0, 0),
+                head: (0, 7),
+            },
+        );
+        h.idle();
+        h
+    }
+
+    #[test]
+    fn format_bar_consecutive_pointer_clicks_toggle_bold() {
+        let mut h = Harness::new("", &[(BlockKind::Paragraph, "palavra alvo")]);
+        h.click_in(0, 0);
+        h.app.activate_span(
+            &h.ctx,
+            TextSpan {
+                anchor: (0, 0),
+                head: (0, 7),
+            },
+        );
+        h.idle();
+        let focus = h.ctx.memory(|m| m.focused());
+        let pos = bar_state(&h).buttons[0].center();
+        for expected in ["**palavra** alvo", "palavra alvo"] {
+            h.frame(vec![
+                Event::PointerMoved(pos),
+                Event::PointerButton {
+                    pos,
+                    button: egui::PointerButton::Primary,
+                    pressed: true,
+                    modifiers: Modifiers::NONE,
+                },
+            ]);
+            assert!(bar_state(&h).rect.is_some());
+            assert!(h.app.text_span.is_some());
+            h.frame(vec![Event::PointerButton {
+                pos,
+                button: egui::PointerButton::Primary,
+                pressed: false,
+                modifiers: Modifiers::NONE,
+            }]);
+            assert_eq!(h.texts(), vec![expected]);
+            assert!(bar_state(&h).rect.is_some());
+            assert_eq!(h.ctx.memory(|m| m.focused()), focus);
+            h.idle();
+        }
+        assert_eq!(h.app.text_span.unwrap().ordered(), ((0, 0), (0, 7)));
+    }
+
+    #[test]
+    fn format_bar_span_toggle_preserves_selection_and_focus() {
+        let mut h = selected_word();
+        assert!(bar_state(&h).rect.is_some());
+        let focus = h.ctx.memory(|m| m.focused());
+        h.click(bar_state(&h).buttons[0].center());
+        assert_eq!(h.texts(), vec!["**palavra**"]);
+        assert_eq!(h.app.text_span.unwrap().ordered(), ((0, 2), (0, 9)));
+        assert_eq!(h.ctx.memory(|m| m.focused()), focus);
+        assert!(h.app.pending.is_none());
+        h.click(bar_state(&h).buttons[0].center());
+        assert_eq!(h.texts(), vec!["palavra"]);
+        assert_eq!(h.app.text_span.unwrap().ordered(), ((0, 0), (0, 7)));
+    }
+
+    #[test]
+    fn format_bar_matches_bold_shortcut() {
+        let mut button = selected_word();
+        button.click(bar_state(&button).buttons[0].center());
+        let mut shortcut = Harness::new("", &[(BlockKind::Paragraph, "palavra")]);
+        shortcut.click_in(0, 0);
+        shortcut.app.pending = Some(PendingFocus {
+            target: Focus::Block(shortcut.id(0)),
+            range: Some((0, 7)),
+            select_all: false,
+        });
+        shortcut.idle();
+        shortcut.key(Key::B, Modifiers::COMMAND);
+        assert_eq!(button.texts(), shortcut.texts());
+    }
+
+    #[test]
+    fn format_bar_all_actions_keep_label_selected() {
+        for (action, expected, offset) in [
+            (1, "*palavra*", 1),
+            (2, "~~palavra~~", 2),
+            (3, "`palavra`", 1),
+            (4, "[palavra](https://)", 1),
+        ] {
+            let mut h = selected_word();
+            h.click(bar_state(&h).buttons[action].center());
+            assert_eq!(h.texts(), vec![expected]);
+            assert_eq!(
+                h.app.text_span.unwrap().ordered(),
+                ((0, offset), (0, offset + 7))
+            );
+            assert_eq!(h.app.focus, Focus::None);
+        }
+    }
+
+    #[test]
+    fn format_bar_native_selection_preserves_caret_direction_and_focus() {
+        let mut h = Harness::new("", &[(BlockKind::Paragraph, "palavra")]);
+        h.click_in(0, 0);
+        h.app.pending = Some(PendingFocus {
+            target: Focus::Block(h.id(0)),
+            range: Some((7, 0)),
+            select_all: false,
+        });
+        h.idle();
+        let focus = h.ctx.memory(|m| m.focused());
+        let before = TextEditState::load(&h.ctx, block_te_id(h.id(0)))
+            .unwrap()
+            .cursor
+            .char_range()
+            .unwrap();
+        h.click(bar_state(&h).buttons[0].center());
+        let after = TextEditState::load(&h.ctx, block_te_id(h.id(0)))
+            .unwrap()
+            .cursor
+            .char_range()
+            .unwrap();
+        assert_eq!(h.texts(), vec!["**palavra**"]);
+        assert_eq!(after.primary.index.0, before.primary.index.0 + 2);
+        assert_eq!(after.secondary.index.0, before.secondary.index.0 + 2);
+        assert_eq!(h.ctx.memory(|m| m.focused()), focus);
+        h.click(bar_state(&h).buttons[0].center());
+        assert_eq!(h.texts(), vec!["palavra"]);
+        h.click_in(0, 0);
+        assert!(bar_state(&h).rect.is_none());
+    }
+
+    #[test]
+    fn format_bar_escape_keeps_span_and_typing_dismisses() {
+        let mut h = selected_word();
+        let span = h.app.text_span;
+        h.key(Key::Escape, Modifiers::NONE);
+        assert_eq!(h.app.text_span, span);
+        assert!(bar_state(&h).rect.is_none());
+        h.type_text("novo");
+        assert_eq!(h.texts(), vec!["novo"]);
+        assert!(bar_state(&h).rect.is_none());
+    }
+
+    #[test]
+    fn format_bar_formats_only_selected_text_blocks() {
+        let mut h = Harness::new(
+            "",
+            &[
+                (BlockKind::Paragraph, "um"),
+                (BlockKind::Divider, ""),
+                (BlockKind::Paragraph, "dois"),
+            ],
+        );
+        h.app.block_selection = Some((h.id(0), h.id(2)));
+        let selection = h.app.block_selection;
+        h.idle();
+        h.click(bar_state(&h).buttons[0].center());
+        assert_eq!(h.texts(), vec!["**um**", "", "**dois**"]);
+        assert_eq!(h.app.block_selection, selection);
+        h.app.block_selection = Some((h.id(1), h.id(1)));
+        h.idle();
+        assert!(bar_state(&h).rect.is_none());
+    }
+
     #[test]
     fn context_menu_keeps_inside_selection_and_retargets_outside() {
         let mut h = Harness::new(
@@ -3928,9 +4441,19 @@ mod tests {
         h.type_text("Q");
         assert_eq!(h.texts(), vec![format!("{}Q{}", &text[..5], &text[100..])]);
         drag_text(&mut h, (0, 20), (0, 3));
+        let before = h.app.page.blocks[0].text.clone();
         h.key(Key::Escape, Modifiers::NONE);
+        assert!(
+            h.app
+                .text_span
+                .is_some_and(|s| s.ordered() == ((0, 3), (0, 20)))
+                || h.app.cursor_range_for(&h.ctx, h.id(0)) == Some((3, 20))
+        );
         h.type_text("Z");
-        assert_eq!(h.app.page.blocks[0].text.chars().nth(20), Some('Z'));
+        assert_eq!(
+            h.texts(),
+            vec![format!("{}Z{}", &before[..3], &before[20..])]
+        );
     }
 
     #[test]
@@ -4593,13 +5116,14 @@ mod tests {
         h.key(Key::ArrowDown, Modifiers::NONE);
         assert_eq!(h.app.block_selection, Some((h.id(2), h.id(2))));
         h.key(Key::Escape, Modifiers::NONE);
-        assert_eq!(h.app.block_selection, None);
+        assert_eq!(h.app.block_selection, Some((h.id(2), h.id(2))));
+        assert!(bar_state(&h).rect.is_none());
         h.type_text("Q");
-        assert_eq!(h.texts(), ["a", "b", "cQ"]);
+        assert_eq!(h.texts(), ["a", "b", "Q"]);
     }
 
     #[test]
-    fn escape_focuses_last_selected_block_end() {
+    fn escape_preserves_selected_blocks_and_focus() {
         let mut h = Harness::new(
             "title",
             &[
@@ -4613,14 +5137,11 @@ mod tests {
         assert_eq!(h.app.block_selection, Some((h.id(1), h.id(1))));
         h.key(Key::ArrowDown, Modifiers::SHIFT);
         h.key(Key::Escape, Modifiers::NONE);
-        assert_eq!(h.app.focus, Focus::Block(h.id(2)));
-        assert_eq!(h.app.cursor_range_for(&h.ctx, h.id(2)), Some((13, 13)));
-        assert!(
-            h.ctx
-                .memory(|memory| memory.has_focus(block_te_id(h.id(2))))
-        );
+        assert_eq!(h.app.focus, Focus::None);
+        assert_eq!(h.app.block_selection, Some((h.id(1), h.id(2))));
+        assert!(bar_state(&h).rect.is_none());
         h.type_text("Q");
-        assert_eq!(h.texts(), ["alpha one", "bravo two", "charlie threeQ"]);
+        assert_eq!(h.texts(), ["alpha one", "Q"]);
     }
 
     #[test]
@@ -4703,7 +5224,7 @@ mod tests {
     }
 
     #[test]
-    fn escape_reversed_selection_edits_document_last_block() {
+    fn escape_preserves_reversed_block_selection() {
         let mut h = Harness::new(
             "t",
             &[(BlockKind::Paragraph, "a"), (BlockKind::Paragraph, "c")],
@@ -4712,8 +5233,9 @@ mod tests {
         h.app.start_block_selection(&h.ctx.clone(), h.id(1));
         h.app.block_selection = Some((h.id(1), h.id(0)));
         h.key(Key::Escape, Modifiers::NONE);
+        assert_eq!(h.app.block_selection, Some((h.id(1), h.id(0))));
         h.type_text("Q");
-        assert_eq!(h.texts(), ["a", "cQ"]);
+        assert_eq!(h.texts(), ["Q"]);
     }
 
     #[test]
