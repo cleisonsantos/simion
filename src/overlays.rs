@@ -754,6 +754,7 @@ impl App {
                             ("Ctrl E", "Código inline"),
                             ("Ctrl ⇧ S", "Riscado"),
                             ("Ctrl ⇧ K", "Inserir link"),
+                            ("Ctrl V", "Colar texto, Markdown ou imagem"),
                             ("Ctrl ⇧ V", "Colar sem formatar"),
                             ("Ctrl A", "Selecionar o bloco; de novo, a nota inteira"),
                             ("Ctrl D", "Duplicar bloco"),

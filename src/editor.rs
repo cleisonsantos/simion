@@ -13,6 +13,7 @@ use eframe::egui::{
 
 use crate::app::{Action, App, Focus, PendingFocus};
 use crate::icons;
+use crate::images;
 use crate::markdown::{self, InlineLayout};
 use crate::model::BlockKind;
 use crate::syntax;
@@ -478,7 +479,13 @@ impl App {
                     .block_heights
                     .get(&block.id)
                     .copied()
-                    .unwrap_or_else(|| block.estimated_height(text_width - GUTTER, self.zoom));
+                    .unwrap_or_else(|| {
+                        if block.kind == BlockKind::Image {
+                            self.image_height(block.text.parse().ok(), text_width)
+                        } else {
+                            block.estimated_height(text_width - GUTTER, self.zoom)
+                        }
+                    });
                 (block.id, (height + 2.0).max(10.0))
             };
 
@@ -628,6 +635,9 @@ impl App {
 
         if kind == BlockKind::Divider {
             return self.divider_row(ui, text_width, column_left, id, actions);
+        }
+        if kind == BlockKind::Image {
+            return self.image_row(ui, text_width, column_left, id, &text, actions);
         }
 
         let base_size = kind.font_size() * zoom;
@@ -1086,6 +1096,109 @@ impl App {
             rows,
             galley,
         }
+    }
+
+    fn image_height(&self, asset_id: Option<u64>, text_width: f32) -> f32 {
+        let width = (text_width - GUTTER).max(40.0);
+        match asset_id.and_then(|id| self.asset_sizes.get(&id).copied()) {
+            Some((asset_width, asset_height)) if asset_width > 0 => {
+                (width * asset_height as f32 / asset_width as f32 + 8.0).max(60.0)
+            }
+            _ => 220.0 * self.zoom,
+        }
+    }
+
+    fn image_row(
+        &mut self,
+        ui: &mut Ui,
+        text_width: f32,
+        column_left: f32,
+        id: u64,
+        text: &str,
+        actions: &mut Vec<Action>,
+    ) -> BlockOutcome {
+        let p = self.palette;
+        let zoom = self.zoom;
+        let asset_id = text.parse::<u64>().ok();
+        let row_start = ui.cursor().min;
+        let width = (text_width - GUTTER).max(40.0);
+        let height = self.image_height(asset_id, text_width);
+        let (rect, response) = ui.allocate_exact_size(vec2(text_width, height), Sense::click());
+        self.block_context_menu(ui, &response, id, actions);
+
+        let image_rect = Rect::from_min_size(
+            pos2(rect.left() + GUTTER, rect.top() + 4.0),
+            vec2(width, (height - 8.0).max(1.0)),
+        );
+        let texture = asset_id
+            .filter(|asset_id| self.ensure_texture(ui.ctx(), *asset_id))
+            .and_then(|asset_id| self.textures.get(&asset_id).map(|texture| texture.id()));
+        if let Some(texture) = texture {
+            ui.painter().image(
+                texture,
+                image_rect,
+                Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0)),
+                Color32::WHITE,
+            );
+        } else {
+            ui.painter().rect_filled(image_rect, 8, p.hover);
+            ui.painter().rect_stroke(
+                image_rect,
+                8,
+                Stroke::new(1.0, p.border),
+                egui::StrokeKind::Inside,
+            );
+            ui.painter().text(
+                image_rect.center(),
+                Align2::CENTER_CENTER,
+                "Imagem indisponível",
+                FontId::new(13.0 * zoom, family(FONT_BODY)),
+                p.muted,
+            );
+        }
+
+        let row_rect = Rect::from_min_max(row_start, rect.max);
+        self.hover_handles(ui, id, column_left, row_rect, actions);
+        BlockOutcome {
+            changed: false,
+            focused: false,
+            span_shape: ui.painter().add(Shape::Noop),
+            cursor: None,
+            rect: row_rect,
+            rows: 1,
+            galley: None,
+        }
+    }
+
+    /// Loads and caches the texture for `asset_id`. Failed/missing assets are
+    /// cached too, so a broken reference costs one decode per page opening.
+    fn ensure_texture(&mut self, ctx: &egui::Context, asset_id: u64) -> bool {
+        if self.textures.contains_key(&asset_id) {
+            return true;
+        }
+        if self.broken_assets.contains(&asset_id) {
+            return false;
+        }
+        let Some(asset) = self
+            .store
+            .as_ref()
+            .and_then(|store| store.asset(asset_id).ok().flatten())
+        else {
+            self.broken_assets.insert(asset_id);
+            return false;
+        };
+        let Ok((rgba, width, height)) = images::decode(&asset.bytes) else {
+            self.broken_assets.insert(asset_id);
+            return false;
+        };
+        let texture = ctx.load_texture(
+            format!("simion-image-{asset_id}"),
+            egui::ColorImage::from_rgba_unmultiplied([width as usize, height as usize], &rgba),
+            egui::TextureOptions::LINEAR,
+        );
+        self.asset_sizes.insert(asset_id, (width, height));
+        self.textures.insert(asset_id, texture);
+        true
     }
 
     fn divider_row(
@@ -2019,7 +2132,7 @@ impl App {
         let previous_len = previous.text.chars().count();
         let current_text = self.page.blocks[index].text.clone();
 
-        if previous_kind == BlockKind::Divider {
+        if previous_kind == BlockKind::Divider || previous_kind == BlockKind::Image {
             self.begin_change();
             self.page.blocks.remove(index - 1);
             let new_index = index - 1;
@@ -2076,7 +2189,7 @@ impl App {
         // The caret stays at the seam, where the removed break was.
         let caret = self.page.blocks[index].text.chars().count();
         self.begin_change();
-        if next_kind == BlockKind::Divider {
+        if next_kind == BlockKind::Divider || next_kind == BlockKind::Image {
             self.page.blocks.remove(index + 1);
         } else {
             if !self.page.blocks[index].text.is_empty()
@@ -2271,13 +2384,13 @@ impl App {
         };
         if !self.page.blocks[lo..=hi]
             .iter()
-            .any(|b| b.kind != BlockKind::Divider && (b.kind != kind || kind == BlockKind::Todo))
+            .any(|b| b.kind.accepts_text() && (b.kind != kind || kind == BlockKind::Todo))
         {
             return;
         }
         self.begin_change();
         for block in &mut self.page.blocks[lo..=hi] {
-            if block.kind == BlockKind::Divider {
+            if !block.kind.accepts_text() {
                 continue;
             }
             block.kind = kind;
@@ -2304,7 +2417,8 @@ impl App {
         let Some(index) = self.index_of(id) else {
             return;
         };
-        if self.page.blocks[index].kind == kind {
+        let current = self.page.blocks[index].kind;
+        if current == kind || current == BlockKind::Image {
             return;
         }
         self.begin_change();
@@ -3042,6 +3156,7 @@ fn hint_for(kind: BlockKind) -> &'static str {
         BlockKind::Callout => "Destaque",
         BlockKind::Code => "Código",
         BlockKind::Divider => "",
+        BlockKind::Image => "",
     }
 }
 

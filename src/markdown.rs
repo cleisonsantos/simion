@@ -901,6 +901,9 @@ pub fn to_markdown(blocks: &[Block]) -> String {
             BlockKind::Divider => {
                 out.push_str(&format!("{indent}---\n"));
             }
+            BlockKind::Image => {
+                out.push_str(&format!("{indent}![imagem](simion-asset:{})\n", block.text));
+            }
         }
     }
 
@@ -1229,5 +1232,16 @@ mod tests {
     fn single_line_heading_paste_is_not_a_paragraph() {
         let drafts = parse_blocks("# Titulo", false);
         assert_eq!(drafts[0].kind, BlockKind::Heading1);
+    }
+
+    #[test]
+    fn image_block_exports_an_asset_reference() {
+        let blocks = [
+            Block::with_text(1, BlockKind::Paragraph, "antes"),
+            Block::with_text(2, BlockKind::Image, "42"),
+        ];
+        let markdown = to_markdown(&blocks);
+        assert!(markdown.contains("![imagem](simion-asset:42)"));
+        assert_eq!(markdown.matches("simion-asset:42").count(), 1);
     }
 }

@@ -17,6 +17,7 @@ pub enum BlockKind {
     Callout,
     Code,
     Divider,
+    Image,
 }
 
 impl BlockKind {
@@ -47,6 +48,7 @@ impl BlockKind {
             Self::Callout => "callout",
             Self::Code => "code",
             Self::Divider => "divider",
+            Self::Image => "image",
         }
     }
 
@@ -62,6 +64,7 @@ impl BlockKind {
             "callout" => Self::Callout,
             "code" => Self::Code,
             "divider" => Self::Divider,
+            "image" => Self::Image,
             _ => Self::Paragraph,
         }
     }
@@ -75,7 +78,7 @@ impl BlockKind {
     }
 
     pub fn accepts_text(self) -> bool {
-        self != Self::Divider
+        !matches!(self, Self::Divider | Self::Image)
     }
 
     /// Label used in the slash menu & block menu.
@@ -92,6 +95,7 @@ impl BlockKind {
             Self::Callout => "Destaque",
             Self::Code => "Bloco de código",
             Self::Divider => "Divisor",
+            Self::Image => "Imagem",
         }
     }
 
@@ -108,6 +112,7 @@ impl BlockKind {
             Self::Callout => "Um aviso em destaque",
             Self::Code => "Código com fonte monoespaçada",
             Self::Divider => "Uma linha de separação",
+            Self::Image => "Imagem colada",
         }
     }
 
@@ -125,6 +130,7 @@ impl BlockKind {
             Self::Callout => "destaque callout nota aviso",
             Self::Code => "codigo code bloco trecho",
             Self::Divider => "divisor linha divider separador",
+            Self::Image => "imagem image figura foto",
         }
     }
 
@@ -142,6 +148,7 @@ impl BlockKind {
             Self::Callout => "> [!NOTE]",
             Self::Code => "```",
             Self::Divider => "---",
+            Self::Image => "![ ]",
         }
     }
 
@@ -220,6 +227,9 @@ impl Block {
         if self.kind == BlockKind::Divider {
             return 24.0 * zoom;
         }
+        if self.kind == BlockKind::Image {
+            return 220.0 * zoom;
+        }
         let chars_per_line = (width / (font * 0.52)).max(8.0);
         let lines = ((self.text.chars().count() as f32) / chars_per_line)
             .ceil()
@@ -292,5 +302,19 @@ impl IdGen {
     /// Make sure the generator never hands out an id that is already in use.
     pub fn observe(&mut self, id: u64) {
         self.0 = self.0.max(id);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn image_kind_round_trips_and_takes_no_text() {
+        assert_eq!(BlockKind::Image.as_str(), "image");
+        assert_eq!(BlockKind::from_db("image"), BlockKind::Image);
+        assert!(!BlockKind::Image.accepts_text());
+        assert_eq!(BlockKind::from_db("lixo"), BlockKind::Paragraph);
+        assert!(!BlockKind::ALL.contains(&BlockKind::Image));
     }
 }
