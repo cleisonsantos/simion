@@ -1,5 +1,6 @@
 //! SQLite persistence. One local file, no server, no network.
 
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context as _, Result};
@@ -144,7 +145,14 @@ Copie um documento inteiro e cole dentro do Simion: títulos, listas, tarefas, c
 impl Store {
     pub fn open_default() -> Result<Self> {
         let path = data_dir().join("simion.db");
-        Self::open(&path)
+        let mut store = Self::open(&path)?;
+        // GC so no boot: aqui nenhum snapshot de undo esta vivo. No save,
+        // Ctrl+Z depois de apagar um bloco de imagem devolveria um id de asset
+        // ja apagado. Falha no GC nao pode impedir o app de abrir.
+        if let Err(err) = store.gc_orphan_assets() {
+            eprintln!("simion: falha ao limpar assets orfaos: {err:#}");
+        }
+        Ok(store)
     }
 
     pub fn open(path: &Path) -> Result<Self> {
@@ -657,6 +665,45 @@ impl Store {
             params![to_page, unix_now(), id as i64],
         )?;
         Ok((copied == 1).then(|| self.conn.last_insert_rowid() as u64))
+    }
+
+    /// Apaga os assets que nenhum bloco `image` (de qualquer pagina)
+    /// referencia. O id e lido com `parse::<u64>()`, igual ao editor, para que
+    /// texto vazio ou nao numerico nunca proteja um asset. Retorna quantos
+    /// foram apagados. So deve rodar no boot (ver `open_default`).
+    pub fn gc_orphan_assets(&mut self) -> Result<usize> {
+        let tx = self.conn.transaction()?;
+        let referenced: HashSet<u64> = {
+            let mut stmt = tx.prepare("SELECT text FROM blocks WHERE kind = 'image'")?;
+            let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
+            let mut ids = HashSet::new();
+            for text in rows {
+                if let Ok(id) = text?.parse::<u64>() {
+                    ids.insert(id);
+                }
+            }
+            ids
+        };
+        let orphans: Vec<i64> = {
+            let mut stmt = tx.prepare("SELECT id FROM assets")?;
+            let rows = stmt.query_map([], |row| row.get::<_, i64>(0))?;
+            let mut out = Vec::new();
+            for id in rows {
+                let id = id?;
+                if !u64::try_from(id).is_ok_and(|id| referenced.contains(&id)) {
+                    out.push(id);
+                }
+            }
+            out
+        };
+        {
+            let mut stmt = tx.prepare("DELETE FROM assets WHERE id = ?1")?;
+            for id in &orphans {
+                stmt.execute(params![id])?;
+            }
+        }
+        tx.commit()?;
+        Ok(orphans.len())
     }
 
     pub fn page_asset_sizes(&self, page_id: PageId) -> Result<Vec<(u64, u32, u32)>> {
@@ -1328,5 +1375,68 @@ mod tests {
 
         drop(store);
         let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn gc_removes_orphans_and_keeps_referenced_assets() {
+        let (mut store, path) = blank_store();
+        let now = unix_now();
+        let first = store.create_page(None, "Primeira", "", now).unwrap();
+        let second = store.create_page(None, "Segunda", "", now).unwrap();
+        let same_page = store
+            .insert_asset(first.id, "image/png", &[1], 1, 1)
+            .unwrap();
+        let orphan = store
+            .insert_asset(first.id, "image/png", &[2], 1, 1)
+            .unwrap();
+        // Asset de uma pagina referenciado por bloco de outra: o GC e global.
+        let cross_page = store
+            .insert_asset(second.id, "image/png", &[3], 1, 1)
+            .unwrap();
+        // Paragrafo com o id como texto nao protege; texto vazio e lixo tambem nao.
+        let only_paragraph = store
+            .insert_asset(second.id, "image/png", &[4], 1, 1)
+            .unwrap();
+
+        let first_page = Page {
+            meta: first,
+            blocks: vec![
+                Block::with_text(1, BlockKind::Image, same_page.to_string()),
+                Block::with_text(2, BlockKind::Image, cross_page.to_string()),
+                Block::with_text(3, BlockKind::Image, ""),
+                Block::with_text(4, BlockKind::Image, format!("{only_paragraph}abc")),
+            ],
+        };
+        store.save_page(&first_page).unwrap();
+        let paragraph = Block::with_text(1, BlockKind::Paragraph, only_paragraph.to_string());
+        let second_page = Page {
+            meta: second,
+            blocks: vec![paragraph],
+        };
+        store.save_page(&second_page).unwrap();
+
+        assert_eq!(store.gc_orphan_assets().unwrap(), 2);
+        assert!(store.asset(orphan).unwrap().is_none());
+        assert!(store.asset(only_paragraph).unwrap().is_none());
+        assert!(store.asset(same_page).unwrap().is_some());
+        assert!(store.asset(cross_page).unwrap().is_some());
+        // Idempotente.
+        assert_eq!(store.gc_orphan_assets().unwrap(), 0);
+
+        drop(store);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn gc_with_no_assets_returns_zero() {
+        let (mut store, path) = temp_store();
+        assert_eq!(store.gc_orphan_assets().unwrap(), 0);
+        let (mut blank, blank_path) = blank_store();
+        assert_eq!(blank.gc_orphan_assets().unwrap(), 0);
+
+        drop(store);
+        drop(blank);
+        let _ = std::fs::remove_file(path);
+        let _ = std::fs::remove_file(blank_path);
     }
 }
