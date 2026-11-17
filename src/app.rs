@@ -285,9 +285,21 @@ pub fn hash_page(page: &Page) -> u64 {
     hasher.finish()
 }
 
+/// Pontos por "linha" de rodinha. O padrão do egui (40) é mais lento que um
+/// navegador na mesma tela; 64 deixa a nota na mesma velocidade de um navegador
+/// sem perder a suavidade (issue #69).
+pub(crate) const SCROLL_LINE_POINTS: f32 = 64.0;
+
+/// Aplica a velocidade da rodinha no contexto. Separado de `App::new` para poder
+/// ser testado sem abrir janela.
+pub(crate) fn apply_scroll_speed(ctx: &egui::Context) {
+    ctx.options_mut(|options| options.input_options.line_scroll_speed = SCROLL_LINE_POINTS);
+}
+
 impl App {
     pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
         theme::install_fonts(&cc.egui_ctx);
+        apply_scroll_speed(&cc.egui_ctx);
 
         let mut app = Self::blank();
 
@@ -3233,5 +3245,16 @@ mod tests {
         assert_eq!(blocks[0].kind, BlockKind::Image);
         assert_eq!(blocks[1].kind, BlockKind::Heading1);
         assert_eq!(focus, 2);
+    }
+    #[test]
+    fn scroll_speed_is_faster_than_the_egui_default() {
+        let ctx = egui::Context::default();
+        apply_scroll_speed(&ctx);
+        let speed = ctx.options(|o| o.input_options.line_scroll_speed);
+        assert_eq!(speed, SCROLL_LINE_POINTS);
+        assert!(
+            speed > 40.0,
+            "a rodinha precisa ser mais rapida que o padrao do egui"
+        );
     }
 }
