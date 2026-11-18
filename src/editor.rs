@@ -53,12 +53,18 @@ struct FormatBarState {
     dismissed: bool,
     rect: Option<Rect>,
     buttons: Vec<Rect>,
+    /// Block-kind popup rect, so its clicks count as bar clicks.
+    menu: Option<Rect>,
     // Keep the drawn position when formatting moves the selected label past markers.
     anchor: Option<egui::Pos2>,
 }
 
 fn format_bar_id() -> Id {
     Id::unique("floating-format-bar")
+}
+
+fn format_menu_id() -> Id {
+    format_bar_id().with("block-kind-menu")
 }
 
 impl App {
@@ -95,11 +101,83 @@ impl App {
     }
 
     fn format_bar_pointer(ctx: &egui::Context) -> bool {
-        ctx.data(|d| d.get_temp::<FormatBarState>(format_bar_id()))
-            .and_then(|s| s.rect)
-            .is_some_and(|rect| {
-                ctx.input(|i| i.pointer.interact_pos().is_some_and(|p| rect.contains(p)))
+        let Some(state) = ctx.data(|d| d.get_temp::<FormatBarState>(format_bar_id())) else {
+            return false;
+        };
+        let menu = state
+            .menu
+            .filter(|_| egui::Popup::is_id_open(ctx, format_menu_id()));
+        ctx.input(|i| {
+            i.pointer.interact_pos().is_some_and(|p| {
+                state.rect.is_some_and(|r| r.contains(p)) || menu.is_some_and(|r| r.contains(p))
             })
+        })
+    }
+
+    /// Kind shared by every block the bar acts on, if they all agree.
+    fn format_bar_common_kind(&self, ctx: &egui::Context) -> Option<BlockKind> {
+        let indices: Vec<usize> = if let Some((lo, hi)) = self.block_selection_range() {
+            (lo..=hi).collect()
+        } else {
+            self.format_selection(ctx)
+                .iter()
+                .filter_map(|(id, _, _)| self.index_of(*id))
+                .collect()
+        };
+        let kind = self.page.blocks.get(*indices.first()?)?.kind;
+        indices
+            .iter()
+            .all(|&i| self.page.blocks[i].kind == kind)
+            .then_some(kind)
+    }
+
+    /// Transforms every block touched by the bar's selection, keeping the
+    /// text selection (span or native caret) in place.
+    fn transform_format_selection(&mut self, ctx: &egui::Context, kind: BlockKind) {
+        if self.block_selection_range().is_some() {
+            self.transform_selection(kind);
+        } else {
+            let selection = self.format_selection(ctx);
+            let indices: Vec<usize> = selection
+                .iter()
+                .filter_map(|(id, _, _)| self.index_of(*id))
+                .collect();
+            let (Some(&lo), Some(&hi)) = (indices.iter().min(), indices.iter().max()) else {
+                return;
+            };
+            let native = match (self.text_span, self.focus) {
+                (None, Focus::Block(id)) => TextEditState::load(ctx, block_te_id(id))
+                    .and_then(|s| s.cursor.char_range())
+                    .map(|r| (id, (r.secondary.index.0, r.primary.index.0))),
+                _ => None,
+            };
+            if !self.transform_range(lo, hi, kind) {
+                return;
+            }
+            if !kind.accepts_text() {
+                // Divider clears the text, so offsets no longer exist: select the blocks.
+                self.text_span = None;
+                self.text_anchor = None;
+                self.focus = Focus::None;
+                self.block_selection = Some((self.page.blocks[lo].id, self.page.blocks[hi].id));
+            } else if let Some((id, range)) = native {
+                self.focus = Focus::Block(id);
+                self.pending = Some(PendingFocus {
+                    target: Focus::Block(id),
+                    range: Some(range),
+                    select_all: false,
+                });
+            }
+        }
+        let selection = self.format_selection(ctx);
+        ctx.data_mut(|d| {
+            let mut state = d
+                .get_temp::<FormatBarState>(format_bar_id())
+                .unwrap_or_default();
+            state.selection = selection;
+            d.insert_temp(format_bar_id(), state);
+        });
+        ctx.request_repaint();
     }
 
     /// Process dismissal before the editor can collapse a selection on Escape.
@@ -115,6 +193,13 @@ impl App {
         }
         if selection.is_empty() {
             state.rect = None;
+        } else if egui::Popup::is_id_open(ctx, format_menu_id())
+            && self.consume_pub(ctx, Key::Escape, Modifiers::NONE)
+        {
+            // First Escape only closes the block-kind menu.
+            egui::Popup::close_id(ctx, format_menu_id());
+            ctx.data_mut(|d| d.insert_temp(format_bar_id(), state));
+            return true;
         } else if self.consume_pub(ctx, Key::Escape, Modifiers::NONE) {
             state.dismissed = true;
             state.rect = None;
@@ -201,6 +286,7 @@ impl App {
             state.selection = selection.clone();
         }
         state.rect = None;
+        state.menu = None;
         state.buttons.clear();
         if !selection.is_empty() && !state.dismissed {
             let (id, start, _) = selection[0];
@@ -212,7 +298,7 @@ impl App {
                     .translate(origin.to_vec2());
                 if line.intersects(viewport) && block_rect.intersects(viewport) {
                     let bounds = ctx.content_rect().shrink(4.0);
-                    let size = vec2(158.0, 40.0);
+                    let size = vec2(188.0, 40.0);
                     let y = if line.top() - size.y - 6.0 >= bounds.top() {
                         line.top() - size.y - 6.0
                     } else {
@@ -226,6 +312,7 @@ impl App {
                     };
                     // If neither side has room, do not cover selected text.
                     if y + size.y > bounds.bottom() {
+                        egui::Popup::close_id(ctx, format_menu_id());
                         ctx.data_mut(|d| d.insert_temp(format_bar_id(), state));
                         return;
                     }
@@ -266,6 +353,8 @@ impl App {
                         })
                         .collect();
                     let mut clicked = None;
+                    let mut picked = None;
+                    let common = self.format_bar_common_kind(ctx);
                     let p = self.palette;
                     let output = egui::Area::new(format_bar_id())
                         .order(egui::Order::Foreground)
@@ -350,6 +439,68 @@ impl App {
                                             }
                                             response.on_hover_text(tip);
                                         }
+                                        let (rect, response) =
+                                            ui.allocate_exact_size(vec2(26.0, 26.0), Sense::CLICK);
+                                        state.buttons.push(rect);
+                                        let open = egui::Popup::is_id_open(ctx, format_menu_id());
+                                        if open || response.hovered() {
+                                            ui.painter().rect_filled(
+                                                rect,
+                                                4,
+                                                if open { p.accent_soft } else { p.hover },
+                                            );
+                                        }
+                                        let color = if open { p.accent } else { p.text };
+                                        ui.painter().text(
+                                            rect.center() - vec2(3.0, 0.0),
+                                            Align2::CENTER_CENTER,
+                                            "T",
+                                            FontId::proportional(14.0),
+                                            color,
+                                        );
+                                        // Drawn caret: the bundled fonts may lack "▾".
+                                        let c = rect.center() + vec2(6.0, 1.0);
+                                        ui.painter().add(egui::Shape::convex_polygon(
+                                            vec![
+                                                c + vec2(-3.0, -1.5),
+                                                c + vec2(3.0, -1.5),
+                                                c + vec2(0.0, 2.0),
+                                            ],
+                                            color,
+                                            Stroke::NONE,
+                                        ));
+                                        let menu = egui::Popup::menu(&response)
+                                            .id(format_menu_id())
+                                            .width(220.0)
+                                            .show(|ui| {
+                                                ui.set_width(220.0);
+                                                let mut chosen = None;
+                                                for kind in BlockKind::ALL {
+                                                    let selected = common == Some(kind);
+                                                    if widgets::menu_row(
+                                                        ui,
+                                                        &format!(
+                                                            "{}{}",
+                                                            if selected { "● " } else { "" },
+                                                            kind.label()
+                                                        ),
+                                                        None,
+                                                        false,
+                                                        selected,
+                                                        &p,
+                                                    )
+                                                    .clicked()
+                                                    {
+                                                        chosen = Some(kind);
+                                                    }
+                                                }
+                                                chosen
+                                            });
+                                        if let Some(menu) = menu {
+                                            state.menu = Some(menu.response.rect);
+                                            picked = menu.inner;
+                                        }
+                                        response.on_hover_text("Transformar em (tipo de bloco)");
                                     });
                                 });
                         });
@@ -359,8 +510,16 @@ impl App {
                         self.apply_format_bar(ctx, action);
                         return;
                     }
+                    if let Some(kind) = picked {
+                        egui::Popup::close_id(ctx, format_menu_id());
+                        self.transform_format_selection(ctx, kind);
+                        return;
+                    }
                 }
             }
+        }
+        if state.rect.is_none() {
+            egui::Popup::close_id(ctx, format_menu_id());
         }
         ctx.data_mut(|d| d.insert_temp(format_bar_id(), state));
     }
@@ -2722,11 +2881,21 @@ impl App {
         let Some((lo, hi)) = self.block_selection_range() else {
             return;
         };
+        if !self.transform_range(lo, hi, kind) {
+            return;
+        }
+        if let Some((anchor, _)) = self.block_selection {
+            self.restore_selection_focus(anchor);
+        }
+    }
+
+    /// One undo step turning the text blocks in `lo..=hi` into `kind`.
+    fn transform_range(&mut self, lo: usize, hi: usize, kind: BlockKind) -> bool {
         if !self.page.blocks[lo..=hi]
             .iter()
             .any(|b| b.kind.accepts_text() && (b.kind != kind || kind == BlockKind::Todo))
         {
-            return;
+            return false;
         }
         self.begin_change();
         for block in &mut self.page.blocks[lo..=hi] {
@@ -2748,9 +2917,7 @@ impl App {
             }
         }
         self.end_change();
-        if let Some((anchor, _)) = self.block_selection {
-            self.restore_selection_focus(anchor);
-        }
+        true
     }
 
     fn transform_block(&mut self, id: u64, kind: BlockKind) {
@@ -4111,6 +4278,200 @@ mod tests {
         h.app.block_selection = Some((h.id(1), h.id(1)));
         h.idle();
         assert!(bar_state(&h).rect.is_none());
+    }
+
+    fn block_menu_open(h: &mut Harness) {
+        h.click(bar_state(h).buttons[5].center());
+        assert!(egui::Popup::is_id_open(&h.ctx, format_menu_id()));
+        assert!(bar_state(h).menu.is_some());
+        assert!(bar_state(h).rect.is_some());
+    }
+
+    /// Center of the `kind` row in the open block-kind menu.
+    fn block_menu_row(h: &Harness, kind: BlockKind) -> egui::Pos2 {
+        let rect = bar_state(h).menu.unwrap();
+        let gap = h.ctx.global_style().spacing.item_spacing.y;
+        let n = BlockKind::ALL.len() as f32;
+        let margin = (rect.height() - (n * 30.0 + (n - 1.0) * gap)) / 2.0;
+        let i = BlockKind::ALL.iter().position(|k| *k == kind).unwrap() as f32;
+        pos2(
+            rect.center().x,
+            rect.top() + margin + i * (30.0 + gap) + 15.0,
+        )
+    }
+
+    fn pick_block_kind(h: &mut Harness, kind: BlockKind) {
+        block_menu_open(h);
+        let pos = block_menu_row(h, kind);
+        h.click(pos);
+        assert!(!egui::Popup::is_id_open(&h.ctx, format_menu_id()));
+    }
+
+    #[test]
+    fn format_bar_block_menu_transforms_text_span() {
+        let mut h = Harness::new("", &[(BlockKind::Paragraph, "palavra alvo")]);
+        h.click_in(0, 0);
+        let span = TextSpan {
+            anchor: (0, 2),
+            head: (0, 9),
+        };
+        h.app.activate_span(&h.ctx, span);
+        h.idle();
+        let undo_count = h.app.history.undo.len();
+        pick_block_kind(&mut h, BlockKind::Heading1);
+        assert_eq!(h.app.page.blocks[0].kind, BlockKind::Heading1);
+        assert_eq!(h.texts(), vec!["palavra alvo"]);
+        assert_eq!(h.app.text_span, Some(span));
+        assert_eq!(h.app.history.undo.len(), undo_count + 1);
+        assert!(bar_state(&h).rect.is_some());
+    }
+
+    #[test]
+    fn format_bar_block_menu_transforms_native_selection_keeping_focus() {
+        let mut h = Harness::new("", &[(BlockKind::Paragraph, "palavra")]);
+        h.click_in(0, 0);
+        h.app.pending = Some(PendingFocus {
+            target: Focus::Block(h.id(0)),
+            range: Some((7, 2)),
+            select_all: false,
+        });
+        h.idle();
+        let focus = h.ctx.memory(|m| m.focused());
+        assert!(focus.is_some());
+        pick_block_kind(&mut h, BlockKind::Quote);
+        assert_eq!(h.app.page.blocks[0].kind, BlockKind::Quote);
+        assert_eq!(h.texts(), vec!["palavra"]);
+        assert_eq!(h.ctx.memory(|m| m.focused()), focus);
+        let range = TextEditState::load(&h.ctx, block_te_id(h.id(0)))
+            .unwrap()
+            .cursor
+            .char_range()
+            .unwrap();
+        assert_eq!((range.secondary.index.0, range.primary.index.0), (7, 2));
+    }
+
+    #[test]
+    fn format_bar_block_menu_transforms_block_selection() {
+        let mut h = Harness::new(
+            "",
+            &[
+                (BlockKind::Paragraph, "um"),
+                (BlockKind::Todo, "dois"),
+                (BlockKind::Paragraph, "fora"),
+            ],
+        );
+        h.app.page.blocks[1].checked = true;
+        let selection = Some((h.id(0), h.id(1)));
+        h.app.block_selection = selection;
+        h.idle();
+        pick_block_kind(&mut h, BlockKind::Todo);
+        for i in [0, 1] {
+            assert_eq!(h.app.page.blocks[i].kind, BlockKind::Todo);
+            assert!(!h.app.page.blocks[i].checked);
+        }
+        assert_eq!(h.app.page.blocks[2].kind, BlockKind::Paragraph);
+        assert_eq!(h.texts(), vec!["um", "dois", "fora"]);
+        assert_eq!(h.app.block_selection, selection);
+    }
+
+    #[test]
+    fn format_bar_block_menu_undo_restores_kind_and_text() {
+        let mut h = Harness::new(
+            "",
+            &[(BlockKind::Bullet, "um"), (BlockKind::Paragraph, "dois")],
+        );
+        h.app.page.blocks[0].indent = 1;
+        h.click_in(0, 0);
+        h.app.activate_span(
+            &h.ctx,
+            TextSpan {
+                anchor: (0, 1),
+                head: (1, 2),
+            },
+        );
+        h.idle();
+        let before = h.app.page.blocks.clone();
+        pick_block_kind(&mut h, BlockKind::Code);
+        assert!(h.app.page.blocks.iter().all(|b| b.kind == BlockKind::Code));
+        assert_eq!(h.app.page.blocks[0].indent, 0);
+        h.key(Key::Z, Modifiers::COMMAND);
+        assert_eq!(
+            markdown::to_markdown(&h.app.page.blocks),
+            markdown::to_markdown(&before)
+        );
+        assert_eq!(h.texts(), vec!["um", "dois"]);
+    }
+
+    #[test]
+    fn format_bar_block_menu_marks_common_kind() {
+        let mut h = Harness::new(
+            "",
+            &[
+                (BlockKind::Heading2, "a"),
+                (BlockKind::Heading2, "b"),
+                (BlockKind::Quote, "c"),
+            ],
+        );
+        h.app.block_selection = Some((h.id(0), h.id(1)));
+        assert_eq!(
+            h.app.format_bar_common_kind(&h.ctx),
+            Some(BlockKind::Heading2)
+        );
+        h.app.block_selection = Some((h.id(1), h.id(2)));
+        assert_eq!(h.app.format_bar_common_kind(&h.ctx), None);
+        h.app.block_selection = None;
+        h.app.text_span = Some(TextSpan {
+            anchor: (0, 0),
+            head: (1, 1),
+        });
+        assert_eq!(
+            h.app.format_bar_common_kind(&h.ctx),
+            Some(BlockKind::Heading2)
+        );
+        h.app.text_span = Some(TextSpan {
+            anchor: (0, 0),
+            head: (2, 1),
+        });
+        assert_eq!(h.app.format_bar_common_kind(&h.ctx), None);
+    }
+
+    #[test]
+    fn format_bar_block_menu_escape_closes_menu_first() {
+        let mut h = selected_word();
+        let span = h.app.text_span;
+        block_menu_open(&mut h);
+        h.key(Key::Escape, Modifiers::NONE);
+        assert!(!egui::Popup::is_id_open(&h.ctx, format_menu_id()));
+        assert!(bar_state(&h).rect.is_some());
+        assert_eq!(h.app.text_span, span);
+        h.key(Key::Escape, Modifiers::NONE);
+        assert!(bar_state(&h).rect.is_none());
+        assert_eq!(h.app.text_span, span);
+    }
+
+    #[test]
+    fn format_bar_block_menu_click_outside_dismisses() {
+        let mut h = Harness::new(
+            "",
+            &[
+                (BlockKind::Paragraph, "palavra"),
+                (BlockKind::Paragraph, "outra"),
+            ],
+        );
+        h.click_in(0, 0);
+        h.app.activate_span(
+            &h.ctx,
+            TextSpan {
+                anchor: (0, 0),
+                head: (0, 7),
+            },
+        );
+        h.idle();
+        block_menu_open(&mut h);
+        h.click(pos2(850.0, 650.0));
+        assert!(!egui::Popup::is_id_open(&h.ctx, format_menu_id()));
+        assert!(bar_state(&h).rect.is_none());
+        assert_eq!(h.app.page.blocks[0].kind, BlockKind::Paragraph);
     }
 
     #[test]
