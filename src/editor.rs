@@ -101,15 +101,25 @@ impl App {
     }
 
     fn format_bar_pointer(ctx: &egui::Context) -> bool {
-        let Some(state) = ctx.data(|d| d.get_temp::<FormatBarState>(format_bar_id())) else {
-            return false;
-        };
-        let menu = state
-            .menu
-            .filter(|_| egui::Popup::is_id_open(ctx, format_menu_id()));
-        ctx.input(|i| {
-            i.pointer.interact_pos().is_some_and(|p| {
-                state.rect.is_some_and(|r| r.contains(p)) || menu.is_some_and(|r| r.contains(p))
+        [false, true].into_iter().any(|fixed| {
+            let id = if fixed {
+                format_bar_id().with("fixed")
+            } else {
+                format_bar_id()
+            };
+            let menu_id = if fixed {
+                format_menu_id().with("fixed")
+            } else {
+                format_menu_id()
+            };
+            let Some(state) = ctx.data(|d| d.get_temp::<FormatBarState>(id)) else {
+                return false;
+            };
+            let menu = state.menu.filter(|_| egui::Popup::is_id_open(ctx, menu_id));
+            ctx.input(|i| {
+                i.pointer.interact_pos().is_some_and(|p| {
+                    state.rect.is_some_and(|r| r.contains(p)) || menu.is_some_and(|r| r.contains(p))
+                })
             })
         })
     }
@@ -182,6 +192,13 @@ impl App {
 
     /// Process dismissal before the editor can collapse a selection on Escape.
     fn format_bar_input(&mut self, ctx: &egui::Context) -> bool {
+        let fixed_menu = format_menu_id().with("fixed");
+        if egui::Popup::is_id_open(ctx, fixed_menu)
+            && self.consume_pub(ctx, Key::Escape, Modifiers::NONE)
+        {
+            egui::Popup::close_id(ctx, fixed_menu);
+            return true;
+        }
         let selection = self.format_selection(ctx);
         let mut state = ctx
             .data(|d| d.get_temp::<FormatBarState>(format_bar_id()))
@@ -274,6 +291,220 @@ impl App {
         ctx.request_repaint();
     }
 
+    /// Shared controls and active styles for both toolbar placements.
+    fn format_controls(
+        &self,
+        ui: &mut Ui,
+        state: &mut FormatBarState,
+        menu_id: Id,
+    ) -> (Option<usize>, Option<BlockKind>) {
+        let ctx = ui.ctx().clone();
+        let selection = self.format_selection(&ctx);
+        let enabled = !selection.is_empty();
+        let active: Vec<bool> = (0..5)
+            .map(|action| {
+                !selection.is_empty()
+                    && selection.iter().all(|(id, a, b)| {
+                        let text = &self.page.blocks[self.index_of(*id).unwrap()].text;
+                        let start = markdown::char_to_byte(text, *a);
+                        let end = markdown::char_to_byte(text, *b);
+                        let parsed = markdown::parse_inline(text);
+                        // Ignore hidden delimiters, but require every selected content piece to carry the style.
+                        let pieces: Vec<_> = parsed
+                            .pieces
+                            .iter()
+                            .filter(|p| !p.marker && p.range.start < end && p.range.end > start)
+                            .collect();
+                        !pieces.is_empty()
+                            && pieces.iter().all(|p| {
+                                parsed.styles.iter().any(|(r, s)| {
+                                    r.start <= p.range.start.max(start)
+                                        && r.end >= p.range.end.min(end)
+                                        && [s.bold, s.italic, s.strike, s.code, s.link][action]
+                                })
+                            })
+                    })
+            })
+            .collect();
+
+        let common = self.format_bar_common_kind(&ctx);
+        let p = self.palette;
+        let mut clicked = None;
+        let mut picked = None;
+        ui.spacing_mut().item_spacing.x = 4.0;
+        ui.spacing_mut().interact_size.y = 26.0;
+        ui.horizontal(|ui| {
+            for (action, (label, tip)) in [
+                ("B", "Negrito (Ctrl B)"),
+                ("I", "Itálico (Ctrl I)"),
+                ("S", "Riscado (Ctrl ⇧ S)"),
+                ("</>", "Código inline (Ctrl E)"),
+                ("", "Link (Ctrl ⇧ K)"),
+            ]
+            .into_iter()
+            .enumerate()
+            {
+                let response = ui.add_enabled(enabled, |ui: &mut Ui| {
+                    ui.allocate_exact_size(vec2(26.0, 26.0), Sense::CLICK).1
+                });
+                let rect = response.rect;
+                state.buttons.push(rect);
+                if active[action] || response.hovered() {
+                    ui.painter().rect_filled(
+                        rect,
+                        4,
+                        if active[action] {
+                            p.accent_soft
+                        } else {
+                            p.hover
+                        },
+                    );
+                }
+                let color = if !enabled {
+                    p.faint
+                } else if active[action] {
+                    p.accent
+                } else {
+                    p.text
+                };
+                if action == 4 {
+                    // Two interlocking links, drawn with the app's vector palette.
+                    for delta in [-3.0, 3.0] {
+                        ui.painter().rect_stroke(
+                            Rect::from_center_size(
+                                rect.center() + vec2(delta, -delta),
+                                vec2(10.0, 7.0),
+                            ),
+                            3,
+                            Stroke::new(1.3, color),
+                            egui::StrokeKind::Inside,
+                        );
+                    }
+                    ui.painter().line_segment(
+                        [
+                            rect.center() - vec2(3.0, -3.0),
+                            rect.center() + vec2(3.0, -3.0),
+                        ],
+                        Stroke::new(1.3, color),
+                    );
+                } else {
+                    ui.painter().text(
+                        rect.center(),
+                        Align2::CENTER_CENTER,
+                        label,
+                        FontId::proportional(14.0),
+                        color,
+                    );
+                }
+                if response.clicked() {
+                    clicked = Some(action);
+                }
+                response.on_hover_text(tip);
+            }
+            let response = ui.add_enabled(enabled, |ui: &mut Ui| {
+                ui.allocate_exact_size(vec2(26.0, 26.0), Sense::CLICK).1
+            });
+            let rect = response.rect;
+            state.buttons.push(rect);
+            let open = egui::Popup::is_id_open(&ctx, menu_id);
+            if open || response.hovered() {
+                ui.painter()
+                    .rect_filled(rect, 4, if open { p.accent_soft } else { p.hover });
+            }
+            let color = if !enabled {
+                p.faint
+            } else if open {
+                p.accent
+            } else {
+                p.text
+            };
+            ui.painter().text(
+                rect.center() - vec2(3.0, 0.0),
+                Align2::CENTER_CENTER,
+                "T",
+                FontId::proportional(14.0),
+                color,
+            );
+            // Drawn caret: the bundled fonts may lack "▾".
+            let c = rect.center() + vec2(6.0, 1.0);
+            ui.painter().add(egui::Shape::convex_polygon(
+                vec![
+                    c + vec2(-3.0, -1.5),
+                    c + vec2(3.0, -1.5),
+                    c + vec2(0.0, 2.0),
+                ],
+                color,
+                Stroke::NONE,
+            ));
+            let menu = egui::Popup::menu(&response)
+                .id(menu_id)
+                .width(220.0)
+                .show(|ui| {
+                    ui.set_width(220.0);
+                    let mut chosen = None;
+                    for kind in BlockKind::ALL {
+                        let selected = common == Some(kind);
+                        if widgets::menu_row(
+                            ui,
+                            &format!("{}{}", if selected { "● " } else { "" }, kind.label()),
+                            None,
+                            false,
+                            selected,
+                            &p,
+                        )
+                        .clicked()
+                        {
+                            chosen = Some(kind);
+                        }
+                    }
+                    chosen
+                });
+            if let Some(menu) = menu {
+                state.menu = Some(menu.response.rect);
+                picked = menu.inner;
+            }
+            response.on_hover_text("Transformar em (tipo de bloco)");
+        });
+        (clicked, picked)
+    }
+
+    fn dispatch_format_controls(
+        &mut self,
+        ctx: &egui::Context,
+        menu_id: Id,
+        (clicked, picked): (Option<usize>, Option<BlockKind>),
+    ) {
+        if let Some(action) = clicked {
+            self.apply_format_bar(ctx, action);
+        }
+        if let Some(kind) = picked {
+            egui::Popup::close_id(ctx, menu_id);
+            self.transform_format_selection(ctx, kind);
+        }
+    }
+
+    fn fixed_format_bar(&mut self, ui: &mut Ui) {
+        let id = format_bar_id().with("fixed");
+        let mut state = FormatBarState::default();
+        let mut clicked = (None, None);
+        if self.format_bar_visible {
+            let p = self.palette;
+            let output = Frame::new()
+                .fill(p.elevated)
+                .inner_margin(4)
+                .show(ui, |ui| {
+                    ui.set_min_width(ui.available_width());
+                    clicked = self.format_controls(ui, &mut state, format_menu_id().with("fixed"));
+                });
+            state.rect = Some(output.response.rect);
+            widgets::hairline(ui, &p);
+        } else {
+            egui::Popup::close_id(ui.ctx(), format_menu_id().with("fixed"));
+        }
+        ui.ctx().data_mut(|d| d.insert_temp(id, state));
+        self.dispatch_format_controls(ui.ctx(), format_menu_id().with("fixed"), clicked);
+    }
+
     /// Foreground area emitted after all editor text and selection painting.
     fn format_bar(&mut self, ctx: &egui::Context, viewport: Rect) {
         let selection = self.format_selection(ctx);
@@ -325,37 +556,8 @@ impl App {
                             .y
                             .clamp(bounds.top(), (bounds.bottom() - size.y).max(bounds.top())),
                     );
-                    let active: Vec<bool> = (0..5)
-                        .map(|action| {
-                            selection.iter().all(|(id, a, b)| {
-                                let text = &self.page.blocks[self.index_of(*id).unwrap()].text;
-                                let start = markdown::char_to_byte(text, *a);
-                                let end = markdown::char_to_byte(text, *b);
-                                let parsed = markdown::parse_inline(text);
-                                // Ignore hidden delimiters, but require every selected content piece to carry the style.
-                                let pieces: Vec<_> = parsed
-                                    .pieces
-                                    .iter()
-                                    .filter(|p| {
-                                        !p.marker && p.range.start < end && p.range.end > start
-                                    })
-                                    .collect();
-                                !pieces.is_empty()
-                                    && pieces.iter().all(|p| {
-                                        parsed.styles.iter().any(|(r, s)| {
-                                            r.start <= p.range.start.max(start)
-                                                && r.end >= p.range.end.min(end)
-                                                && [s.bold, s.italic, s.strike, s.code, s.link]
-                                                    [action]
-                                        })
-                                    })
-                            })
-                        })
-                        .collect();
-                    let mut clicked = None;
-                    let mut picked = None;
-                    let common = self.format_bar_common_kind(ctx);
                     let p = self.palette;
+                    let mut clicked = (None, None);
                     let output = egui::Area::new(format_bar_id())
                         .order(egui::Order::Foreground)
                         .movable(false)
@@ -374,145 +576,14 @@ impl App {
                                     color: p.shadow,
                                 })
                                 .show(ui, |ui| {
-                                    ui.spacing_mut().item_spacing.x = 4.0;
-                                    ui.spacing_mut().interact_size.y = 26.0;
-                                    ui.horizontal(|ui| {
-                                        for (action, (label, tip)) in [
-                                            ("B", "Negrito (Ctrl B)"),
-                                            ("I", "Itálico (Ctrl I)"),
-                                            ("S", "Riscado (Ctrl ⇧ S)"),
-                                            ("</>", "Código inline (Ctrl E)"),
-                                            ("", "Link (Ctrl ⇧ K)"),
-                                        ]
-                                        .into_iter()
-                                        .enumerate()
-                                        {
-                                            let (rect, response) = ui.allocate_exact_size(
-                                                vec2(26.0, 26.0),
-                                                Sense::CLICK,
-                                            );
-                                            state.buttons.push(rect);
-                                            if active[action] || response.hovered() {
-                                                ui.painter().rect_filled(
-                                                    rect,
-                                                    4,
-                                                    if active[action] {
-                                                        p.accent_soft
-                                                    } else {
-                                                        p.hover
-                                                    },
-                                                );
-                                            }
-                                            let color =
-                                                if active[action] { p.accent } else { p.text };
-                                            if action == 4 {
-                                                // Two interlocking links, drawn with the app's vector palette.
-                                                for delta in [-3.0, 3.0] {
-                                                    ui.painter().rect_stroke(
-                                                        Rect::from_center_size(
-                                                            rect.center() + vec2(delta, -delta),
-                                                            vec2(10.0, 7.0),
-                                                        ),
-                                                        3,
-                                                        Stroke::new(1.3, color),
-                                                        egui::StrokeKind::Inside,
-                                                    );
-                                                }
-                                                ui.painter().line_segment(
-                                                    [
-                                                        rect.center() - vec2(3.0, -3.0),
-                                                        rect.center() + vec2(3.0, -3.0),
-                                                    ],
-                                                    Stroke::new(1.3, color),
-                                                );
-                                            } else {
-                                                ui.painter().text(
-                                                    rect.center(),
-                                                    Align2::CENTER_CENTER,
-                                                    label,
-                                                    FontId::proportional(14.0),
-                                                    color,
-                                                );
-                                            }
-                                            if response.clicked() {
-                                                clicked = Some(action);
-                                            }
-                                            response.on_hover_text(tip);
-                                        }
-                                        let (rect, response) =
-                                            ui.allocate_exact_size(vec2(26.0, 26.0), Sense::CLICK);
-                                        state.buttons.push(rect);
-                                        let open = egui::Popup::is_id_open(ctx, format_menu_id());
-                                        if open || response.hovered() {
-                                            ui.painter().rect_filled(
-                                                rect,
-                                                4,
-                                                if open { p.accent_soft } else { p.hover },
-                                            );
-                                        }
-                                        let color = if open { p.accent } else { p.text };
-                                        ui.painter().text(
-                                            rect.center() - vec2(3.0, 0.0),
-                                            Align2::CENTER_CENTER,
-                                            "T",
-                                            FontId::proportional(14.0),
-                                            color,
-                                        );
-                                        // Drawn caret: the bundled fonts may lack "▾".
-                                        let c = rect.center() + vec2(6.0, 1.0);
-                                        ui.painter().add(egui::Shape::convex_polygon(
-                                            vec![
-                                                c + vec2(-3.0, -1.5),
-                                                c + vec2(3.0, -1.5),
-                                                c + vec2(0.0, 2.0),
-                                            ],
-                                            color,
-                                            Stroke::NONE,
-                                        ));
-                                        let menu = egui::Popup::menu(&response)
-                                            .id(format_menu_id())
-                                            .width(220.0)
-                                            .show(|ui| {
-                                                ui.set_width(220.0);
-                                                let mut chosen = None;
-                                                for kind in BlockKind::ALL {
-                                                    let selected = common == Some(kind);
-                                                    if widgets::menu_row(
-                                                        ui,
-                                                        &format!(
-                                                            "{}{}",
-                                                            if selected { "● " } else { "" },
-                                                            kind.label()
-                                                        ),
-                                                        None,
-                                                        false,
-                                                        selected,
-                                                        &p,
-                                                    )
-                                                    .clicked()
-                                                    {
-                                                        chosen = Some(kind);
-                                                    }
-                                                }
-                                                chosen
-                                            });
-                                        if let Some(menu) = menu {
-                                            state.menu = Some(menu.response.rect);
-                                            picked = menu.inner;
-                                        }
-                                        response.on_hover_text("Transformar em (tipo de bloco)");
-                                    });
+                                    clicked =
+                                        self.format_controls(ui, &mut state, format_menu_id());
                                 });
                         });
                     state.rect = Some(output.response.rect);
                     ctx.data_mut(|d| d.insert_temp(format_bar_id(), state.clone()));
-                    if let Some(action) = clicked {
-                        self.apply_format_bar(ctx, action);
-                        return;
-                    }
-                    if let Some(kind) = picked {
-                        egui::Popup::close_id(ctx, format_menu_id());
-                        self.transform_format_selection(ctx, kind);
+                    if clicked.0.is_some() || clicked.1.is_some() {
+                        self.dispatch_format_controls(ctx, format_menu_id(), clicked);
                         return;
                     }
                 }
@@ -556,6 +627,8 @@ impl App {
         }
         self.header(ui, actions);
         widgets::hairline(ui, &p);
+
+        self.fixed_format_bar(ui);
 
         let page_id = self.current.unwrap_or(0);
         let mut scroll = egui::ScrollArea::vertical()
@@ -4123,6 +4196,115 @@ mod tests {
         );
         h.idle();
         h
+    }
+
+    fn fixed_bar_state(h: &Harness) -> FormatBarState {
+        h.ctx
+            .data(|d| d.get_temp(format_bar_id().with("fixed")))
+            .unwrap()
+    }
+
+    #[test]
+    fn fixed_format_bar_visibility_and_disabled_controls() {
+        let mut h = Harness::new("", &[(BlockKind::Paragraph, "palavra")]);
+        assert!(fixed_bar_state(&h).rect.is_none());
+        h.app.format_bar_visible = true;
+        h.idle();
+        assert_eq!(fixed_bar_state(&h).buttons.len(), 6);
+        for button in fixed_bar_state(&h).buttons {
+            h.click(button.center());
+        }
+        assert_eq!(h.texts(), vec!["palavra"]);
+        assert!(!egui::Popup::is_id_open(
+            &h.ctx,
+            format_menu_id().with("fixed")
+        ));
+        h.app.page.blocks[0].kind = BlockKind::Divider;
+        h.app.block_selection = Some((h.id(0), h.id(0)));
+        h.idle();
+        h.click(fixed_bar_state(&h).buttons[5].center());
+        assert!(!egui::Popup::is_id_open(
+            &h.ctx,
+            format_menu_id().with("fixed")
+        ));
+        h.app.format_bar_visible = false;
+        h.idle();
+        assert!(fixed_bar_state(&h).rect.is_none());
+    }
+
+    #[test]
+    fn fixed_format_bar_native_selection_focus_typing_and_undo() {
+        let mut h = Harness::new("", &[(BlockKind::Paragraph, "palavra alvo")]);
+        h.app.format_bar_visible = true;
+        h.caret_in(0, 0);
+        h.app.pending = Some(PendingFocus {
+            target: Focus::Block(h.id(0)),
+            range: Some((7, 0)),
+            select_all: false,
+        });
+        h.idle();
+        let focus = h.ctx.memory(|m| m.focused());
+        h.click(fixed_bar_state(&h).buttons[0].center());
+        assert_eq!(h.texts(), vec!["**palavra** alvo"]);
+        assert_eq!(h.ctx.memory(|m| m.focused()), focus);
+        assert!(h.app.text_span.is_none());
+        let range = TextEditState::load(&h.ctx, block_te_id(h.id(0)))
+            .unwrap()
+            .cursor
+            .char_range()
+            .unwrap();
+        assert_eq!((range.secondary.index.0, range.primary.index.0), (9, 2));
+        h.key(Key::Z, Modifiers::COMMAND);
+        assert_eq!(h.texts(), vec!["palavra alvo"]);
+        h.type_text("X");
+        assert!(h.app.page.blocks[0].text.contains('X'));
+        assert_eq!(h.ctx.memory(|m| m.focused()), focus);
+    }
+
+    #[test]
+    fn fixed_format_bar_escape_closes_menu_without_collapsing_selection() {
+        let mut h = selected_word();
+        h.app.format_bar_visible = true;
+        h.idle();
+        let span = h.app.text_span;
+        h.click(fixed_bar_state(&h).buttons[5].center());
+        let menu_id = format_menu_id().with("fixed");
+        assert!(egui::Popup::is_id_open(&h.ctx, menu_id));
+        h.key(Key::Escape, Modifiers::NONE);
+        assert!(!egui::Popup::is_id_open(&h.ctx, menu_id));
+        assert_eq!(h.app.text_span, span);
+        assert!(fixed_bar_state(&h).rect.is_some());
+    }
+
+    #[test]
+    fn fixed_format_bar_type_menu_preserves_span_and_single_undo() {
+        let mut h = selected_word();
+        h.app.format_bar_visible = true;
+        h.idle();
+        let span = h.app.text_span;
+        let count = h.app.history.undo.len();
+        h.click(fixed_bar_state(&h).buttons[5].center());
+        let menu_id = format_menu_id().with("fixed");
+        assert!(egui::Popup::is_id_open(&h.ctx, menu_id));
+        let rect = fixed_bar_state(&h).menu.unwrap();
+        let gap = h.ctx.global_style().spacing.item_spacing.y;
+        let n = BlockKind::ALL.len() as f32;
+        let margin = (rect.height() - (n * 30.0 + (n - 1.0) * gap)) / 2.0;
+        let i = BlockKind::ALL
+            .iter()
+            .position(|k| *k == BlockKind::Heading1)
+            .unwrap() as f32;
+        h.click(pos2(
+            rect.center().x,
+            rect.top() + margin + i * (30.0 + gap) + 15.0,
+        ));
+        assert_eq!(h.app.page.blocks[0].kind, BlockKind::Heading1);
+        assert_eq!(h.texts(), vec!["palavra"]);
+        assert_eq!(h.app.text_span, span);
+        assert_eq!(h.app.history.undo.len(), count + 1);
+        h.key(Key::Z, Modifiers::COMMAND);
+        assert_eq!(h.app.page.blocks[0].kind, BlockKind::Paragraph);
+        assert_eq!(h.texts(), vec!["palavra"]);
     }
 
     #[test]

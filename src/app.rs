@@ -72,6 +72,7 @@ pub enum Action {
     ToggleFavorite(PageId),
     ToggleCollapsed(PageId),
     ToggleSidebar,
+    ToggleFormatBar,
     ToggleTheme,
     OpenSearch,
     OpenShortcuts,
@@ -174,6 +175,7 @@ pub struct App {
     pub emoji_picker: Option<Pos2>,
 
     pub sidebar_visible: bool,
+    pub format_bar_visible: bool,
     /// Ultimo rect da barra lateral (coordenadas de tela), usado para saber
     /// se o ponteiro esta sobre ela nos gestos de pagina.
     pub sidebar_rect: Option<Rect>,
@@ -379,6 +381,7 @@ impl App {
             page_menu: None,
             emoji_picker: None,
             sidebar_visible: true,
+            format_bar_visible: false,
             sidebar_rect: None,
             search: SearchState::default(),
             shortcuts_open: false,
@@ -425,6 +428,8 @@ impl App {
             .flatten()
             .map(|value| Mode::from_str(&value))
             .unwrap_or(Mode::Light);
+        self.format_bar_visible =
+            store.setting("format_bar").ok().flatten().as_deref() == Some("1");
         self.palette = palette(self.mode);
         self.pages = store.list_pages().unwrap_or_default();
 
@@ -1648,6 +1653,15 @@ impl App {
             }
             Action::ToggleCollapsed(id) => self.toggle_collapsed(id),
             Action::ToggleSidebar => self.sidebar_visible = !self.sidebar_visible,
+            Action::ToggleFormatBar => {
+                self.format_bar_visible = !self.format_bar_visible;
+                if let Some(store) = self.store.as_mut() {
+                    let _ = store.set_setting(
+                        "format_bar",
+                        if self.format_bar_visible { "1" } else { "0" },
+                    );
+                }
+            }
             Action::ToggleTheme => self.set_theme(self.mode.toggled()),
             Action::SetTheme(mode) => self.set_theme(mode),
             Action::SetZoom(zoom) => self.set_zoom(zoom),
@@ -2837,6 +2851,38 @@ mod tests {
         app.reload_pages();
         app.current = Some(b.id);
         (app, path, a.id, b.id, c.id)
+    }
+
+    #[test]
+    fn format_bar_setting_defaults_off_and_survives_reopening() {
+        let (mut app, path, ..) = seeded_root_app("format-bar-setting");
+        let ctx = Context::default();
+        app.boot();
+        assert!(!app.format_bar_visible);
+        assert_eq!(
+            app.store.as_ref().unwrap().setting("format_bar").unwrap(),
+            None
+        );
+        for (value, visible) in [("1", true), ("0", false)] {
+            app.apply_action(Action::ToggleFormatBar, &ctx);
+            assert_eq!(app.format_bar_visible, visible);
+            assert_eq!(
+                app.store
+                    .as_ref()
+                    .unwrap()
+                    .setting("format_bar")
+                    .unwrap()
+                    .as_deref(),
+                Some(value)
+            );
+            drop(app);
+            app = App::blank();
+            app.store = Some(Store::open(&path).unwrap());
+            app.boot();
+            assert_eq!(app.format_bar_visible, visible);
+        }
+        drop(app);
+        let _ = std::fs::remove_file(path);
     }
 
     /// Roda `handle_keys` com um ponteiro e uma tecla, mantendo um TextEdit

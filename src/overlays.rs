@@ -831,6 +831,7 @@ impl App {
         let mode = self.mode;
         let zoom = self.zoom;
         let mut sidebar_visible = self.sidebar_visible;
+        let mut format_bar_visible = self.format_bar_visible;
         let update = self.update.clone();
         let db_path = self.store.as_ref().map(|store| store.path().to_path_buf());
         let page_count = self.pages.len();
@@ -909,6 +910,15 @@ impl App {
                             .changed()
                         {
                             actions.push(Action::ToggleSidebar);
+                        }
+                    });
+
+                    setting_row(ui, "Barra de formatação", &p, |ui| {
+                        if ui
+                            .checkbox(&mut format_bar_visible, "Mostrar barra fixa")
+                            .changed()
+                        {
+                            actions.push(Action::ToggleFormatBar);
                         }
                     });
 
