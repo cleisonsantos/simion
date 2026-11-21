@@ -734,6 +734,9 @@ impl App {
                         "Essencial",
                         &[
                             ("Ctrl K", "Buscar em todas as páginas"),
+                            ("Alt R", "Busca: usar expressão regular"),
+                            ("Alt C", "Busca: diferenciar maiúsculas e minúsculas"),
+                            ("Alt W", "Busca: palavra inteira"),
                             ("Ctrl N", "Nova subpágina"),
                             ("Ctrl S", "Salvar agora"),
                             ("Ctrl \\", "Mostrar ou ocultar a barra lateral"),

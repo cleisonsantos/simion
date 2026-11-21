@@ -9,7 +9,7 @@ use eframe::egui::{
 
 use crate::app::{Action, App};
 use crate::icons;
-use crate::store::SearchHit;
+use crate::store::{SearchHit, SearchOptions};
 use crate::text::plural;
 use crate::theme::{FONT_BODY, FONT_SEMIBOLD, Palette, family};
 use crate::ui as widgets;
@@ -17,6 +17,10 @@ use crate::ui as widgets;
 #[derive(Default)]
 pub struct SearchState {
     pub open: bool,
+    pub regex: bool,
+    pub match_case: bool,
+    pub whole_word: bool,
+    pub error: Option<String>,
     pub query: String,
     pub results: Vec<SearchHit>,
     pub selected: usize,
@@ -27,6 +31,7 @@ pub struct SearchState {
 
 impl App {
     pub fn search_recent(&mut self) {
+        self.search.error = None;
         let mut pages = self.pages.clone();
         pages.sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
         self.search.results = pages
@@ -44,16 +49,28 @@ impl App {
 
     pub fn run_search(&mut self) {
         let query = self.search.query.trim().to_owned();
+        self.search.error = None;
         if query.is_empty() {
             self.search_recent();
             return;
         }
-        let results = self
+        let options = SearchOptions {
+            regex: self.search.regex,
+            match_case: self.search.match_case,
+            whole_word: self.search.whole_word,
+        };
+        self.search.results = match self
             .store
             .as_ref()
-            .and_then(|store| store.search(&query, 50).ok())
-            .unwrap_or_default();
-        self.search.results = results;
+            .map(|store| store.search_with(&query, options, 50))
+        {
+            Some(Ok(results)) => results,
+            Some(Err(error)) => {
+                self.search.error = Some(error.to_string());
+                Vec::new()
+            }
+            None => Vec::new(),
+        };
         self.search.selected = self
             .search
             .selected
@@ -61,6 +78,26 @@ impl App {
     }
 
     pub fn search_keys(&mut self, ctx: &Context) {
+        if !self.search.open {
+            return;
+        }
+        let mut changed = false;
+        for (key, option) in [(egui::Key::R, 0), (egui::Key::C, 1), (egui::Key::W, 2)] {
+            if self.consume_pub(ctx, key, egui::Modifiers::ALT) {
+                match option {
+                    0 => self.search.regex = !self.search.regex,
+                    1 => self.search.match_case = !self.search.match_case,
+                    _ => self.search.whole_word = !self.search.whole_word,
+                }
+                changed = true;
+            }
+        }
+        if changed {
+            // Linux may emit text alongside an Alt shortcut. Keep it out of the query.
+            ctx.input_mut(|i| i.events.retain(|e| !matches!(e, egui::Event::Text(_))));
+            self.run_search();
+            self.search.selected = 0;
+        }
         if self.consume_pub(ctx, egui::Key::Escape, egui::Modifiers::NONE)
             || self.consume_pub(ctx, egui::Key::K, egui::Modifiers::COMMAND)
         {
@@ -99,8 +136,8 @@ impl App {
         let selected = self.search.selected;
         let scroll_selected = self.search.scroll_selected;
         let focus_pending = self.search.focus_pending;
-        let mut query = std::mem::take(&mut self.search.query);
-        let new_query;
+        let mut query = self.search.query.clone();
+        let mut options_changed = false;
         let mut open_page: Option<i64> = None;
         let mut new_selected = selected;
 
@@ -128,7 +165,7 @@ impl App {
                 ui.add_space(2.0);
                 let (icon_rect, _) = ui.allocate_exact_size(vec2(18.0, 18.0), Sense::hover());
                 icons::search(ui.painter(), icon_rect, p.faint, 1.6);
-                let available = (ui.available_width() - 54.0).max(80.0);
+                let available = (ui.available_width() - 174.0).max(80.0);
                 let input = TextEdit::singleline(&mut query)
                     .id(input_id)
                     .frame(egui::Frame::NONE)
@@ -145,11 +182,48 @@ impl App {
                 if focus_pending {
                     output.response.request_focus();
                 }
+                for (label, enabled, tooltip) in [
+                    (
+                        ".*",
+                        &mut self.search.regex,
+                        "Usar expressão regular (Alt+R)",
+                    ),
+                    (
+                        "Aa",
+                        &mut self.search.match_case,
+                        "Diferenciar maiúsculas e minúsculas (Alt+C)",
+                    ),
+                    (
+                        "ab|",
+                        &mut self.search.whole_word,
+                        "Buscar palavra inteira (Alt+W)",
+                    ),
+                ] {
+                    let button =
+                        egui::Button::new(RichText::new(label).monospace().color(if *enabled {
+                            p.accent_text
+                        } else {
+                            p.muted
+                        }))
+                        .fill(if *enabled { p.accent_soft } else { p.bg })
+                        .stroke(egui::Stroke::new(
+                            1.0,
+                            if *enabled { p.accent_text } else { p.faint },
+                        ))
+                        .selected(*enabled);
+                    if ui.add(button).on_hover_text(tooltip).clicked() {
+                        *enabled = !*enabled;
+                        options_changed = true;
+                    }
+                }
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     widgets::key_hint(ui, "Esc", &p);
                 });
             });
 
+            if let Some(error) = &self.search.error {
+                ui.colored_label(Color32::from_rgb(220, 65, 65), error);
+            }
             ui.add_space(6.0);
             widgets::hairline(ui, &p);
             ui.add_space(4.0);
@@ -213,11 +287,10 @@ impl App {
             self.search.open = false;
         }
 
-        new_query = query.clone();
-        if self.search.query != new_query {
-            self.search.query = new_query;
+        if self.search.query != query || options_changed {
+            self.search.query = query;
             self.run_search();
-            self.search.selected = 0;
+            new_selected = 0;
         }
         self.search.selected = new_selected.min(self.search.results.len().saturating_sub(1));
         self.search.focus_pending = false;
@@ -229,6 +302,67 @@ impl App {
         }
 
         actions
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn frame(app: &mut App, ctx: &Context, events: Vec<egui::Event>) {
+        let mut output = ctx.run_ui(
+            egui::RawInput {
+                screen_rect: Some(Rect::from_min_size(pos2(0.0, 0.0), vec2(1000.0, 700.0))),
+                events,
+                ..Default::default()
+            },
+            |ui| {
+                app.search_keys(ui.ctx());
+                app.search_overlay(ui.ctx());
+            },
+        );
+        output.textures_delta.clear();
+    }
+
+    #[test]
+    fn alt_toggles_preserve_query_and_allow_typing_next_frame() {
+        for (key, text) in [
+            (egui::Key::R, "r"),
+            (egui::Key::C, "c"),
+            (egui::Key::W, "w"),
+        ] {
+            for with_text in [false, true] {
+                let ctx = Context::default();
+                crate::theme::install_fonts(&ctx);
+                let mut app = App::blank();
+                app.search.open = true;
+                app.search.focus_pending = true;
+                frame(&mut app, &ctx, vec![]);
+                frame(&mut app, &ctx, vec![egui::Event::Text("alpha".into())]);
+                assert_eq!(app.search.query, "alpha");
+
+                for enabled in [true, false] {
+                    let mut events = vec![egui::Event::Key {
+                        key,
+                        physical_key: Some(key),
+                        pressed: true,
+                        repeat: false,
+                        modifiers: egui::Modifiers::ALT,
+                    }];
+                    if with_text {
+                        events.push(egui::Event::Text(text.into()));
+                    }
+                    frame(&mut app, &ctx, events);
+                    assert_eq!(app.search.query, "alpha");
+                    assert_eq!(app.search.regex, enabled && key == egui::Key::R);
+                    assert_eq!(app.search.match_case, enabled && key == egui::Key::C);
+                    assert_eq!(app.search.whole_word, enabled && key == egui::Key::W);
+                }
+
+                frame(&mut app, &ctx, vec![egui::Event::Text(" beta".into())]);
+                assert_eq!(app.search.query, "alpha beta");
+            }
+        }
     }
 }
 

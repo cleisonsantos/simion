@@ -16,6 +16,7 @@ image = { version = "0.25", default-features = false, features = ["png", "jpeg",
 # Decodifica o PNG da marca para o icone da janela (ver src/icon.rs, #2).
 # `png` ja esta na arvore via eframe; declarar aqui evita depender de reexport.
 png = { version = "0.18", default-features = false }
+regex = "1.13.1"
 rusqlite = { version = "0.40.2", features = ["bundled", "functions"] }
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.154"

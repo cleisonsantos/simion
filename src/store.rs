@@ -58,6 +58,86 @@ pub struct Store {
     path: PathBuf,
 }
 
+/// Options shared by the search overlay and store callers.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct SearchOptions {
+    pub regex: bool,
+    pub match_case: bool,
+    pub whole_word: bool,
+}
+
+const MAX_MATCHES_PER_BLOCK: usize = 200;
+
+struct SearchPattern {
+    regex: regex::Regex,
+    options: SearchOptions,
+}
+
+impl SearchPattern {
+    fn new(query: &str, options: SearchOptions) -> Result<Self> {
+        let pattern = if options.regex {
+            // Validate before wrapping: a trailing backslash must remain an error.
+            regex::RegexBuilder::new(query)
+                .case_insensitive(!options.match_case)
+                .unicode(true)
+                .build()
+                .map_err(|err| anyhow::anyhow!("Expressão regular inválida: {err}"))?;
+            query.to_owned()
+        } else {
+            regex::escape(&search_fold(query, options.match_case))
+        };
+        let pattern = if options.whole_word {
+            format!(r"\b(?:{pattern})\b")
+        } else {
+            pattern
+        };
+        let regex = regex::RegexBuilder::new(&pattern)
+            .case_insensitive(options.regex && !options.match_case)
+            .unicode(true)
+            .build()
+            .map_err(|err| anyhow::anyhow!("Expressão regular inválida: {err}"))?;
+        Ok(Self { regex, options })
+    }
+
+    fn matches(&self, text: &str) -> Vec<std::ops::Range<usize>> {
+        let text = if self.options.regex {
+            text.to_owned()
+        } else {
+            search_fold(text, self.options.match_case)
+        };
+        self.regex
+            .find_iter(&text)
+            .take(MAX_MATCHES_PER_BLOCK)
+            .map(|m| m.range())
+            .collect()
+    }
+}
+
+fn search_fold(text: &str, match_case: bool) -> String {
+    if !match_case {
+        return fold(text);
+    }
+    text.chars()
+        .map(|ch| match ch {
+            'á' | 'à' | 'â' | 'ã' | 'ä' => 'a',
+            'é' | 'è' | 'ê' | 'ë' => 'e',
+            'í' | 'ì' | 'î' | 'ï' => 'i',
+            'ó' | 'ò' | 'ô' | 'õ' | 'ö' => 'o',
+            'ú' | 'ù' | 'û' | 'ü' => 'u',
+            'ç' => 'c',
+            'ñ' => 'n',
+            'Á' | 'À' | 'Â' | 'Ã' | 'Ä' => 'A',
+            'É' | 'È' | 'Ê' | 'Ë' => 'E',
+            'Í' | 'Ì' | 'Î' | 'Ï' => 'I',
+            'Ó' | 'Ò' | 'Ô' | 'Õ' | 'Ö' => 'O',
+            'Ú' | 'Ù' | 'Û' | 'Ü' => 'U',
+            'Ç' => 'C',
+            'Ñ' => 'N',
+            other => other,
+        })
+        .collect()
+}
+
 #[derive(Clone, Debug)]
 pub struct SearchHit {
     pub page_id: PageId,
@@ -516,75 +596,62 @@ impl Store {
     }
 
     pub fn search(&self, query: &str, limit: usize) -> Result<Vec<SearchHit>> {
+        self.search_with(query, SearchOptions::default(), limit)
+    }
+
+    pub fn search_with(
+        &self,
+        query: &str,
+        options: SearchOptions,
+        limit: usize,
+    ) -> Result<Vec<SearchHit>> {
         let query = query.trim();
+        let pattern = SearchPattern::new(query, options)?;
         if query.is_empty() {
             return Ok(Vec::new());
         }
-        let limit = limit.clamp(1, 200) as i64;
-        let mut hits: Vec<SearchHit> = Vec::new();
-        let mut seen: std::collections::HashSet<PageId> = std::collections::HashSet::new();
-
-        let folded_query = fold(query);
-
-        // Title matches first.
-        {
-            let mut stmt = self.conn.prepare(
-                "SELECT id, title, icon FROM pages
-                 WHERE instr(fold(title), ?1) > 0
-                 ORDER BY updated_at DESC LIMIT ?2",
-            )?;
-            let rows = stmt.query_map(params![folded_query, limit], |row| {
-                Ok(SearchHit {
-                    page_id: row.get(0)?,
-                    title: row.get(1)?,
-                    icon: row.get(2)?,
-                    snippet: String::new(),
-                })
-            })?;
-            for row in rows {
-                let hit = row?;
-                seen.insert(hit.page_id);
-                hits.push(hit);
-            }
-        }
-
-        // Then block text matches.
-        if (hits.len() as i64) < limit {
-            let mut stmt = self.conn.prepare(
+        let limit = limit.clamp(1, 200);
+        let mut hits = Vec::new();
+        let mut seen = HashSet::new();
+        // Titles retain priority over block matches, with one hit per page.
+        for titles in [true, false] {
+            let sql = if titles {
+                "SELECT id, title, icon, title FROM pages ORDER BY updated_at DESC"
+            } else {
                 "SELECT p.id, p.title, p.icon, b.text
                  FROM blocks b JOIN pages p ON p.id = b.page_id
-                 WHERE b.kind != 'image' AND instr(fold(b.text), ?1) > 0
-                 ORDER BY p.updated_at DESC LIMIT ?2",
-            )?;
-            let rows = stmt.query_map(params![folded_query, limit * 4], |row| {
-                let text: String = row.get(3)?;
+                 WHERE b.kind != 'image' ORDER BY p.updated_at DESC"
+            };
+            let mut stmt = self.conn.prepare(sql)?;
+            let rows = stmt.query_map([], |row| {
                 Ok((
-                    SearchHit {
-                        page_id: row.get(0)?,
-                        title: row.get(1)?,
-                        icon: row.get(2)?,
-                        snippet: snippet(&text, query),
-                    },
-                    text,
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
                 ))
             })?;
             for row in rows {
-                let (mut hit, text) = row?;
-                if seen.contains(&hit.page_id) {
+                let (page_id, title, icon, text) = row?;
+                if seen.contains(&page_id) || pattern.matches(&text).is_empty() {
                     continue;
                 }
-                // Make sure the snippet actually contains the term.
-                if hit.snippet.is_empty() {
-                    hit.snippet = snippet(&text, query);
-                }
-                seen.insert(hit.page_id);
-                hits.push(hit);
-                if hits.len() as i64 >= limit {
-                    break;
+                seen.insert(page_id);
+                hits.push(SearchHit {
+                    page_id,
+                    title,
+                    icon,
+                    snippet: if titles {
+                        String::new()
+                    } else {
+                        snippet(&text, query)
+                    },
+                });
+                if hits.len() >= limit {
+                    return Ok(hits);
                 }
             }
         }
-
         Ok(hits)
     }
 
@@ -934,6 +1001,132 @@ mod tests {
 
         store.delete_page(meta.id).unwrap();
         assert!(store.load_page(meta.id).unwrap().is_none());
+        drop(store);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn search_options_combine_on_titles_and_blocks() {
+        let (mut store, path) = temp_store();
+        store.conn.execute("DELETE FROM pages", []).unwrap();
+        let meta = store.create_page(None, "Árvore", "", unix_now()).unwrap();
+        store
+            .save_page(&Page {
+                meta,
+                blocks: vec![Block::with_text(1, BlockKind::Paragraph, "Pré ação pós")],
+            })
+            .unwrap();
+        let default = SearchOptions::default();
+        let sensitive = SearchOptions {
+            match_case: true,
+            ..default
+        };
+        assert_eq!(store.search_with("arvore", default, 10).unwrap().len(), 1);
+        assert!(
+            store
+                .search_with("arvore", sensitive, 10)
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(store.search_with("Arvore", sensitive, 10).unwrap().len(), 1);
+        assert_eq!(store.search_with("pre", default, 10).unwrap().len(), 1);
+        assert!(store.search_with("pre", sensitive, 10).unwrap().is_empty());
+        assert_eq!(store.search_with("Pre", sensitive, 10).unwrap().len(), 1);
+        let word = SearchOptions {
+            whole_word: true,
+            ..default
+        };
+        assert_eq!(store.search_with("acao", word, 10).unwrap().len(), 1);
+        assert!(store.search_with("cao", word, 10).unwrap().is_empty());
+        assert_eq!(store.search_with("cao", default, 10).unwrap().len(), 1);
+        let regex = SearchOptions {
+            regex: true,
+            whole_word: true,
+            ..default
+        };
+        assert_eq!(store.search_with("[aàâ]ção", regex, 10).unwrap().len(), 1);
+        assert!(store.search_with("acao", regex, 10).unwrap().is_empty());
+        assert_eq!(store.search_with("árvore", regex, 10).unwrap().len(), 1);
+        assert!(
+            store
+                .search_with(
+                    "árvore",
+                    SearchOptions {
+                        match_case: true,
+                        ..regex
+                    },
+                    10
+                )
+                .unwrap()
+                .is_empty()
+        );
+        drop(store);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn whole_word_uses_unicode_boundaries() {
+        for regex in [false, true] {
+            let options = SearchOptions {
+                regex,
+                whole_word: true,
+                ..Default::default()
+            };
+            let pattern = SearchPattern::new("猫", options).unwrap();
+            assert!(pattern.matches("黑猫").is_empty());
+            assert_eq!(pattern.matches("猫! 猫").len(), 2);
+        }
+    }
+
+    #[test]
+    fn invalid_regex_returns_error() {
+        let (store, path) = temp_store();
+        for whole_word in [false, true] {
+            for query in ["[", "(", "abc\\"] {
+                let error = store
+                    .search_with(
+                        query,
+                        SearchOptions {
+                            regex: true,
+                            whole_word,
+                            ..Default::default()
+                        },
+                        10,
+                    )
+                    .unwrap_err();
+                assert!(error.to_string().contains("Expressão regular inválida"));
+            }
+        }
+        drop(store);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn zero_length_regex_matches_are_bounded() {
+        let options = SearchOptions {
+            regex: true,
+            ..Default::default()
+        };
+        let text = "a ".repeat(1000);
+        for query in [r"\b", "", "a?"] {
+            let matches = SearchPattern::new(query, options).unwrap().matches(&text);
+            assert_eq!(matches.len(), MAX_MATCHES_PER_BLOCK);
+        }
+        assert_eq!(
+            SearchPattern::new("^", options).unwrap().matches(&text),
+            vec![0..0]
+        );
+        let (mut store, path) = temp_store();
+        store.conn.execute("DELETE FROM pages", []).unwrap();
+        store.create_page(None, &text, "", unix_now()).unwrap();
+        let meta = store.create_page(None, "", "", unix_now()).unwrap();
+        store
+            .save_page(&Page {
+                meta,
+                blocks: vec![Block::with_text(1, BlockKind::Paragraph, &text)],
+            })
+            .unwrap();
+        assert_eq!(store.search_with(r"\b", options, 10).unwrap().len(), 2);
         drop(store);
         let _ = std::fs::remove_file(path);
     }
