@@ -89,6 +89,8 @@ pub enum Action {
     CheckUpdates,
     StartDownload,
     ApplyUpdate,
+    /// Reabre o executável atual depois do instalador de pacote.
+    Relaunch,
     DismissUpdate,
     ExportMarkdown(PageId),
     CopyMarkdown(PageId),
@@ -1139,6 +1141,16 @@ impl App {
             }
             return;
         }
+        // Instalador aberto: uma nova checagem descartaria a faixa "Reabrir".
+        if let UpdateStatus::Installing { release, .. } = &self.update.status {
+            if manual {
+                self.toast(format!(
+                    "Conclua o instalador da v{} e clique em Reabrir Simion",
+                    release.version
+                ));
+            }
+            return;
+        }
 
         self.update.auto = !manual;
         self.update.status = UpdateStatus::Checking;
@@ -1287,7 +1299,8 @@ impl App {
         }
         match updater::apply_update(&path) {
             Ok(ApplyOutcome::InstallerOpened) => {
-                self.update.status = UpdateStatus::Idle;
+                // Mantém release/caminho para a faixa oferecer "Reabrir Simion".
+                self.update.status = UpdateStatus::Installing { release, path };
                 self.update.dismissed = None;
                 self.toast("Instalador aberto — conclua a instalação");
             }
@@ -1302,6 +1315,16 @@ impl App {
                     release.version
                 ));
             }
+        }
+    }
+
+    /// Reabre o Simion depois de o usuário concluir o instalador do sistema.
+    /// Só sai se o novo processo foi iniciado; senão segue aberto com o erro.
+    fn relaunch_now(&mut self) {
+        self.save_now();
+        match updater::relaunch_current() {
+            Ok(()) => std::process::exit(0),
+            Err(err) => self.toast(format!("Não foi possível reabrir o Simion: {err}")),
         }
     }
 
@@ -1704,6 +1727,7 @@ impl App {
                 }
             }
             Action::ApplyUpdate => self.apply_update_now(),
+            Action::Relaunch => self.relaunch_now(),
             Action::DismissUpdate => self.dismiss_update(),
             Action::ExportMarkdown(id) => {
                 self.page_menu = None;
@@ -2522,7 +2546,8 @@ impl App {
         let visible = match &status {
             UpdateStatus::Available(release)
             | UpdateStatus::Downloading { release, .. }
-            | UpdateStatus::Ready { release, .. } => {
+            | UpdateStatus::Ready { release, .. }
+            | UpdateStatus::Installing { release, .. } => {
                 dismissed.as_deref() != Some(release.version.as_str())
             }
             // Erros só aparecem quando a checagem foi pedida pelo usuário.
@@ -2571,7 +2596,7 @@ impl App {
                                 }
                             });
                         }
-                        UpdateStatus::Ready { release, path } => {
+                        UpdateStatus::Ready { release, .. } => {
                             ui.label(
                                 RichText::new(format!("Atualizar para v{}", release.version))
                                     .size(13.0)
@@ -2579,13 +2604,36 @@ impl App {
                                     .strong(),
                             );
                             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                                let action = if updater::replaces_running_app(path) {
-                                    "Reiniciar e atualizar"
-                                } else {
-                                    "Abrir instalador"
-                                };
+                                let action = updater::update_action_label(&status)
+                                    .unwrap_or("Abrir instalador");
                                 if crate::ui::primary_button(ui, action, &p).clicked() {
                                     actions.push(Action::ApplyUpdate);
+                                }
+                                if banner_dismiss(ui, &p) {
+                                    actions.push(Action::DismissUpdate);
+                                }
+                            });
+                        }
+                        UpdateStatus::Installing { release, .. } => {
+                            ui.label(
+                                RichText::new(format!("Instalando v{}", release.version))
+                                    .size(13.0)
+                                    .color(p.text)
+                                    .strong(),
+                            );
+                            ui.label(
+                                RichText::new(
+                                    "O instalador pode pedir para fechar o Simion. \
+                                     Quando terminar, clique em Reabrir.",
+                                )
+                                .size(11.5)
+                                .color(p.muted),
+                            );
+                            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                                let action = updater::update_action_label(&status)
+                                    .unwrap_or("Reabrir Simion");
+                                if crate::ui::primary_button(ui, action, &p).clicked() {
+                                    actions.push(Action::Relaunch);
                                 }
                                 if banner_dismiss(ui, &p) {
                                     actions.push(Action::DismissUpdate);

@@ -716,6 +716,8 @@ fn launch_installer(path: &Path) -> Result<(), String> {
     Err("Abertura automática de instalador não é suportada nesta plataforma".to_owned())
 }
 
+/// `Installing`: instalador de pacote (.deb/.rpm/.msi/.dmg) aberto; o usuário
+/// conclui a instalação e depois reabre o Simion pela faixa.
 #[derive(Clone, Debug, PartialEq)]
 pub enum UpdateStatus {
     Idle,
@@ -724,6 +726,7 @@ pub enum UpdateStatus {
     Available(Release),
     Downloading { release: Release, progress: f32 },
     Ready { release: Release, path: PathBuf },
+    Installing { release: Release, path: PathBuf },
     Error(String),
 }
 
@@ -732,10 +735,53 @@ impl UpdateStatus {
         match self {
             Self::Available(release)
             | Self::Downloading { release, .. }
-            | Self::Ready { release, .. } => Some(release),
+            | Self::Ready { release, .. }
+            | Self::Installing { release, .. } => Some(release),
             _ => None,
         }
     }
+}
+
+/// Rótulo do botão principal da faixa/configurações para cada estado.
+pub fn update_action_label(status: &UpdateStatus) -> Option<&'static str> {
+    match status {
+        UpdateStatus::Available(_) => Some("Baixar"),
+        UpdateStatus::Ready { path, .. } if replaces_running_app(path) => {
+            Some("Reiniciar e atualizar")
+        }
+        UpdateStatus::Ready { .. } => Some("Abrir instalador"),
+        UpdateStatus::Installing { .. } => Some("Reabrir Simion"),
+        UpdateStatus::Error(_) => Some("Tentar de novo"),
+        UpdateStatus::Idle
+        | UpdateStatus::Checking
+        | UpdateStatus::UpToDate
+        | UpdateStatus::Downloading { .. } => None,
+    }
+}
+
+/// No Linux, se o gerenciador de pacotes substituiu o binário em uso,
+/// `/proc/self/exe` passa a apontar para `"<caminho> (deleted)"`. O arquivo
+/// novo está no caminho original, então o sufixo é descartado.
+fn strip_deleted_suffix(path: PathBuf) -> PathBuf {
+    let original = path
+        .to_str()
+        .and_then(|text| text.strip_suffix(" (deleted)"));
+    match original {
+        Some(original) => PathBuf::from(original),
+        None => path,
+    }
+}
+
+/// Relança o executável atual de forma desacoplada (sem substituir arquivos).
+/// Não encerra o processo: o chamador sai só depois de sucesso.
+pub fn relaunch_current() -> Result<(), String> {
+    let exe = std::env::current_exe()
+        .map_err(|err| format!("Não foi possível localizar o executável atual: {err}"))?;
+    let exe = strip_deleted_suffix(exe);
+    if !exe.is_file() {
+        return Err(format!("Executável não encontrado: {}", exe.display()));
+    }
+    respawn_detached(&exe)
 }
 
 #[derive(Clone, Debug)]
@@ -1151,5 +1197,73 @@ mod tests {
         assert_eq!(fs::read_to_string(&target).unwrap(), new_script);
         assert!(wait_for(&marker, Duration::from_secs(3)));
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    fn installing_status() -> UpdateStatus {
+        UpdateStatus::Installing {
+            release: pending_release("0.1.22"),
+            path: PathBuf::from("/tmp/simion_0.1.22_amd64.deb"),
+        }
+    }
+
+    #[test]
+    fn installing_status_keeps_its_release() {
+        let status = installing_status();
+        assert_eq!(status.release().map(|r| r.version.as_str()), Some("0.1.22"));
+    }
+
+    #[test]
+    fn action_label_follows_the_update_path() {
+        let ready = |name: &str| UpdateStatus::Ready {
+            release: pending_release("0.1.22"),
+            path: PathBuf::from(name),
+        };
+        assert_eq!(
+            update_action_label(&ready("Simion-0.1.22-x86_64.AppImage")),
+            Some("Reiniciar e atualizar")
+        );
+        assert_eq!(
+            update_action_label(&ready("simion-0.1.22-linux-x86_64.tar.xz")),
+            Some("Reiniciar e atualizar")
+        );
+        for installer in [
+            "simion_0.1.22_amd64.deb",
+            "simion-0.1.22-1.x86_64.rpm",
+            "Simion-0.1.22.msi",
+            "Simion-0.1.22.dmg",
+        ] {
+            assert_eq!(
+                update_action_label(&ready(installer)),
+                Some("Abrir instalador"),
+                "{installer}"
+            );
+        }
+        assert_eq!(
+            update_action_label(&installing_status()),
+            Some("Reabrir Simion")
+        );
+        assert_eq!(
+            update_action_label(&UpdateStatus::Available(pending_release("0.1.22"))),
+            Some("Baixar")
+        );
+        assert_eq!(
+            update_action_label(&UpdateStatus::Error("x".to_owned())),
+            Some("Tentar de novo")
+        );
+        assert_eq!(update_action_label(&UpdateStatus::Idle), None);
+        assert_eq!(update_action_label(&UpdateStatus::Checking), None);
+        assert_eq!(update_action_label(&UpdateStatus::UpToDate), None);
+    }
+
+    #[test]
+    fn relaunch_path_drops_the_deleted_marker() {
+        assert_eq!(
+            strip_deleted_suffix(PathBuf::from("/usr/bin/simion (deleted)")),
+            PathBuf::from("/usr/bin/simion")
+        );
+        assert_eq!(
+            strip_deleted_suffix(PathBuf::from("/usr/bin/simion")),
+            PathBuf::from("/usr/bin/simion")
+        );
     }
 }

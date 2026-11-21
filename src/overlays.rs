@@ -1450,11 +1450,7 @@ fn update_status(ui: &mut Ui, status: &UpdateStatus, p: &Palette, actions: &mut 
             ui.horizontal(|ui| {
                 text(ui, format!("Atualizar para v{}", release.version), p.text);
                 ui.add_space(6.0);
-                let action = if updater::replaces_running_app(path) {
-                    "Reiniciar e atualizar"
-                } else {
-                    "Abrir instalador"
-                };
+                let action = updater::update_action_label(status).unwrap_or("Abrir instalador");
                 if widgets::primary_button(ui, action, p).clicked() {
                     actions.push(Action::ApplyUpdate);
                 }
@@ -1474,6 +1470,23 @@ fn update_status(ui: &mut Ui, status: &UpdateStatus, p: &Palette, actions: &mut 
                     p.muted,
                 );
             }
+        }
+        UpdateStatus::Installing { release, .. } => {
+            ui.horizontal(|ui| {
+                text(ui, format!("Instalando v{}", release.version), p.text);
+                ui.add_space(6.0);
+                let action = updater::update_action_label(status).unwrap_or("Reabrir Simion");
+                if widgets::primary_button(ui, action, p).clicked() {
+                    actions.push(Action::Relaunch);
+                }
+            });
+            ui.add_space(2.0);
+            text(
+                ui,
+                "O instalador pode pedir para fechar o Simion. Quando terminar, clique em Reabrir."
+                    .to_owned(),
+                p.muted,
+            );
         }
         UpdateStatus::Error(err) => {
             ui.add(egui::Label::new(RichText::new(err).size(12.5).color(p.danger)).wrap());
