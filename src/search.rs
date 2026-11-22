@@ -27,6 +27,8 @@ pub struct SearchState {
     pub focus_pending: bool,
     /// Scroll the selected result into view after keyboard navigation.
     pub scroll_selected: bool,
+    /// Hit chosen via keyboard or click, drained into an Action by `search_overlay`.
+    pub pending_open: Option<SearchHit>,
 }
 
 impl App {
@@ -42,6 +44,8 @@ impl App {
                 title: meta.display_title().to_owned(),
                 icon: meta.icon,
                 snippet: String::new(),
+                block_ord: None,
+                match_chars: None,
             })
             .collect();
         self.search.selected = 0;
@@ -95,6 +99,7 @@ impl App {
         if changed {
             // Linux may emit text alongside an Alt shortcut. Keep it out of the query.
             ctx.input_mut(|i| i.events.retain(|e| !matches!(e, egui::Event::Text(_))));
+            self.persist_search_options();
             self.run_search();
             self.search.selected = 0;
         }
@@ -102,6 +107,7 @@ impl App {
             || self.consume_pub(ctx, egui::Key::K, egui::Modifiers::COMMAND)
         {
             self.search.open = false;
+            self.search.pending_open = None;
             return;
         }
         let len = self.search.results.len();
@@ -117,10 +123,8 @@ impl App {
             self.search.scroll_selected = true;
         }
         if self.consume_pub(ctx, egui::Key::Enter, egui::Modifiers::NONE) {
-            if let Some(hit) = self.search.results.get(self.search.selected) {
-                let page_id = hit.page_id;
-                self.search.open = false;
-                self.open_page(page_id);
+            if let Some(hit) = self.search.results.get(self.search.selected).cloned() {
+                self.search.pending_open = Some(hit);
             }
         }
     }
@@ -128,6 +132,11 @@ impl App {
     pub fn search_overlay(&mut self, ctx: &Context) -> Vec<Action> {
         let mut actions = Vec::new();
         if !self.search.open {
+            return actions;
+        }
+        if let Some(hit) = self.search.pending_open.take() {
+            self.search.open = false;
+            actions.push(Action::OpenSearchHit(hit));
             return actions;
         }
         let p = self.palette;
@@ -138,7 +147,6 @@ impl App {
         let focus_pending = self.search.focus_pending;
         let mut query = self.search.query.clone();
         let mut options_changed = false;
-        let mut open_page: Option<i64> = None;
         let mut new_selected = selected;
 
         let modal = Modal::new(Id::unique("simion-search-modal"))
@@ -255,7 +263,7 @@ impl App {
                             let (rect, row_response) =
                                 result_row(ui, hit, is_selected, &query, &p, width - 20.0);
                             if row_response.clicked() {
-                                open_page = Some(hit.page_id);
+                                self.search.pending_open = Some(hit.clone());
                                 new_selected = index;
                             }
                             if scroll_selected && is_selected && !ui.is_rect_visible(rect) {
@@ -285,8 +293,12 @@ impl App {
 
         if response.should_close() {
             self.search.open = false;
+            self.search.pending_open = None;
         }
 
+        if options_changed {
+            self.persist_search_options();
+        }
         if self.search.query != query || options_changed {
             self.search.query = query;
             self.run_search();
@@ -296,9 +308,9 @@ impl App {
         self.search.focus_pending = false;
         self.search.scroll_selected = false;
 
-        if let Some(page_id) = open_page {
+        if let Some(hit) = self.search.pending_open.take() {
             self.search.open = false;
-            actions.push(Action::SelectPage(page_id));
+            actions.push(Action::OpenSearchHit(hit));
         }
 
         actions
@@ -309,7 +321,8 @@ impl App {
 mod tests {
     use super::*;
 
-    fn frame(app: &mut App, ctx: &Context, events: Vec<egui::Event>) {
+    fn frame(app: &mut App, ctx: &Context, events: Vec<egui::Event>) -> Vec<Action> {
+        let mut actions = Vec::new();
         let mut output = ctx.run_ui(
             egui::RawInput {
                 screen_rect: Some(Rect::from_min_size(pos2(0.0, 0.0), vec2(1000.0, 700.0))),
@@ -318,10 +331,132 @@ mod tests {
             },
             |ui| {
                 app.search_keys(ui.ctx());
-                app.search_overlay(ui.ctx());
+                actions = app.search_overlay(ui.ctx());
             },
         );
         output.textures_delta.clear();
+        actions
+    }
+
+    #[test]
+    fn enter_emits_open_search_hit_for_selected_result() {
+        let ctx = Context::default();
+        crate::theme::install_fonts(&ctx);
+        let mut app = App::blank();
+        let first = SearchHit {
+            page_id: 1,
+            title: "Primeira".into(),
+            icon: String::new(),
+            snippet: String::new(),
+            block_ord: None,
+            match_chars: Some((0, 4)),
+        };
+        let second = SearchHit {
+            page_id: 2,
+            title: "Segunda".into(),
+            icon: String::new(),
+            snippet: "Uma citação".into(),
+            block_ord: Some(3),
+            match_chars: Some((4, 11)),
+        };
+        app.search.open = true;
+        app.search.results = vec![first, second.clone()];
+        app.search.selected = 1;
+
+        let actions = frame(
+            &mut app,
+            &ctx,
+            vec![egui::Event::Key {
+                key: egui::Key::Enter,
+                physical_key: Some(egui::Key::Enter),
+                pressed: true,
+                repeat: false,
+                modifiers: egui::Modifiers::NONE,
+            }],
+        );
+        assert!(!app.search.open);
+        assert!(app.search.pending_open.is_none());
+        assert_eq!(actions.len(), 1);
+        match &actions[0] {
+            Action::OpenSearchHit(hit) => assert_eq!(hit, &second),
+            other => panic!("esperava Action::OpenSearchHit, veio {other:?}"),
+        }
+    }
+
+    #[test]
+    fn alt_toggles_persist_search_options_in_store() {
+        let mut path = std::env::temp_dir();
+        path.push(format!(
+            "simion-search-opts-{}-{}.db",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let store = crate::store::Store::open(&path).unwrap();
+        let ctx = Context::default();
+        crate::theme::install_fonts(&ctx);
+        let mut app = App::blank();
+        app.store = Some(store);
+        app.search.open = true;
+
+        let press_alt = |app: &mut App, key: egui::Key| {
+            frame(
+                app,
+                &ctx,
+                vec![egui::Event::Key {
+                    key,
+                    physical_key: Some(key),
+                    pressed: true,
+                    repeat: false,
+                    modifiers: egui::Modifiers::ALT,
+                }],
+            );
+        };
+
+        press_alt(&mut app, egui::Key::R);
+        {
+            let store = app.store.as_ref().unwrap();
+            assert_eq!(store.setting("search_regex").unwrap().as_deref(), Some("1"));
+            assert_eq!(
+                store.setting("search_match_case").unwrap().as_deref(),
+                Some("0")
+            );
+            assert_eq!(
+                store.setting("search_whole_word").unwrap().as_deref(),
+                Some("0")
+            );
+        }
+
+        press_alt(&mut app, egui::Key::C);
+        press_alt(&mut app, egui::Key::W);
+        {
+            let store = app.store.as_ref().unwrap();
+            assert_eq!(store.setting("search_regex").unwrap().as_deref(), Some("1"));
+            assert_eq!(
+                store.setting("search_match_case").unwrap().as_deref(),
+                Some("1")
+            );
+            assert_eq!(
+                store.setting("search_whole_word").unwrap().as_deref(),
+                Some("1")
+            );
+        }
+
+        press_alt(&mut app, egui::Key::R);
+        assert_eq!(
+            app.store
+                .as_ref()
+                .unwrap()
+                .setting("search_regex")
+                .unwrap()
+                .as_deref(),
+            Some("0")
+        );
+
+        drop(app);
+        let _ = std::fs::remove_file(path);
     }
 
     #[test]

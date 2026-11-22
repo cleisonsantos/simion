@@ -54,6 +54,7 @@ pub struct Toast {
 pub enum Action {
     BlockContext(crate::editor::BlockContextAction),
     SelectPage(PageId),
+    OpenSearchHit(crate::store::SearchHit),
     NewPage {
         parent: Option<PageId>,
     },
@@ -432,6 +433,11 @@ impl App {
             .unwrap_or(Mode::Light);
         self.format_bar_visible =
             store.setting("format_bar").ok().flatten().as_deref() == Some("1");
+        self.search.regex = store.setting("search_regex").ok().flatten().as_deref() == Some("1");
+        self.search.match_case =
+            store.setting("search_match_case").ok().flatten().as_deref() == Some("1");
+        self.search.whole_word =
+            store.setting("search_whole_word").ok().flatten().as_deref() == Some("1");
         self.palette = palette(self.mode);
         self.pages = store.list_pages().unwrap_or_default();
 
@@ -644,6 +650,54 @@ impl App {
         }
         self.save_now();
         self.load_page_from_db(id);
+    }
+
+    pub fn open_search_hit(&mut self, hit: crate::store::SearchHit) {
+        self.open_page(hit.page_id);
+        if self.current != Some(hit.page_id) {
+            return;
+        }
+        self.block_selection = None;
+        self.text_span = None;
+        self.text_anchor = None;
+        self.text_dragging = false;
+        self.scroll_to = None;
+
+        if let Some(ord) = hit.block_ord
+            && let Ok(index) = usize::try_from(ord)
+            && let Some(block) = self.page.blocks.get(index)
+        {
+            let id = block.id;
+            self.focus = Focus::Block(id);
+            self.pending = Some(PendingFocus {
+                target: Focus::Block(id),
+                range: hit.match_chars,
+                select_all: false,
+            });
+            self.scroll_to = Some(id);
+            return;
+        }
+
+        let range = if hit.block_ord.is_none() {
+            hit.match_chars
+        } else {
+            None
+        };
+        self.focus = Focus::Title;
+        self.pending = Some(PendingFocus {
+            target: Focus::Title,
+            range,
+            select_all: false,
+        });
+    }
+
+    pub fn persist_search_options(&mut self) {
+        if let Some(store) = self.store.as_mut() {
+            let flag = |on| if on { "1" } else { "0" };
+            let _ = store.set_setting("search_regex", flag(self.search.regex));
+            let _ = store.set_setting("search_match_case", flag(self.search.match_case));
+            let _ = store.set_setting("search_whole_word", flag(self.search.whole_word));
+        }
     }
 
     fn create_page(&mut self, parent: Option<PageId>) {
@@ -1633,6 +1687,10 @@ impl App {
         match action {
             Action::BlockContext(action) => self.apply_block_context(action, ctx),
             Action::SelectPage(id) => self.open_page(id),
+            Action::OpenSearchHit(hit) => {
+                self.open_search_hit(hit);
+                ctx.request_repaint();
+            }
             Action::NewPage { parent } => self.create_page(parent),
             Action::NewFolder { parent } => self.create_folder(parent),
             Action::MovePage { id, parent, index } => {
@@ -1903,6 +1961,7 @@ impl App {
         self.search.selected = 0;
         self.search.query.clear();
         self.search.results.clear();
+        self.search.pending_open = None;
         self.search_recent();
         self.page_menu = None;
         self.block_menu = None;
@@ -3340,6 +3399,155 @@ mod tests {
         assert_eq!(blocks[1].kind, BlockKind::Heading1);
         assert_eq!(focus, 2);
     }
+    #[test]
+    fn search_options_default_off_and_survive_reopening() {
+        let (mut app, path, ..) = seeded_root_app("search-options-setting");
+        app.boot();
+        assert!(!app.search.regex);
+        assert!(!app.search.match_case);
+        assert!(!app.search.whole_word);
+
+        app.search.regex = true;
+        app.search.whole_word = true;
+        app.persist_search_options();
+
+        drop(app);
+        app = App::blank();
+        app.store = Some(Store::open(&path).unwrap());
+        app.boot();
+        assert!(app.search.regex);
+        assert!(!app.search.match_case);
+        assert!(app.search.whole_word);
+
+        app.search.regex = false;
+        app.search.match_case = true;
+        app.search.whole_word = false;
+        app.persist_search_options();
+
+        drop(app);
+        app = App::blank();
+        app.store = Some(Store::open(&path).unwrap());
+        app.boot();
+        assert!(!app.search.regex);
+        assert!(app.search.match_case);
+        assert!(!app.search.whole_word);
+
+        drop(app);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn open_search_hit_focuses_selects_and_scrolls_to_match() {
+        let (mut app, path, a, b, _c) = seeded_root_app("open-search-hit");
+        {
+            let store = app.store.as_mut().unwrap();
+            let mut meta_b = store.page_meta(b).unwrap().unwrap();
+            meta_b.title = "Resumo da Ação".into();
+            let mut blocks = Vec::new();
+            for i in 0..60 {
+                let text = if i == 50 {
+                    "Pré ação pós".to_owned()
+                } else {
+                    format!("Parágrafo de enchimento número {i}")
+                };
+                blocks.push(Block::with_text(i + 1, BlockKind::Paragraph, text));
+            }
+            store
+                .save_page(&Page {
+                    meta: meta_b,
+                    blocks,
+                })
+                .unwrap();
+        }
+        app.reload_pages();
+        app.load_page_from_db(a);
+
+        let ctx = Context::default();
+        crate::theme::install_fonts(&ctx);
+        real_ui_frame(&ctx, &mut app, Vec::new());
+
+        // 1. Abrir hit em bloco distante de outra página.
+        let hit = crate::store::SearchHit {
+            page_id: b,
+            title: "Resumo da Ação".into(),
+            icon: String::new(),
+            snippet: "Pré ação pós".into(),
+            block_ord: Some(50),
+            match_chars: Some((4, 8)),
+        };
+        app.apply_action(Action::OpenSearchHit(hit.clone()), &ctx);
+        assert_eq!(app.current, Some(b));
+        let target_id = app.page.blocks[50].id;
+        assert_eq!(app.focus, Focus::Block(target_id));
+        assert_eq!(app.scroll_to, Some(target_id));
+        assert_eq!(app.pending.as_ref().and_then(|p| p.range), Some((4, 8)));
+
+        real_ui_frame(&ctx, &mut app, Vec::new());
+        real_ui_frame(&ctx, &mut app, Vec::new());
+        assert_eq!(app.focus, Focus::Block(target_id));
+        let te_id = egui::Id::unique(("simion-block", target_id));
+        let cursor = egui::text_edit::TextEditState::load(&ctx, te_id)
+            .and_then(|s| s.cursor.char_range())
+            .expect("seleção aplicada ao bloco");
+        let lo = cursor.primary.index.0.min(cursor.secondary.index.0);
+        let hi = cursor.primary.index.0.max(cursor.secondary.index.0);
+        assert_eq!((lo, hi), (4, 8));
+        // Verifica que o ScrollArea realmente rolou para baixo até o bloco 50 ficar visível na tela.
+        let rect = app
+            .block_rects
+            .get(&target_id)
+            .copied()
+            .expect("bloco 50 renderizado");
+        assert!(
+            rect.top() >= 0.0 && rect.bottom() <= 700.0,
+            "esperava bloco 50 visível no viewport 0..700 após scroll, veio {rect:?}"
+        );
+
+        // 2. Match no título na mesma página (caminho curto de open_page).
+        let title_hit = crate::store::SearchHit {
+            page_id: b,
+            title: "Resumo da Ação".into(),
+            icon: String::new(),
+            snippet: String::new(),
+            block_ord: None,
+            match_chars: Some((10, 14)),
+        };
+        app.apply_action(Action::OpenSearchHit(title_hit), &ctx);
+        assert_eq!(app.focus, Focus::Title);
+        assert_eq!(app.pending.as_ref().and_then(|p| p.range), Some((10, 14)));
+        real_ui_frame(&ctx, &mut app, Vec::new());
+        let title_cursor = egui::text_edit::TextEditState::load(&ctx, title_focus_id(&app))
+            .and_then(|s| s.cursor.char_range())
+            .expect("seleção aplicada ao título");
+        let lo = title_cursor
+            .primary
+            .index
+            .0
+            .min(title_cursor.secondary.index.0);
+        let hi = title_cursor
+            .primary
+            .index
+            .0
+            .max(title_cursor.secondary.index.0);
+        assert_eq!((lo, hi), (10, 14));
+
+        // 3. Fallback quando o bloco não existe mais.
+        let stale_hit = crate::store::SearchHit {
+            page_id: b,
+            title: "Resumo da Ação".into(),
+            icon: String::new(),
+            snippet: String::new(),
+            block_ord: Some(999),
+            match_chars: Some((2, 5)),
+        };
+        app.apply_action(Action::OpenSearchHit(stale_hit), &ctx);
+        assert_eq!(app.focus, Focus::Title);
+        assert_eq!(app.pending.as_ref().and_then(|p| p.range), None);
+
+        drop(app);
+        let _ = std::fs::remove_file(path);
+    }
+
     #[test]
     fn scroll_speed_is_faster_than_the_egui_default() {
         let ctx = egui::Context::default();

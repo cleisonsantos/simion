@@ -99,17 +99,38 @@ impl SearchPattern {
         Ok(Self { regex, options })
     }
 
-    fn matches(&self, text: &str) -> Vec<std::ops::Range<usize>> {
-        let text = if self.options.regex {
-            text.to_owned()
-        } else {
-            search_fold(text, self.options.match_case)
-        };
+    fn matches_in(&self, haystack: &str) -> Vec<std::ops::Range<usize>> {
         self.regex
-            .find_iter(&text)
+            .find_iter(haystack)
             .take(MAX_MATCHES_PER_BLOCK)
             .map(|m| m.range())
             .collect()
+    }
+
+    #[cfg(test)]
+    fn matches(&self, text: &str) -> Vec<std::ops::Range<usize>> {
+        let folded;
+        let haystack = if self.options.regex {
+            text
+        } else {
+            folded = search_fold(text, self.options.match_case);
+            &folded
+        };
+        self.matches_in(haystack)
+    }
+
+    fn first_match_chars(&self, text: &str) -> Option<(usize, usize)> {
+        let folded;
+        let haystack = if self.options.regex {
+            text
+        } else {
+            folded = search_fold(text, self.options.match_case);
+            &folded
+        };
+        let range = self.matches_in(haystack).into_iter().next()?;
+        let start = haystack[..range.start].chars().count();
+        let end = start + haystack[range.start..range.end].chars().count();
+        Some((start, end))
     }
 }
 
@@ -138,12 +159,14 @@ fn search_fold(text: &str, match_case: bool) -> String {
         .collect()
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SearchHit {
     pub page_id: PageId,
     pub title: String,
     pub icon: String,
     pub snippet: String,
+    pub block_ord: Option<i64>,
+    pub match_chars: Option<(usize, usize)>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -616,11 +639,11 @@ impl Store {
         // Titles retain priority over block matches, with one hit per page.
         for titles in [true, false] {
             let sql = if titles {
-                "SELECT id, title, icon, title FROM pages ORDER BY updated_at DESC"
+                "SELECT id, title, icon, title, NULL FROM pages ORDER BY updated_at DESC"
             } else {
-                "SELECT p.id, p.title, p.icon, b.text
+                "SELECT p.id, p.title, p.icon, b.text, b.ord
                  FROM blocks b JOIN pages p ON p.id = b.page_id
-                 WHERE b.kind != 'image' ORDER BY p.updated_at DESC"
+                 WHERE b.kind != 'image' ORDER BY p.updated_at DESC, b.ord ASC"
             };
             let mut stmt = self.conn.prepare(sql)?;
             let rows = stmt.query_map([], |row| {
@@ -629,13 +652,17 @@ impl Store {
                     row.get::<_, String>(1)?,
                     row.get::<_, String>(2)?,
                     row.get::<_, String>(3)?,
+                    row.get::<_, Option<i64>>(4)?,
                 ))
             })?;
             for row in rows {
-                let (page_id, title, icon, text) = row?;
-                if seen.contains(&page_id) || pattern.matches(&text).is_empty() {
+                let (page_id, title, icon, text, block_ord) = row?;
+                if seen.contains(&page_id) {
                     continue;
                 }
+                let Some(match_chars) = pattern.first_match_chars(&text) else {
+                    continue;
+                };
                 seen.insert(page_id);
                 hits.push(SearchHit {
                     page_id,
@@ -646,6 +673,8 @@ impl Store {
                     } else {
                         snippet(&text, query)
                     },
+                    block_ord,
+                    match_chars: Some(match_chars),
                 });
                 if hits.len() >= limit {
                     return Ok(hits);
@@ -1149,6 +1178,87 @@ mod tests {
         assert!(hits.iter().any(|hit| hit.snippet.contains("citação")));
         let hits = store.search("coração", 10).unwrap();
         assert!(!hits.is_empty());
+        drop(store);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn search_with_reports_block_ord_and_char_range_with_accents() {
+        let (mut store, path) = blank_store();
+        let now = unix_now();
+        let title = "Resumo da Ação";
+        let meta = store.create_page(None, title, "", now).unwrap();
+        let block0 = "Primeiro bloco sem o termo";
+        let block1 = "Uma citação com coração";
+        let block2 = "🌱 Pré ação pós coração";
+        store
+            .save_page(&Page {
+                meta: meta.clone(),
+                blocks: vec![
+                    Block::with_text(1, BlockKind::Paragraph, block0),
+                    Block::with_text(2, BlockKind::Paragraph, block1),
+                    Block::with_text(3, BlockKind::Paragraph, block2),
+                ],
+            })
+            .unwrap();
+
+        let slice_chars = |text: &str, (start, end): (usize, usize)| -> String {
+            text.chars().skip(start).take(end - start).collect()
+        };
+
+        // Match no título sem regex (dobrando acentos).
+        let hits = store
+            .search_with("acao", SearchOptions::default(), 10)
+            .unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].page_id, meta.id);
+        assert_eq!(hits[0].block_ord, None);
+        assert_eq!(hits[0].match_chars, Some((10, 14)));
+        assert_eq!(slice_chars(title, hits[0].match_chars.unwrap()), "Ação");
+
+        // Match no bloco 1 sem regex (dobrando acentos).
+        let hits = store
+            .search_with("citacao", SearchOptions::default(), 10)
+            .unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].block_ord, Some(1));
+        assert_eq!(hits[0].match_chars, Some((4, 11)));
+        assert_eq!(slice_chars(block1, hits[0].match_chars.unwrap()), "citação");
+
+        // Quando vários blocos casam, pega o primeiro em ordem de `ord`.
+        let hits = store
+            .search_with("coracao", SearchOptions::default(), 10)
+            .unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].block_ord, Some(1));
+        assert_eq!(slice_chars(block1, hits[0].match_chars.unwrap()), "coração");
+
+        // Match com emoji multibyte antes do termo (folded e regex).
+        let hits = store
+            .search_with("pre", SearchOptions::default(), 10)
+            .unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].block_ord, Some(2));
+        assert_eq!(slice_chars(block2, hits[0].match_chars.unwrap()), "Pré");
+
+        let regex_opts = SearchOptions {
+            regex: true,
+            ..Default::default()
+        };
+        let hits = store.search_with("[aà]ção", regex_opts, 10).unwrap();
+        assert_eq!(hits.len(), 1);
+        // Título tem prioridade sobre blocos.
+        assert_eq!(hits[0].block_ord, None);
+        assert_eq!(slice_chars(title, hits[0].match_chars.unwrap()), "Ação");
+
+        let hits = store.search_with("Pré\\s+ação", regex_opts, 10).unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].block_ord, Some(2));
+        assert_eq!(
+            slice_chars(block2, hits[0].match_chars.unwrap()),
+            "Pré ação"
+        );
+
         drop(store);
         let _ = std::fs::remove_file(path);
     }
