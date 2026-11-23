@@ -50,6 +50,10 @@
         <Property Id="WIXUI_INSTALLDIR" Value="INSTALLFOLDER"/>
         <ui:WixUI Id="WixUI_InstallDir"/>
 
+        <!-- O RTF padrao do WixUI traz texto "Lorem ipsum" no contrato de
+             licenca. Usamos a licenca MIT real do projeto (#77). -->
+        <WixVariable Id="WixUILicenseRtf" Value="wix\\License.rtf"/>
+
         <!-- Metadados de Apps instalados (#3): ícone, ajuda e comentário. -->
         <Icon Id="ProductICO" SourceFile="assets\branding\simion.ico"/>
         <Property Id="ARPPRODUCTICON" Value="ProductICO"/>
