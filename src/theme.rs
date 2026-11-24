@@ -140,6 +140,18 @@ pub fn family(name: &str) -> FontFamily {
     FontFamily::Name(name.into())
 }
 
+/// Linearly blends `from` toward `to` by `t` (clamped to `0.0..=1.0`).
+pub fn mix_color(from: Color32, to: Color32, t: f32) -> Color32 {
+    let t = t.clamp(0.0, 1.0);
+    if t == 0.0 {
+        return from;
+    }
+    if t == 1.0 {
+        return to;
+    }
+    from.lerp_to_gamma(to, t)
+}
+
 pub fn install_fonts(ctx: &egui::Context) {
     let mut fonts = FontDefinitions::default();
 
