@@ -20,7 +20,7 @@ use crate::syntax;
 use crate::text::plural;
 use crate::theme::{
     FONT_BODY, FONT_ITALIC, FONT_MEDIUM, FONT_MONO, FONT_SEMIBOLD, FONT_SEMIBOLD_ITALIC, GUTTER,
-    INDENT_WIDTH, MAX_CONTENT_WIDTH, Palette, family,
+    INDENT_WIDTH, MAX_CONTENT_WIDTH, Palette, family, mix_color,
 };
 use crate::ui as widgets;
 
@@ -1332,20 +1332,22 @@ impl App {
                 match kind {
                     BlockKind::Bullet => {
                         let center = pos2(rect.left() + 12.0, center_y);
-                        ui.painter().circle_filled(
-                            center,
-                            3.2 * zoom,
-                            if checked { p.faint } else { p.text },
-                        );
+                        let style = bullet_style(indent, checked, zoom, &p);
+                        paint_bullet(ui.painter(), center, style);
                     }
                     BlockKind::Numbered => {
-                        let number = self.list_number(index).to_string();
+                        let label = numbered_marker(self.list_number(index), indent);
+                        let color = if checked {
+                            p.faint
+                        } else {
+                            mix_color(p.muted, p.faint, indent_fade(indent))
+                        };
                         ui.painter().text(
                             pos2(rect.right() - 8.0, center_y),
                             Align2::RIGHT_CENTER,
-                            format!("{number}."),
+                            label,
                             FontId::new(base_size * 0.95, family(FONT_BODY)),
-                            p.muted,
+                            color,
                         );
                     }
                     BlockKind::Todo => {
@@ -1354,8 +1356,14 @@ impl App {
                             pos2(rect.left() + 8.0 + size / 2.0, center_y),
                             Vec2::splat(size),
                         );
+                        let alpha = todo_opacity(indent);
                         if checked {
-                            ui.painter().rect_filled(box_rect, 4, p.accent);
+                            let fill = if alpha < 1.0 {
+                                p.accent.gamma_multiply(alpha)
+                            } else {
+                                p.accent
+                            };
+                            ui.painter().rect_filled(box_rect, 4, fill);
                             icons::check(
                                 ui.painter(),
                                 Rect::from_center_size(box_rect.center(), Vec2::splat(size * 0.8)),
@@ -1363,10 +1371,15 @@ impl App {
                                 1.9,
                             );
                         } else {
+                            let stroke_color = if alpha < 1.0 {
+                                p.faint.gamma_multiply(alpha)
+                            } else {
+                                p.faint
+                            };
                             ui.painter().rect_stroke(
                                 box_rect,
                                 4,
-                                Stroke::new(1.5, p.faint),
+                                Stroke::new(1.5, stroke_color),
                                 egui::StrokeKind::Inside,
                             );
                         }
@@ -3739,6 +3752,117 @@ fn hint_for(kind: BlockKind) -> &'static str {
         BlockKind::Code => "Código",
         BlockKind::Divider => "",
         BlockKind::Image => "",
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum BulletShape {
+    FilledCircle { radius: f32 },
+    HollowCircle { radius: f32, stroke: f32 },
+    FilledSquare { side: f32 },
+    Dash { width: f32, thickness: f32 },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct BulletStyle {
+    shape: BulletShape,
+    color: Color32,
+}
+
+/// Fade factor (`0.0..=1.0`) toward `p.faint` for indentation levels 4+.
+fn indent_fade(indent: u8) -> f32 {
+    if indent < 4 {
+        0.0
+    } else {
+        ((indent - 3) as f32 / 3.0).min(1.0)
+    }
+}
+
+/// Pure mapping from list nesting level to bullet shape, zoom-scaled dimensions and palette color.
+fn bullet_style(indent: u8, checked: bool, zoom: f32, p: &Palette) -> BulletStyle {
+    let shape = match indent % 4 {
+        0 => BulletShape::FilledCircle { radius: 3.2 * zoom },
+        1 => BulletShape::HollowCircle {
+            radius: 3.0 * zoom,
+            stroke: 1.2 * zoom,
+        },
+        2 => BulletShape::FilledSquare { side: 5.4 * zoom },
+        _ => BulletShape::Dash {
+            width: 6.0 * zoom,
+            thickness: 1.2 * zoom,
+        },
+    };
+    let color = if checked {
+        p.faint
+    } else {
+        mix_color(p.text, p.faint, indent_fade(indent))
+    };
+    BulletStyle { shape, color }
+}
+
+fn paint_bullet(painter: &egui::Painter, center: egui::Pos2, style: BulletStyle) {
+    match style.shape {
+        BulletShape::FilledCircle { radius } => {
+            painter.circle_filled(center, radius, style.color);
+        }
+        BulletShape::HollowCircle { radius, stroke } => {
+            painter.circle_stroke(center, radius, Stroke::new(stroke, style.color));
+        }
+        BulletShape::FilledSquare { side } => {
+            let rect = Rect::from_center_size(center, Vec2::splat(side));
+            painter.rect_filled(rect, 0, style.color);
+        }
+        BulletShape::Dash { width, thickness } => {
+            let rect = Rect::from_center_size(center, vec2(width, thickness));
+            painter.rect_filled(rect, 0, style.color);
+        }
+    }
+}
+
+fn todo_opacity(indent: u8) -> f32 {
+    1.0 - indent_fade(indent) * 0.45
+}
+
+fn to_roman_lower(mut n: usize) -> String {
+    if n == 0 || n >= 4000 {
+        return n.to_string();
+    }
+    const TABLE: &[(usize, &str)] = &[
+        (1000, "m"),
+        (900, "cm"),
+        (500, "d"),
+        (400, "cd"),
+        (100, "c"),
+        (90, "xc"),
+        (50, "l"),
+        (40, "xl"),
+        (10, "x"),
+        (9, "ix"),
+        (5, "v"),
+        (4, "iv"),
+        (1, "i"),
+    ];
+    let mut out = String::new();
+    for &(value, symbol) in TABLE {
+        while n >= value {
+            out.push_str(symbol);
+            n -= value;
+        }
+    }
+    out
+}
+
+/// Formats a 1-based numbered list item by indent level:
+/// `indent % 3 == 0` -> arabic (`1.`), `1` -> lowercase letter (`a.`, wrapping mod 26),
+/// `2` -> lowercase roman (`i.`).
+fn numbered_marker(number: usize, indent: u8) -> String {
+    match indent % 3 {
+        0 => format!("{number}."),
+        1 => {
+            let letter = (b'a' + (number.saturating_sub(1) % 26) as u8) as char;
+            format!("{letter}.")
+        }
+        _ => format!("{}.", to_roman_lower(number)),
     }
 }
 
@@ -6344,5 +6468,141 @@ mod tests {
         assert_eq!(h.app.focus, Focus::Block(id1));
         h.type_text("Q");
         assert_eq!(h.texts(), ["alpha one", "Qbravo two"]);
+    }
+
+    #[test]
+    fn bullet_style_maps_levels_0_to_6_with_zoom_and_fade() {
+        for mode in [crate::theme::Mode::Light, crate::theme::Mode::Dark] {
+            let p = crate::theme::palette(mode);
+            let zoom = 1.5;
+
+            let s0 = bullet_style(0, false, zoom, &p);
+            let s1 = bullet_style(1, false, zoom, &p);
+            let s2 = bullet_style(2, false, zoom, &p);
+            let s3 = bullet_style(3, false, zoom, &p);
+            let s4 = bullet_style(4, false, zoom, &p);
+            let s5 = bullet_style(5, false, zoom, &p);
+            let s6 = bullet_style(6, false, zoom, &p);
+
+            assert_eq!(s0.shape, BulletShape::FilledCircle { radius: 3.2 * zoom });
+            assert_eq!(
+                s1.shape,
+                BulletShape::HollowCircle {
+                    radius: 3.0 * zoom,
+                    stroke: 1.2 * zoom,
+                }
+            );
+            assert_eq!(s2.shape, BulletShape::FilledSquare { side: 5.4 * zoom });
+            assert_eq!(
+                s3.shape,
+                BulletShape::Dash {
+                    width: 6.0 * zoom,
+                    thickness: 1.2 * zoom,
+                }
+            );
+            // Levels 4..=6 cycle shapes via indent % 4.
+            assert_eq!(s4.shape, s0.shape);
+            assert_eq!(s5.shape, s1.shape);
+            assert_eq!(s6.shape, s2.shape);
+
+            // Levels 0..=3 keep full palette text color.
+            for style in [s0, s1, s2, s3] {
+                assert_eq!(style.color, p.text);
+            }
+
+            // Levels 4..=6 move strictly monotonically from p.text toward p.faint.
+            let dist = |a: Color32, b: Color32| -> i32 {
+                (a.r() as i32 - b.r() as i32).abs()
+                    + (a.g() as i32 - b.g() as i32).abs()
+                    + (a.b() as i32 - b.b() as i32).abs()
+            };
+            assert!(dist(s4.color, p.faint) < dist(p.text, p.faint));
+            assert!(dist(s5.color, p.faint) < dist(s4.color, p.faint));
+            assert_eq!(s6.color, p.faint);
+            assert_ne!(s4.color, p.text);
+            assert_ne!(s4.color, s5.color);
+            assert_ne!(s5.color, s6.color);
+
+            // Checked bullets always use p.faint regardless of nesting level.
+            for indent in 0..=6 {
+                let checked = bullet_style(indent, true, zoom, &p);
+                assert_eq!(checked.color, p.faint);
+            }
+        }
+    }
+
+    #[test]
+    fn numbered_marker_cycles_levels_and_wraps_letters_mod_26() {
+        // Level 0 (and 3, 6): arabic numerals.
+        for indent in [0, 3, 6] {
+            assert_eq!(numbered_marker(1, indent), "1.");
+            assert_eq!(numbered_marker(26, indent), "26.");
+            assert_eq!(numbered_marker(27, indent), "27.");
+        }
+
+        // Level 1 (and 4): lowercase letters, wrapping mod 26 without panic.
+        for indent in [1, 4] {
+            assert_eq!(numbered_marker(1, indent), "a.");
+            assert_eq!(numbered_marker(2, indent), "b.");
+            assert_eq!(numbered_marker(26, indent), "z.");
+            assert_eq!(numbered_marker(27, indent), "a.");
+            assert_eq!(numbered_marker(28, indent), "b.");
+            assert_eq!(numbered_marker(52, indent), "z.");
+            assert_eq!(numbered_marker(53, indent), "a.");
+            assert_eq!(numbered_marker(0, indent), "a.");
+        }
+
+        // Level 2 (and 5): lowercase roman numerals.
+        for indent in [2, 5] {
+            assert_eq!(numbered_marker(1, indent), "i.");
+            assert_eq!(numbered_marker(2, indent), "ii.");
+            assert_eq!(numbered_marker(3, indent), "iii.");
+            assert_eq!(numbered_marker(4, indent), "iv.");
+            assert_eq!(numbered_marker(9, indent), "ix.");
+            assert_eq!(numbered_marker(10, indent), "x.");
+            assert_eq!(numbered_marker(26, indent), "xxvi.");
+            assert_eq!(numbered_marker(27, indent), "xxvii.");
+        }
+    }
+
+    #[test]
+    fn todo_opacity_fades_only_at_level_4_and_above() {
+        for indent in 0..=3 {
+            assert_eq!(todo_opacity(indent), 1.0);
+        }
+        assert!(todo_opacity(4) < 1.0);
+        assert!(todo_opacity(5) < todo_opacity(4));
+        assert!(todo_opacity(6) < todo_opacity(5));
+        assert!(todo_opacity(6) > 0.0);
+    }
+
+    #[test]
+    fn bullet_tab_shift_tab_and_typing_preserve_behavior() {
+        let mut h = Harness::new(
+            "t",
+            &[
+                (BlockKind::Bullet, "zero"),
+                (BlockKind::Bullet, "one"),
+                (BlockKind::Bullet, "two"),
+                (BlockKind::Bullet, "three"),
+            ],
+        );
+        h.caret_in(1, 3);
+        h.key(Key::Tab, Modifiers::NONE);
+        h.type_text("!");
+        h.caret_in(2, 3);
+        h.key(Key::Tab, Modifiers::NONE);
+        h.key(Key::Tab, Modifiers::NONE);
+        h.caret_in(3, 5);
+        h.key(Key::Tab, Modifiers::NONE);
+        h.key(Key::Tab, Modifiers::NONE);
+        h.key(Key::Tab, Modifiers::NONE);
+
+        let indents: Vec<u8> = h.app.page.blocks.iter().map(|b| b.indent).collect();
+        assert_eq!(indents, [0, 1, 2, 3]);
+        assert_eq!(h.texts(), ["zero", "one!", "two", "three"]);
+
+        h.key(Key::Tab, Modifiers::SHIFT);
+        assert_eq!(h.app.page.blocks[3].indent, 2);
     }
 }
