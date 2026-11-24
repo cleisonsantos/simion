@@ -666,6 +666,8 @@ impl App {
         let output = scroll.show_viewport(ui, |ui, viewport| {
             self.editor_content(ui, viewport, actions);
         });
+        ui.ctx()
+            .data_mut(|data| data.insert_temp(editor_viewport_id(), output.inner_rect));
         ui.ctx().data_mut(|data| {
             data.insert_temp(
                 paging_id,
@@ -3083,20 +3085,17 @@ impl App {
     }
 
     fn point_in_text(&self, pos: egui::Pos2, dragging: bool) -> Option<(usize, usize)> {
-        let (index, block) = self
-            .page
-            .blocks
-            .iter()
-            .enumerate()
-            .filter(|(_, b)| self.block_rects.contains_key(&b.id))
-            .filter(|(_, b)| dragging || self.block_rects[&b.id].contains(pos))
-            .min_by(|(_, a), (_, b)| {
-                let distance = |id| {
-                    let r = self.block_rects[&id];
-                    (pos.y - pos.y.clamp(r.top(), r.bottom())).abs()
-                };
-                distance(a.id).total_cmp(&distance(b.id))
-            })?;
+        let index = pick_text_block(
+            self.page
+                .blocks
+                .iter()
+                .enumerate()
+                .filter_map(|(i, b)| self.block_rects.get(&b.id).map(|r| (i, *r))),
+            pos,
+            dragging,
+            DRAG_HIT_TOLERANCE * self.zoom,
+        )?;
+        let block = &self.page.blocks[index];
         // Non-text blocks have a row rect but no galley; their only valid
         // text endpoint is offset zero.
         let offset = self.block_galleys.get(&block.id).map_or(0, |(g, origin)| {
@@ -3108,7 +3107,23 @@ impl App {
         Some((index, offset))
     }
 
+    /// Keyboard/programmatic span activation: keeps the head on screen.
     fn activate_span(&mut self, ctx: &egui::Context, span: TextSpan) {
+        // A stale flag (release lost outside the window) must not disable
+        // keyboard scrolling, so also require the button to be held.
+        let dragging = self.text_dragging && ctx.input(|i| i.pointer.primary_down());
+        let scroll = span_should_scroll(dragging);
+        self.set_span(ctx, span, scroll);
+    }
+
+    /// Pointer span activation. The head is under the pointer, so it is
+    /// already visible; scrolling here would move the block geometry under
+    /// the pointer and feed back into the next hit-test (#88).
+    fn activate_span_pointer(&mut self, ctx: &egui::Context, span: TextSpan) {
+        self.set_span(ctx, span, false);
+    }
+
+    fn set_span(&mut self, ctx: &egui::Context, span: TextSpan, scroll: bool) {
         self.block_selection = None;
         self.text_span = Some(span);
         self.text_anchor = Some(span.anchor);
@@ -3118,7 +3133,9 @@ impl App {
             ctx.memory_mut(|m| m.surrender_focus(block_te_id(block.id)));
         }
         self.focus = Focus::None;
-        self.scroll_to = self.page.blocks.get(span.head.0).map(|b| b.id);
+        if scroll {
+            self.scroll_to = self.page.blocks.get(span.head.0).map(|b| b.id);
+        }
     }
 
     fn span_pointer(&mut self, ctx: &egui::Context) {
@@ -3158,7 +3175,7 @@ impl App {
                             _ => None,
                         })
                         .unwrap_or(point);
-                    self.activate_span(
+                    self.activate_span_pointer(
                         ctx,
                         TextSpan {
                             anchor,
@@ -3187,13 +3204,16 @@ impl App {
             })
         });
         if (down || released) && (self.text_dragging || left_origin) {
-            if let Some((anchor, head)) = self
-                .text_anchor
-                .zip(pos.and_then(|p| self.point_in_text(p, true)))
-            {
+            // Outside the visible editor (toolbar, title, window edge) or
+            // between distant blocks there is no head: keep the current one.
+            let viewport = ctx.data(|d| d.get_temp::<Rect>(editor_viewport_id()));
+            let head = pos
+                .filter(|p| viewport.is_none_or(|v| v.y_range().contains(p.y)))
+                .and_then(|p| self.point_in_text(p, true));
+            if let Some((anchor, head)) = self.text_anchor.zip(head) {
                 if anchor != head || self.text_dragging {
                     self.text_dragging = true;
-                    self.activate_span(ctx, TextSpan { anchor, head });
+                    self.activate_span_pointer(ctx, TextSpan { anchor, head });
                 }
             }
         }
@@ -3971,6 +3991,45 @@ pub fn status_bar(app: &mut App, ui: &mut Ui) {
     });
 }
 
+/// Vertical slack for drag hit-testing, in logical points before zoom. It
+/// bridges the inter-block gap without letting far-away blocks win.
+const DRAG_HIT_TOLERANCE: f32 = 8.0;
+
+fn editor_viewport_id() -> Id {
+    Id::unique("simion-editor-viewport")
+}
+
+/// Only keyboard-driven span changes may scroll; an active pointer drag
+/// must never schedule a scroll (#88).
+fn span_should_scroll(text_dragging: bool) -> bool {
+    !text_dragging
+}
+
+/// Pick the block under `pos`. A press needs the exact rect. A drag accepts
+/// a rect expanded vertically by `tolerance` and ignores x, so the pointer
+/// may leave the text column sideways; above, below or far between blocks
+/// there is no hit, and the caller keeps its previous head.
+fn pick_text_block(
+    rects: impl Iterator<Item = (usize, Rect)>,
+    pos: egui::Pos2,
+    dragging: bool,
+    tolerance: f32,
+) -> Option<usize> {
+    rects
+        .filter(|(_, r)| {
+            if dragging {
+                r.y_range().expand(tolerance).contains(pos.y)
+            } else {
+                r.contains(pos)
+            }
+        })
+        .min_by(|(_, a), (_, b)| {
+            let distance = |r: &Rect| (pos.y - pos.y.clamp(r.top(), r.bottom())).abs();
+            distance(a).total_cmp(&distance(b))
+        })
+        .map(|(index, _)| index)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -4178,6 +4237,117 @@ mod tests {
             modifiers: Modifiers::NONE,
         }]);
         h.idle();
+    }
+
+    #[test]
+    fn drag_hit_test_requires_pointer_near_a_block() {
+        let rects = [
+            (0, Rect::from_min_max(pos2(0.0, 100.0), pos2(400.0, 130.0))),
+            (1, Rect::from_min_max(pos2(0.0, 132.0), pos2(400.0, 160.0))),
+            (2, Rect::from_min_max(pos2(0.0, 300.0), pos2(400.0, 330.0))),
+        ];
+        let pick = |y: f32, x: f32, dragging| {
+            pick_text_block(rects.iter().copied(), pos2(x, y), dragging, 8.0)
+        };
+        // Above every block: no hit (it used to snap to block 0).
+        assert_eq!(pick(10.0, 50.0, true), None);
+        assert_eq!(pick(91.0, 50.0, true), None);
+        // Below every block.
+        assert_eq!(pick(400.0, 50.0, true), None);
+        // Far between blocks.
+        assert_eq!(pick(220.0, 50.0, true), None);
+        // Inside a block, including outside the text column horizontally.
+        assert_eq!(pick(115.0, 50.0, true), Some(0));
+        assert_eq!(pick(115.0, 900.0, true), Some(0));
+        assert_eq!(pick(315.0, 50.0, true), Some(2));
+        // Small gaps and edges are bridged by the tolerance; nearest wins.
+        assert_eq!(pick(131.0, 50.0, true), Some(0));
+        assert_eq!(pick(131.5, 50.0, true), Some(1));
+        assert_eq!(pick(95.0, 50.0, true), Some(0));
+        assert_eq!(pick(166.0, 50.0, true), Some(1));
+        // A press still needs the exact rect.
+        assert_eq!(pick(95.0, 50.0, false), None);
+        assert_eq!(pick(115.0, 900.0, false), None);
+        assert_eq!(pick(115.0, 50.0, false), Some(0));
+    }
+
+    #[test]
+    fn span_scroll_only_outside_pointer_drag() {
+        assert!(span_should_scroll(false));
+        assert!(!span_should_scroll(true));
+    }
+
+    fn press(h: &mut Harness, pos: egui::Pos2, pressed: bool) {
+        h.frame(vec![
+            Event::PointerMoved(pos),
+            Event::PointerButton {
+                pos,
+                button: egui::PointerButton::Primary,
+                pressed,
+                modifiers: Modifiers::NONE,
+            },
+        ]);
+    }
+
+    #[test]
+    fn cross_block_drag_never_scrolls_or_jumps_to_top() {
+        let texts: Vec<String> = (0..40).map(|i| format!("paragrafo {i:02}")).collect();
+        let blocks: Vec<_> = texts
+            .iter()
+            .map(|t| (BlockKind::Paragraph, t.as_str()))
+            .collect();
+        let mut h = Harness::new("", &blocks);
+        // Scroll down so block 0 is above the viewport but still laid out.
+        for _ in 0..2 {
+            h.key(Key::PageDown, Modifiers::NONE);
+            h.idle();
+        }
+        let viewport: Rect = h.ctx.data(|d| d.get_temp(editor_viewport_id())).unwrap();
+        let visible: Vec<usize> = (0..40)
+            .filter(|&i| {
+                h.app
+                    .block_rects
+                    .get(&h.id(i))
+                    .is_some_and(|r| viewport.contains_rect(*r))
+            })
+            .collect();
+        assert!(visible.len() > 6, "{visible:?}");
+        assert!(visible[0] > 0);
+        let (from, to) = (visible[2], visible[5]);
+        let top = |h: &Harness| h.app.block_rects[&h.id(from)].top();
+        let before = top(&h);
+        let center =
+            |h: &Harness, i| h.app.block_rects[&h.id(i)].left_center() + vec2(GUTTER + 20.0, 0.0);
+
+        let start = center(&h, from);
+        press(&mut h, start, true);
+        for i in from..=to {
+            let p = center(&h, i);
+            h.frame(vec![Event::PointerMoved(p)]);
+            assert_eq!(top(&h), before, "scrolled while dragging over {i}");
+        }
+        h.frame(vec![Event::PointerMoved(center(&h, to))]);
+        assert_eq!(h.app.text_span.map(|s| s.head.0), Some(to));
+        assert!(h.app.scroll_to.is_none());
+
+        // Leave the editor upwards: the head stays on the last valid block.
+        let above = pos2(start.x, viewport.top() - 20.0);
+        for _ in 0..4 {
+            h.frame(vec![Event::PointerMoved(above)]);
+            assert_eq!(top(&h), before);
+            assert_eq!(h.app.text_span.map(|s| s.head.0), Some(to));
+        }
+        // Back inside, upwards, then release.
+        let p = center(&h, from + 1);
+        h.frame(vec![Event::PointerMoved(p)]);
+        assert_eq!(h.app.text_span.map(|s| s.head.0), Some(from + 1));
+        press(&mut h, p, false);
+        h.idle();
+        assert_eq!(top(&h), before);
+        let span = h.app.text_span.unwrap();
+        assert_eq!(span.anchor.0, from);
+        assert_eq!(span.head.0, from + 1);
+        assert!(!h.app.text_dragging);
     }
 
     fn bar_state(h: &Harness) -> FormatBarState {
