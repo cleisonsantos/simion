@@ -6,6 +6,7 @@ use eframe::egui::{
 };
 
 use crate::app::{Action, App, Focus, PendingFocus};
+use crate::emoji_data::{self, EmojiCategory};
 use crate::markdown;
 use crate::model::{Block, BlockKind};
 use crate::syntax;
@@ -15,12 +16,6 @@ use crate::theme::{
 };
 use crate::ui as widgets;
 use crate::updater::{self, UpdateStatus};
-
-const EMOJIS: [&str; 48] = [
-    "📄", "📝", "📚", "📌", "💡", "✅", "🚀", "⭐", "❤", "🎯", "🔥", "🌱", "🍀", "🌊", "☀", "🌙",
-    "🎵", "🎨", "🏠", "💼", "📅", "🔍", "⚙", "🔒", "🎁", "🐱", "🐶", "🍎", "🌻", "🌈", "☕", "🏆",
-    "📷", "✏", "📎", "🎓", "💬", "🛠", "🎉", "🔬", "🔖", "📊", "🗺", "⏰", "💎", "🐢", "🌸", "🍕",
-];
 
 impl App {
     pub fn overlays(&mut self, ctx: &Context) -> Vec<Action> {
@@ -629,11 +624,18 @@ impl App {
             return;
         };
         let p = self.palette;
-        let width = 8.0 * 34.0 + 16.0;
-        let height = 340.0;
+        let width = 324.0;
+        let inner_width = width - 16.0;
+        let height = 430.0;
         let pos = menu_pos(ctx, anchor, width, height);
         let mut close = false;
         let current = self.page.meta.icon.clone();
+        let focus = std::mem::take(&mut self.emoji_focus);
+        let mut query = self.emoji_query.clone();
+        let mut category = self.emoji_category;
+        let mut custom = self.emoji_custom.clone();
+        let recents = self.recent_emojis.clone();
+
         let area = egui::Area::new(Id::unique("simion-emoji"))
             .order(Order::Foreground)
             .fixed_pos(pos)
@@ -641,38 +643,153 @@ impl App {
                 widgets::popup_frame(&p)
                     .inner_margin(Margin::same(8))
                     .show(ui, |ui| {
-                        ui.set_width(width - 16.0);
+                        ui.set_width(inner_width);
                         ui.label(RichText::new("Ícone da página").size(10.5).color(p.faint));
                         ui.add_space(4.0);
-                        for chunk in EMOJIS.chunks(8) {
-                            ui.horizontal(|ui| {
-                                ui.spacing_mut().item_spacing = vec2(0.0, 0.0);
-                                for emoji in chunk {
-                                    let (rect, response) =
-                                        ui.allocate_exact_size(vec2(34.0, 34.0), Sense::click());
-                                    let selected = current == *emoji;
-                                    if response.hovered() || selected {
-                                        ui.painter().rect_filled(
-                                            rect,
-                                            7,
-                                            if selected { p.accent_soft } else { p.hover },
+
+                        let search_resp = ui.add(
+                            egui::TextEdit::singleline(&mut query)
+                                .id(Id::unique("simion-emoji-search"))
+                                .hint_text("Buscar emoji (ex.: fogo, flower)…")
+                                .desired_width(f32::INFINITY),
+                        );
+                        if focus {
+                            search_resp.request_focus();
+                        }
+                        ui.add_space(6.0);
+
+                        let search_active = !query.trim().is_empty();
+                        ui.horizontal_wrapped(|ui| {
+                            ui.spacing_mut().item_spacing = vec2(4.0, 4.0);
+                            for tab in EmojiCategory::TABS {
+                                let selected = !search_active && category == tab;
+                                if emoji_category_pill(ui, tab.label(), selected, &p).clicked() {
+                                    category = tab;
+                                    query.clear();
+                                }
+                            }
+                        });
+                        ui.add_space(6.0);
+
+                        let items: Vec<(&str, Option<&str>)> = if search_active {
+                            emoji_data::search(&query)
+                                .into_iter()
+                                .map(|entry| (entry.emoji, Some(entry.name)))
+                                .collect()
+                        } else if category == EmojiCategory::Recents {
+                            recents
+                                .iter()
+                                .map(|emoji| {
+                                    let name = emoji_data::CATALOG
+                                        .iter()
+                                        .find(|entry| entry.emoji == emoji)
+                                        .map(|entry| entry.name);
+                                    (emoji.as_str(), name)
+                                })
+                                .collect()
+                        } else {
+                            emoji_data::by_category(category)
+                                .into_iter()
+                                .map(|entry| (entry.emoji, Some(entry.name)))
+                                .collect()
+                        };
+
+                        if search_active
+                            && search_resp.lost_focus()
+                            && ui.input(|i| i.key_pressed(egui::Key::Enter))
+                            && let Some((first_emoji, _)) = items.first()
+                        {
+                            actions.push(Action::SetPageIcon((*first_emoji).to_owned()));
+                            close = true;
+                        }
+
+                        ScrollArea::vertical()
+                            .id_salt("simion-emoji-grid")
+                            .max_height(216.0)
+                            .auto_shrink([false, false])
+                            .show(ui, |ui| {
+                                ui.set_min_width(ui.available_width());
+                                if items.is_empty() {
+                                    ui.add_space(16.0);
+                                    ui.vertical_centered(|ui| {
+                                        let empty_msg = if search_active {
+                                            "Nenhum emoji encontrado"
+                                        } else {
+                                            "Nenhum emoji recente ainda"
+                                        };
+                                        ui.label(
+                                            RichText::new(empty_msg).size(12.5).color(p.faint),
                                         );
-                                    }
-                                    ui.painter().text(
-                                        rect.center(),
-                                        Align2::CENTER_CENTER,
-                                        emoji,
-                                        FontId::new(20.0, FontFamily::Proportional),
-                                        p.text,
-                                    );
-                                    if response.clicked() {
-                                        actions.push(Action::SetPageIcon((*emoji).to_owned()));
-                                        close = true;
+                                    });
+                                    ui.add_space(16.0);
+                                } else {
+                                    for chunk in items.chunks(8) {
+                                        ui.horizontal(|ui| {
+                                            ui.spacing_mut().item_spacing = vec2(0.0, 0.0);
+                                            for (emoji, name) in chunk {
+                                                let (rect, response) = ui.allocate_exact_size(
+                                                    vec2(36.0, 36.0),
+                                                    Sense::click(),
+                                                );
+                                                let selected = current == *emoji;
+                                                if response.hovered() || selected {
+                                                    ui.painter().rect_filled(
+                                                        rect,
+                                                        7,
+                                                        if selected {
+                                                            p.accent_soft
+                                                        } else {
+                                                            p.hover
+                                                        },
+                                                    );
+                                                }
+                                                ui.painter().text(
+                                                    rect.center(),
+                                                    Align2::CENTER_CENTER,
+                                                    *emoji,
+                                                    FontId::new(20.0, FontFamily::Proportional),
+                                                    p.text,
+                                                );
+                                                let clicked = response.clicked();
+                                                if let Some(name) = name {
+                                                    response.on_hover_text(*name);
+                                                }
+                                                if clicked {
+                                                    actions.push(Action::SetPageIcon(
+                                                        (*emoji).to_owned(),
+                                                    ));
+                                                    close = true;
+                                                }
+                                            }
+                                        });
                                     }
                                 }
                             });
-                        }
-                        ui.add_space(4.0);
+
+                        ui.add_space(6.0);
+                        widgets::hairline(ui, &p);
+                        ui.add_space(6.0);
+
+                        ui.horizontal(|ui| {
+                            ui.spacing_mut().item_spacing.x = 6.0;
+                            let custom_resp = ui.add(
+                                egui::TextEdit::singleline(&mut custom)
+                                    .id(Id::unique("simion-emoji-custom"))
+                                    .hint_text("Colar emoji (ex.: 🫠)…")
+                                    .desired_width((inner_width - 66.0).max(120.0)),
+                            );
+                            let parsed_custom = emoji_data::normalize_custom_emoji(&custom);
+                            let use_btn = emoji_use_button(ui, "Usar", parsed_custom.is_some(), &p);
+                            let submitted = use_btn.clicked()
+                                || (custom_resp.lost_focus()
+                                    && ui.input(|i| i.key_pressed(egui::Key::Enter)));
+                            if submitted && let Some(icon) = parsed_custom {
+                                actions.push(Action::SetPageIcon(icon));
+                                close = true;
+                            }
+                        });
+
+                        ui.add_space(6.0);
                         widgets::hairline(ui, &p);
                         ui.add_space(2.0);
                         if widgets::menu_row(ui, "Remover ícone", None, false, false, &p).clicked()
@@ -682,8 +799,13 @@ impl App {
                         }
                     });
             });
+
         if close || self.outside_click(ctx, area.response.rect) {
-            self.emoji_picker = None;
+            self.close_emoji_picker();
+        } else {
+            self.emoji_query = query;
+            self.emoji_category = category;
+            self.emoji_custom = custom;
         }
     }
 
@@ -1371,6 +1493,50 @@ fn fold(text: &str) -> String {
             other => other,
         })
         .collect()
+}
+
+fn emoji_category_pill(ui: &mut Ui, label: &str, selected: bool, p: &Palette) -> egui::Response {
+    let text_color = if selected { p.accent_text } else { p.muted };
+    let galley = ui.painter().layout_no_wrap(
+        label.to_owned(),
+        FontId::new(11.5, family(FONT_MEDIUM)),
+        text_color,
+    );
+    let size = vec2(galley.size().x + 12.0, 22.0);
+    let (rect, response) = ui.allocate_exact_size(size, Sense::click());
+    if selected {
+        ui.painter().rect_filled(rect, 6, p.accent_soft);
+    } else if response.hovered() {
+        ui.painter().rect_filled(rect, 6, p.hover);
+    }
+    ui.painter()
+        .galley(rect.center() - galley.size() / 2.0, galley, text_color);
+    response
+}
+
+fn emoji_use_button(ui: &mut Ui, label: &str, enabled: bool, p: &Palette) -> egui::Response {
+    let text_color = if enabled { p.bg } else { p.faint };
+    let galley = ui.painter().layout_no_wrap(
+        label.to_owned(),
+        FontId::new(12.5, family(FONT_SEMIBOLD)),
+        text_color,
+    );
+    let size = vec2(58.0, 26.0);
+    let (rect, response) = ui.allocate_exact_size(size, Sense::click());
+    if enabled {
+        let fill = if response.hovered() {
+            p.text.gamma_multiply(0.86)
+        } else {
+            p.text
+        };
+        ui.painter().rect_filled(rect, 6, fill);
+    } else {
+        ui.painter()
+            .rect_stroke(rect, 6, Stroke::new(1.0, p.border), StrokeKind::Inside);
+    }
+    ui.painter()
+        .galley(rect.center() - galley.size() / 2.0, galley, text_color);
+    response
 }
 
 fn menu_pos(ctx: &Context, pos: Pos2, width: f32, height: f32) -> Pos2 {
