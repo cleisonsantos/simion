@@ -176,6 +176,11 @@ pub struct App {
     pub code_lang_focus: bool,
     pub page_menu: Option<(PageId, Pos2)>,
     pub emoji_picker: Option<Pos2>,
+    pub emoji_query: String,
+    pub emoji_category: crate::emoji_data::EmojiCategory,
+    pub emoji_custom: String,
+    pub emoji_focus: bool,
+    pub recent_emojis: Vec<String>,
 
     pub sidebar_visible: bool,
     pub format_bar_visible: bool,
@@ -383,6 +388,11 @@ impl App {
             code_lang_focus: false,
             page_menu: None,
             emoji_picker: None,
+            emoji_query: String::new(),
+            emoji_category: crate::emoji_data::EmojiCategory::All,
+            emoji_custom: String::new(),
+            emoji_focus: false,
+            recent_emojis: Vec::new(),
             sidebar_visible: true,
             format_bar_visible: false,
             sidebar_rect: None,
@@ -438,6 +448,13 @@ impl App {
             store.setting("search_match_case").ok().flatten().as_deref() == Some("1");
         self.search.whole_word =
             store.setting("search_whole_word").ok().flatten().as_deref() == Some("1");
+        self.recent_emojis = crate::emoji_data::parse_recent_emojis(
+            store
+                .setting(crate::emoji_data::RECENT_EMOJIS_KEY)
+                .ok()
+                .flatten()
+                .as_deref(),
+        );
         self.palette = palette(self.mode);
         self.pages = store.list_pages().unwrap_or_default();
 
@@ -627,7 +644,7 @@ impl App {
         self.block_menu = None;
         self.code_lang_menu = None;
         self.page_menu = None;
-        self.emoji_picker = None;
+        self.close_emoji_picker();
         self.focus = Focus::None;
         self.pending = None;
         self.scroll_to = None;
@@ -1798,20 +1815,28 @@ impl App {
             Action::OpenPageMenu(id, pos) => {
                 self.page_menu = Some((id, pos));
                 self.block_menu = None;
-                self.emoji_picker = None;
+                self.close_emoji_picker();
                 self.popup_guard = self.now + 0.2;
             }
             Action::OpenEmojiPicker(pos) => {
-                self.emoji_picker = Some(pos);
-                self.page_menu = None;
-                self.popup_guard = self.now + 0.2;
+                self.open_emoji_picker(pos);
             }
             Action::SetPageIcon(icon) => {
+                let normalized =
+                    crate::emoji_data::normalize_custom_emoji(&icon).unwrap_or_default();
                 self.begin_change();
-                self.page.meta.icon = icon;
+                self.page.meta.icon = normalized.clone();
                 self.end_change();
                 self.save_now();
-                self.emoji_picker = None;
+                if let Some(id) = self.current
+                    && let Some(meta) = self.pages.iter_mut().find(|page| page.id == id)
+                {
+                    meta.icon = self.page.meta.icon.clone();
+                }
+                if !normalized.is_empty() {
+                    self.record_recent_emoji(&normalized);
+                }
+                self.close_emoji_picker();
             }
             Action::ToggleTodo(id) => {
                 if let Some(index) = self.index_of(id) {
@@ -1842,7 +1867,7 @@ impl App {
                 self.block_menu = Some((id, pos));
                 self.block_menu_transform = false;
                 self.page_menu = None;
-                self.emoji_picker = None;
+                self.close_emoji_picker();
                 self.popup_guard = self.now + 0.2;
             }
             Action::Transform(id, kind) => {
@@ -1881,7 +1906,7 @@ impl App {
                 self.open_code_lang_menu(id, pos);
                 self.block_menu = None;
                 self.page_menu = None;
-                self.emoji_picker = None;
+                self.close_emoji_picker();
                 self.popup_guard = self.now + 0.2;
             }
             Action::SetBlockLang(id, lang) => self.apply_code_lang(id, &lang),
@@ -1966,7 +1991,36 @@ impl App {
         self.page_menu = None;
         self.block_menu = None;
         self.code_lang_menu = None;
+        self.close_emoji_picker();
+    }
+
+    pub(crate) fn open_emoji_picker(&mut self, pos: Pos2) {
+        self.emoji_picker = Some(pos);
+        self.emoji_query.clear();
+        self.emoji_custom.clear();
+        self.emoji_category = crate::emoji_data::EmojiCategory::All;
+        self.emoji_focus = true;
+        self.page_menu = None;
+        self.block_menu = None;
+        self.code_lang_menu = None;
+        self.popup_guard = self.now + 0.2;
+    }
+
+    pub(crate) fn close_emoji_picker(&mut self) {
         self.emoji_picker = None;
+        self.emoji_query.clear();
+        self.emoji_custom.clear();
+        self.emoji_category = crate::emoji_data::EmojiCategory::All;
+        self.emoji_focus = false;
+    }
+
+    fn record_recent_emoji(&mut self, icon: &str) {
+        if crate::emoji_data::record_recent_emoji(&mut self.recent_emojis, icon)
+            && let Some(store) = self.store.as_mut()
+        {
+            let value = crate::emoji_data::format_recent_emojis(&self.recent_emojis);
+            let _ = store.set_setting(crate::emoji_data::RECENT_EMOJIS_KEY, &value);
+        }
     }
 
     // -----------------------------------------------------------------------
@@ -2073,11 +2127,16 @@ impl App {
             self.code_lang_keys(ctx);
             return;
         }
-        if self.block_menu.is_some() || self.page_menu.is_some() || self.emoji_picker.is_some() {
+        if self.emoji_picker.is_some() {
+            if self.consume(ctx, Key::Escape, Modifiers::NONE) {
+                self.close_emoji_picker();
+            }
+            return;
+        }
+        if self.block_menu.is_some() || self.page_menu.is_some() {
             if self.consume(ctx, Key::Escape, Modifiers::NONE) {
                 self.block_menu = None;
                 self.page_menu = None;
-                self.emoji_picker = None;
                 return;
             }
             let key_pressed = ctx.input(|input| {
@@ -2091,7 +2150,6 @@ impl App {
             if key_pressed {
                 self.block_menu = None;
                 self.page_menu = None;
-                self.emoji_picker = None;
             }
             return;
         }
@@ -3558,5 +3616,117 @@ mod tests {
             speed > 40.0,
             "a rodinha precisa ser mais rapida que o padrao do egui"
         );
+    }
+
+    #[test]
+    fn emoji_picker_sets_icon_syncs_sidebar_and_persists_recents() {
+        let (mut app, path, _a, b, _c) = seeded_root_app("emoji-recents");
+        let ctx = Context::default();
+        app.boot();
+        app.load_page_from_db(b);
+
+        // Emoji fora do catálogo (colagem livre) vira ícone no cabeçalho e na sidebar.
+        app.apply_action(Action::SetPageIcon(" 🫠 ".to_owned()), &ctx);
+        assert_eq!(app.page.meta.icon, "🫠");
+        assert_eq!(
+            app.pages
+                .iter()
+                .find(|meta| meta.id == b)
+                .map(|meta| meta.icon.as_str()),
+            Some("🫠")
+        );
+        assert_eq!(app.recent_emojis, vec!["🫠".to_owned()]);
+
+        // Inserir mais 8 emojis mantém no máximo 8, na ordem mais recente primeiro.
+        for emoji in ["🔥", "❤", "🌸", "🚀", "⭐", "🍕", "🐱", "🐶"] {
+            app.apply_action(Action::SetPageIcon(emoji.to_owned()), &ctx);
+        }
+        assert_eq!(
+            app.recent_emojis.len(),
+            crate::emoji_data::RECENT_EMOJIS_LIMIT
+        );
+        assert_eq!(app.recent_emojis[0], "🐶");
+        assert!(!app.recent_emojis.contains(&"🫠".to_owned()));
+
+        // Remover ícone limpa a página sem apagar nem poluir `recent_emojis`.
+        let before_remove = app.recent_emojis.clone();
+        app.apply_action(Action::SetPageIcon(String::new()), &ctx);
+        assert_eq!(app.page.meta.icon, "");
+        assert_eq!(
+            app.pages
+                .iter()
+                .find(|meta| meta.id == b)
+                .map(|meta| meta.icon.as_str()),
+            Some("")
+        );
+        assert_eq!(app.recent_emojis, before_remove);
+
+        // Fechar e reabrir restaura `recent_emojis` a partir da tabela `settings`.
+        drop(app);
+        let mut reopened = App::blank();
+        reopened.store = Some(Store::open(&path).unwrap());
+        reopened.boot();
+        assert_eq!(reopened.recent_emojis, before_remove);
+
+        drop(reopened);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn emoji_picker_typing_stays_open_escape_and_page_switch_reset_state() {
+        let (mut app, path, a, b, _c) = seeded_root_app("emoji-picker-ui");
+        let ctx = Context::default();
+        crate::theme::install_fonts(&ctx);
+        app.boot();
+        app.load_page_from_db(a);
+
+        // Abre o popover e confirma estado inicial padrão ("Todos").
+        app.apply_action(Action::OpenEmojiPicker(Pos2::new(260.0, 120.0)), &ctx);
+        assert!(app.emoji_picker.is_some());
+        assert_eq!(app.emoji_category, crate::emoji_data::EmojiCategory::All);
+        assert!(app.emoji_query.is_empty());
+        assert!(app.emoji_custom.is_empty());
+
+        // Um frame renderiza o popover e foca o campo de busca.
+        real_ui_frame(&ctx, &mut app, Vec::new());
+        assert!(app.emoji_picker.is_some());
+
+        // Digitar texto no campo de busca não fecha o popover.
+        real_ui_frame(&ctx, &mut app, vec![egui::Event::Text("fogo".to_owned())]);
+        assert!(app.emoji_picker.is_some());
+        assert_eq!(app.emoji_query, "fogo");
+
+        // Esc fecha o popover e limpa o estado transitório.
+        real_ui_frame(
+            &ctx,
+            &mut app,
+            vec![egui::Event::Key {
+                key: Key::Escape,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: Modifiers::NONE,
+            }],
+        );
+        assert!(app.emoji_picker.is_none());
+        assert!(app.emoji_query.is_empty());
+        assert!(app.emoji_custom.is_empty());
+        assert_eq!(app.emoji_category, crate::emoji_data::EmojiCategory::All);
+
+        // Trocar de página limpa o estado do popover, mantendo `recent_emojis`.
+        app.apply_action(Action::SetPageIcon("🔥".to_owned()), &ctx);
+        app.apply_action(Action::OpenEmojiPicker(Pos2::new(260.0, 120.0)), &ctx);
+        app.emoji_query = "flower".to_owned();
+        app.emoji_custom = "🫠".to_owned();
+        app.emoji_category = crate::emoji_data::EmojiCategory::Food;
+        app.open_page(b);
+        assert!(app.emoji_picker.is_none());
+        assert!(app.emoji_query.is_empty());
+        assert!(app.emoji_custom.is_empty());
+        assert_eq!(app.emoji_category, crate::emoji_data::EmojiCategory::All);
+        assert_eq!(app.recent_emojis, vec!["🔥".to_owned()]);
+
+        drop(app);
+        let _ = std::fs::remove_file(path);
     }
 }

@@ -2,6 +2,7 @@
 
 mod app;
 mod editor;
+mod emoji_data;
 mod icon;
 mod icons;
 mod images;
