@@ -244,7 +244,7 @@ impl App {
             if action == 4 {
                 self.insert_link(id, (a, b));
             } else {
-                self.inline_toggle(["**", "*", "~~", "`"][action], id, (a, b));
+                self.inline_toggle(INLINE_FORMAT_MARKERS[action], id, (a, b));
             }
             if let Some(range) = self.pending.take().and_then(|p| p.range) {
                 // Keep the label selected; insert_link normally selects its URL for keyboard editing.
@@ -2321,24 +2321,16 @@ impl App {
             }
         }
         if kind.accepts_text() {
-            if self.consume_pub(ctx, Key::B, Modifiers::COMMAND) {
-                self.inline_toggle("**", id, (selection_start, selection_end));
-                return;
-            }
-            if self.consume_pub(ctx, Key::I, Modifiers::COMMAND) {
-                self.inline_toggle("*", id, (selection_start, selection_end));
-                return;
-            }
-            if self.consume_pub(ctx, Key::E, Modifiers::COMMAND) {
-                self.inline_toggle("`", id, (selection_start, selection_end));
-                return;
-            }
-            if self.consume_pub(ctx, Key::S, Modifiers::COMMAND | Modifiers::SHIFT) {
-                self.inline_toggle("~~", id, (selection_start, selection_end));
-                return;
-            }
-            if self.consume_pub(ctx, Key::K, Modifiers::COMMAND | Modifiers::SHIFT) {
-                self.insert_link(id, (selection_start, selection_end));
+            if let Some(action) = consume_inline_format_action(ctx) {
+                if action == 4 {
+                    self.insert_link(id, (selection_start, selection_end));
+                } else {
+                    self.inline_toggle(
+                        INLINE_FORMAT_MARKERS[action],
+                        id,
+                        (selection_start, selection_end),
+                    );
+                }
                 return;
             }
             if self.consume_pub(ctx, Key::Num1, Modifiers::COMMAND | Modifiers::ALT) {
@@ -3314,6 +3306,12 @@ impl App {
             }
             return true;
         }
+        if let Some(action) = consume_inline_format_action(ctx) {
+            if !self.format_selection(ctx).is_empty() {
+                self.apply_format_bar(ctx, action);
+            }
+            return true;
+        }
         if self.consume_pub(ctx, Key::Backspace, Modifiers::NONE)
             || self.consume_pub(ctx, Key::Delete, Modifiers::NONE)
         {
@@ -3512,6 +3510,12 @@ impl App {
             self.block_selection = None;
             return false;
         }
+        if let Some(action) = consume_inline_format_action(ctx) {
+            if !self.format_selection(ctx).is_empty() {
+                self.apply_format_bar(ctx, action);
+            }
+            return true;
+        }
         let mut replacement = String::new();
         let mut typed = false;
         ctx.input_mut(|input| {
@@ -3687,6 +3691,55 @@ fn take_event(ctx: &egui::Context, wanted: impl Fn(&egui::Event) -> bool) -> boo
             input.events.remove(position);
             true
         })
+    })
+}
+
+const INLINE_FORMAT_MARKERS: [&str; 4] = ["**", "*", "~~", "`"];
+
+/// Matches an inline formatting shortcut when Command/Ctrl and the expected
+/// Shift state are present, ignoring Alt (ABNT2 AltGr arrives as Ctrl+Alt).
+fn inline_shortcut_matches(modifiers: Modifiers, shift: bool) -> bool {
+    (modifiers.command || modifiers.ctrl) && modifiers.shift == shift
+}
+
+/// Consumes one of the 5 inline formatting shortcuts (Ctrl+B/I/E, Ctrl+Shift+S/K)
+/// and returns its `apply_format_bar` action index.
+fn consume_inline_format_action(ctx: &egui::Context) -> Option<usize> {
+    const SHORTCUTS: [(Key, bool, usize); 5] = [
+        (Key::B, false, 0),
+        (Key::I, false, 1),
+        (Key::S, true, 2),
+        (Key::E, false, 3),
+        (Key::K, true, 4),
+    ];
+    ctx.input_mut(|input| {
+        let found = input.events.iter().enumerate().find_map(|(pos, event)| {
+            let egui::Event::Key {
+                key,
+                pressed: true,
+                modifiers,
+                ..
+            } = event
+            else {
+                return None;
+            };
+            SHORTCUTS.iter().find_map(|&(wanted, shift, action)| {
+                (*key == wanted && inline_shortcut_matches(*modifiers, shift)).then_some((
+                    pos,
+                    action,
+                    modifiers.alt,
+                ))
+            })
+        });
+        let (pos, action, had_alt) = found?;
+        input.events.remove(pos);
+        if had_alt {
+            // AltGr (Ctrl+Alt on ABNT2) may also emit a composed character.
+            input
+                .events
+                .retain(|event| !matches!(event, egui::Event::Text(_)));
+        }
+        Some(action)
     })
 }
 
@@ -6774,5 +6827,277 @@ mod tests {
 
         h.key(Key::Tab, Modifiers::SHIFT);
         assert_eq!(h.app.page.blocks[3].indent, 2);
+    }
+
+    #[test]
+    fn inline_shortcut_modifier_matching_ignores_only_alt() {
+        for mods in [
+            Modifiers::COMMAND,
+            Modifiers::CTRL,
+            Modifiers::CTRL | Modifiers::COMMAND,
+            Modifiers::CTRL | Modifiers::ALT,
+            Modifiers::COMMAND | Modifiers::ALT,
+            Modifiers::CTRL | Modifiers::COMMAND | Modifiers::ALT,
+        ] {
+            assert!(inline_shortcut_matches(mods, false), "{mods:?}");
+            assert!(!inline_shortcut_matches(mods, true), "{mods:?}");
+        }
+
+        for mods in [
+            Modifiers::COMMAND | Modifiers::SHIFT,
+            Modifiers::CTRL | Modifiers::SHIFT,
+            Modifiers::CTRL | Modifiers::COMMAND | Modifiers::SHIFT,
+            Modifiers::CTRL | Modifiers::ALT | Modifiers::SHIFT,
+            Modifiers::COMMAND | Modifiers::ALT | Modifiers::SHIFT,
+            Modifiers::CTRL | Modifiers::COMMAND | Modifiers::ALT | Modifiers::SHIFT,
+        ] {
+            assert!(inline_shortcut_matches(mods, true), "{mods:?}");
+            assert!(!inline_shortcut_matches(mods, false), "{mods:?}");
+        }
+
+        for mods in [
+            Modifiers::NONE,
+            Modifiers::ALT,
+            Modifiers::SHIFT,
+            Modifiers::ALT | Modifiers::SHIFT,
+        ] {
+            assert!(!inline_shortcut_matches(mods, false), "{mods:?}");
+            assert!(!inline_shortcut_matches(mods, true), "{mods:?}");
+        }
+    }
+
+    #[test]
+    fn inline_shortcuts_format_cross_block_text_span_and_keep_selection() {
+        let mut h = Harness::new(
+            "t",
+            &[
+                (BlockKind::Paragraph, "alpha one"),
+                (BlockKind::Paragraph, "beta two"),
+            ],
+        );
+        h.app.activate_span(
+            &h.ctx,
+            TextSpan {
+                anchor: (0, 2),
+                head: (1, 4),
+            },
+        );
+        h.idle();
+
+        h.key(Key::B, Modifiers::COMMAND);
+        assert_eq!(h.texts(), ["al**pha one**", "**beta** two"]);
+        assert_eq!(h.app.text_span.unwrap().ordered(), ((0, 4), (1, 6)));
+        assert_eq!(h.app.focus, Focus::None);
+
+        let mut italic = Harness::new(
+            "t",
+            &[
+                (BlockKind::Paragraph, "alpha one"),
+                (BlockKind::Paragraph, "beta two"),
+            ],
+        );
+        italic.app.activate_span(
+            &italic.ctx,
+            TextSpan {
+                anchor: (0, 2),
+                head: (1, 4),
+            },
+        );
+        italic.idle();
+
+        italic.key(Key::I, Modifiers::COMMAND);
+        assert_eq!(italic.texts(), ["al*pha one*", "*beta* two"]);
+        assert_eq!(italic.app.text_span.unwrap().ordered(), ((0, 3), (1, 5)));
+        assert_eq!(italic.app.focus, Focus::None);
+
+        for (key, mods, expected_a, expected_b, expected_span) in [
+            (
+                Key::E,
+                Modifiers::COMMAND,
+                "al`pha one`",
+                "`beta` two",
+                ((0, 3), (1, 5)),
+            ),
+            (
+                Key::S,
+                Modifiers::COMMAND | Modifiers::SHIFT,
+                "al~~pha one~~",
+                "~~beta~~ two",
+                ((0, 4), (1, 6)),
+            ),
+            (
+                Key::K,
+                Modifiers::COMMAND | Modifiers::SHIFT,
+                "al[pha one](https://)",
+                "[beta](https://) two",
+                ((0, 3), (1, 5)),
+            ),
+        ] {
+            let mut h = Harness::new(
+                "t",
+                &[
+                    (BlockKind::Paragraph, "alpha one"),
+                    (BlockKind::Paragraph, "beta two"),
+                ],
+            );
+            h.app.activate_span(
+                &h.ctx,
+                TextSpan {
+                    anchor: (0, 2),
+                    head: (1, 4),
+                },
+            );
+            h.idle();
+            h.key(key, mods);
+            assert_eq!(h.texts(), [expected_a, expected_b]);
+            assert_eq!(h.app.text_span.unwrap().ordered(), expected_span);
+            assert_eq!(h.app.focus, Focus::None);
+        }
+    }
+
+    #[test]
+    fn inline_shortcuts_format_block_selection_from_shift_down() {
+        let mut h = Harness::new(
+            "t",
+            &[
+                (BlockKind::Paragraph, "alpha one"),
+                (BlockKind::Paragraph, "beta two"),
+                (BlockKind::Paragraph, "gamma three"),
+            ],
+        );
+        h.click_in(0, 2);
+        h.key(Key::ArrowDown, Modifiers::SHIFT);
+        h.key(Key::ArrowDown, Modifiers::SHIFT);
+        assert_eq!(h.app.block_selection, Some((h.id(0), h.id(1))));
+
+        h.key(Key::B, Modifiers::COMMAND);
+        assert_eq!(h.texts(), ["**alpha one**", "**beta two**", "gamma three"]);
+        assert_eq!(h.app.block_selection, Some((h.id(0), h.id(1))));
+        assert_eq!(h.app.focus, Focus::None);
+
+        // Second Ctrl+B toggles bold off on both selected blocks, keeping selection.
+        h.key(Key::B, Modifiers::COMMAND);
+        assert_eq!(h.texts(), ["alpha one", "beta two", "gamma three"]);
+        assert_eq!(h.app.block_selection, Some((h.id(0), h.id(1))));
+
+        // Ctrl+I wraps both selected blocks in italic.
+        h.key(Key::I, Modifiers::COMMAND);
+        assert_eq!(h.texts(), ["*alpha one*", "*beta two*", "gamma three"]);
+        assert_eq!(h.app.block_selection, Some((h.id(0), h.id(1))));
+    }
+
+    #[test]
+    fn inline_shortcuts_accept_altgr_ctrl_alt_without_weakening_other_shortcuts() {
+        let mut h = Harness::new("t", &[(BlockKind::Paragraph, "alpha one")]);
+        h.click_in(0, 0);
+        h.app.pending = Some(PendingFocus {
+            target: Focus::Block(h.id(0)),
+            range: Some((2, 9)),
+            select_all: false,
+        });
+        h.idle();
+
+        // AltGr on ABNT2 arrives as Ctrl+Alt and may also carry a composed Text event.
+        h.frame(vec![
+            Event::Key {
+                key: Key::B,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: Modifiers::CTRL | Modifiers::ALT,
+            },
+            Event::Text("“".to_owned()),
+        ]);
+        h.idle();
+        assert_eq!(h.texts(), ["al**pha one**"]);
+
+        // Ctrl+Alt+Shift+S applies strikethrough.
+        h.key(
+            Key::S,
+            Modifiers::CTRL | Modifiers::COMMAND | Modifiers::ALT | Modifiers::SHIFT,
+        );
+        assert_eq!(h.texts(), ["al**~~pha one~~**"]);
+
+        // Accidental Shift on B does NOT match Ctrl+B; plain Alt+B does NOT match either.
+        h.key(Key::B, Modifiers::COMMAND | Modifiers::SHIFT);
+        h.key(Key::B, Modifiers::ALT);
+        assert_eq!(h.texts(), ["al**~~pha one~~**"]);
+
+        // Other shortcuts keep exact modifier matching: Ctrl+1 != Ctrl+Alt+1.
+        h.key(Key::Num1, Modifiers::COMMAND);
+        assert_eq!(h.app.page.blocks[0].kind, BlockKind::Paragraph);
+        h.key(Key::Num1, Modifiers::COMMAND | Modifiers::ALT);
+        assert_eq!(h.app.page.blocks[0].kind, BlockKind::Heading1);
+
+        // AltGr Ctrl+Alt+B on a cross-block span formats both blocks and does not replace text.
+        let mut span = Harness::new(
+            "t",
+            &[
+                (BlockKind::Paragraph, "alpha one"),
+                (BlockKind::Paragraph, "beta two"),
+            ],
+        );
+        span.app.activate_span(
+            &span.ctx,
+            TextSpan {
+                anchor: (0, 2),
+                head: (1, 4),
+            },
+        );
+        span.idle();
+        span.frame(vec![
+            Event::Key {
+                key: Key::B,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: Modifiers::CTRL | Modifiers::ALT,
+            },
+            Event::Text("“".to_owned()),
+        ]);
+        span.idle();
+        assert_eq!(span.texts(), ["al**pha one**", "**beta** two"]);
+        assert_eq!(span.app.text_span.unwrap().ordered(), ((0, 4), (1, 6)));
+    }
+
+    #[test]
+    fn inline_shortcuts_preserve_single_block_caret_title_and_search_overlay() {
+        // Cases A & B: single-block selection Ctrl+B and Ctrl+I.
+        for (key, expected) in [(Key::B, "al**pha one**"), (Key::I, "al*pha one*")] {
+            let mut h = Harness::new("t", &[(BlockKind::Paragraph, "alpha one")]);
+            h.click_in(0, 0);
+            h.app.pending = Some(PendingFocus {
+                target: Focus::Block(h.id(0)),
+                range: Some((2, 9)),
+                select_all: false,
+            });
+            h.idle();
+            h.key(key, Modifiers::COMMAND);
+            assert_eq!(h.texts(), [expected]);
+        }
+
+        // Case C: no selection, caret in the middle, Ctrl+B.
+        let mut caret = Harness::new("t", &[(BlockKind::Paragraph, "alpha one")]);
+        caret.click_in(0, 5);
+        caret.key(Key::B, Modifiers::COMMAND);
+        assert_eq!(caret.texts(), ["alpha**** one"]);
+
+        // Case E: title focused, Ctrl+B / Ctrl+Alt+B is a no-op.
+        let mut title = Harness::new("titulo", &[(BlockKind::Paragraph, "alpha one")]);
+        title.app.focus_title(3);
+        title.idle();
+        title.key(Key::B, Modifiers::COMMAND);
+        title.key(Key::B, Modifiers::CTRL | Modifiers::ALT);
+        assert_eq!(title.app.page.meta.title, "titulo");
+        assert_eq!(title.texts(), ["alpha one"]);
+
+        // Case F: search overlay open (Ctrl+K), Ctrl+B / Ctrl+Alt+B does not leak to editor.
+        let mut search = Harness::new("t", &[(BlockKind::Paragraph, "alpha one")]);
+        search.click_in(0, 5);
+        search.key(Key::K, Modifiers::COMMAND);
+        assert!(search.app.search.open);
+        search.key(Key::B, Modifiers::COMMAND);
+        search.key(Key::B, Modifiers::CTRL | Modifiers::ALT);
+        assert_eq!(search.texts(), ["alpha one"]);
     }
 }
