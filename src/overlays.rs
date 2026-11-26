@@ -1422,7 +1422,7 @@ impl App {
                 painter.text(
                     inner.center() + vec2(0.0, 22.0),
                     Align2::CENTER_CENTER,
-                    "O arquivo .md vira uma nova página",
+                    ".md vira nova página · imagem (PNG/JPEG/GIF/WebP) vira bloco",
                     FontId::new(13.0, family(FONT_BODY)),
                     Color32::from_rgb(200, 200, 198),
                 );

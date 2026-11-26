@@ -2323,6 +2323,11 @@ pub(crate) fn should_parse_paste(text: &str) -> bool {
     text.contains('\n') || crate::markdown::looks_like_markdown(text)
 }
 
+fn is_markdown_path(path: &Path) -> bool {
+    path.extension()
+        .is_some_and(|ext| ext.eq_ignore_ascii_case("md") || ext.eq_ignore_ascii_case("markdown"))
+}
+
 /// Inserts an image block at `index` (replacing an empty paragraph) and finds
 /// the block that should receive the caret right after it.
 ///
@@ -2532,6 +2537,59 @@ impl App {
         self.toast("Markdown colado");
     }
 
+    fn insert_image_data(
+        &mut self,
+        bytes: Vec<u8>,
+        mime: &str,
+        width: u32,
+        height: u32,
+        index: usize,
+    ) -> Option<usize> {
+        let Some(page_id) = self.current else {
+            self.toast("Não foi possível inserir a imagem");
+            return None;
+        };
+        // The assets foreign key needs a persisted page. Pages are saved when
+        // they are opened or created, but keep the guard for blank states.
+        let page_exists = self
+            .store
+            .as_ref()
+            .and_then(|store| store.page_meta(page_id).ok().flatten())
+            .is_some();
+        if !page_exists {
+            self.toast("Não foi possível inserir a imagem");
+            return None;
+        }
+
+        self.begin_change();
+        let asset = {
+            let Some(store) = self.store.as_ref() else {
+                return None;
+            };
+            store.insert_asset(page_id, mime, &bytes, width, height)
+        };
+        let asset_id = match asset {
+            Ok(id) => id,
+            Err(err) => {
+                // The page was not touched yet, so history stays consistent.
+                self.toast(format!("Erro ao salvar imagem: {err}"));
+                return None;
+            }
+        };
+        self.asset_sizes.insert(asset_id, (width, height));
+        let (image_index, focus_id) =
+            insert_image_block(&mut self.page.blocks, index, asset_id, &mut self.ids);
+        self.end_change();
+        self.focus = Focus::Block(focus_id);
+        self.pending = Some(PendingFocus {
+            target: Focus::Block(focus_id),
+            range: Some((0, 0)),
+            select_all: false,
+        });
+        self.scroll_to = Some(focus_id);
+        Some(image_index)
+    }
+
     fn paste_image(&mut self, image: &egui::ColorImage, block_id: u64) {
         let Some(index) = self.index_of(block_id) else {
             return;
@@ -2547,61 +2605,58 @@ impl App {
             self.toast(err);
             return;
         }
-        let Some(page_id) = self.current else {
-            self.toast("Não foi possível colar a imagem");
-            return;
-        };
-        // The assets foreign key needs a persisted page. Pages are saved when
-        // they are opened or created, but keep the guard for blank states.
-        let page_exists = self
-            .store
-            .as_ref()
-            .and_then(|store| store.page_meta(page_id).ok().flatten())
-            .is_some();
-        if !page_exists {
-            self.toast("Não foi possível colar a imagem");
-            return;
-        }
-
-        self.begin_change();
-        let asset = {
-            let Some(store) = self.store.as_ref() else {
-                return;
-            };
-            store.insert_asset(page_id, "image/png", &png, width, height)
-        };
-        let asset_id = match asset {
-            Ok(id) => id,
-            Err(err) => {
-                // The page was not touched yet, so history stays consistent.
-                self.toast(format!("Erro ao salvar imagem: {err}"));
-                return;
-            }
-        };
-        self.asset_sizes.insert(asset_id, (width, height));
-        let (_, focus_id) =
-            insert_image_block(&mut self.page.blocks, index, asset_id, &mut self.ids);
-        self.end_change();
-        self.focus = Focus::Block(focus_id);
-        self.pending = Some(PendingFocus {
-            target: Focus::Block(focus_id),
-            range: Some((0, 0)),
-            select_all: false,
-        });
-        self.scroll_to = Some(focus_id);
+        self.insert_image_data(png, "image/png", width, height, index);
     }
 
     fn handle_files(&mut self, ctx: &Context) {
         self.file_hover = ctx.input(|input| !input.raw.hovered_files.is_empty());
-        let dropped: Vec<_> = ctx.input(|input| input.raw.dropped_files.clone());
-        for file in dropped {
-            let path = file.path().to_path_buf();
-            if path.extension().is_some_and(|ext| {
-                ext.eq_ignore_ascii_case("md") || ext.eq_ignore_ascii_case("markdown")
-            }) {
+        let dropped: Vec<PathBuf> = ctx.input(|input| {
+            input
+                .raw
+                .dropped_files
+                .iter()
+                .map(|file| file.path().to_path_buf())
+                .collect()
+        });
+        if !dropped.is_empty() {
+            self.handle_dropped_paths(dropped);
+        }
+    }
+
+    fn handle_dropped_paths(&mut self, paths: Vec<PathBuf>) {
+        let mut last_image_index: Option<usize> = None;
+        for path in paths {
+            if is_markdown_path(&path) {
                 self.import_markdown(path);
-            } else {
-                self.toast("Solte apenas arquivos .md");
+                last_image_index = None;
+                continue;
+            }
+            if let Ok(meta) = std::fs::metadata(&path)
+                && meta.len() > images::MAX_IMAGE_BYTES as u64
+            {
+                self.toast(images::check_size(images::MAX_IMAGE_BYTES + 1).unwrap_err());
+                continue;
+            }
+            let bytes = match std::fs::read(&path) {
+                Ok(bytes) => bytes,
+                Err(err) => {
+                    self.toast(format!("Não foi possível ler o arquivo: {err}"));
+                    continue;
+                }
+            };
+            let (bytes, mime, width, height) = match images::prepare_file(&bytes) {
+                Ok(prepared) => prepared,
+                Err(err) => {
+                    self.toast(err);
+                    continue;
+                }
+            };
+            let index = last_image_index.unwrap_or_else(|| match self.focus {
+                Focus::Block(id) => self.index_of(id).unwrap_or(self.page.blocks.len()),
+                _ => self.page.blocks.len(),
+            });
+            if let Some(image_index) = self.insert_image_data(bytes, &mime, width, height, index) {
+                last_image_index = Some(image_index);
             }
         }
     }
@@ -3456,6 +3511,125 @@ mod tests {
         assert_eq!(blocks[0].kind, BlockKind::Image);
         assert_eq!(blocks[1].kind, BlockKind::Heading1);
         assert_eq!(focus, 2);
+    }
+
+    #[test]
+    fn dropped_images_insert_in_order_and_skip_invalid_or_oversized_files() {
+        let (mut app, db_path, a, _b, _c) = seeded_root_app("drop-images");
+        {
+            let store = app.store.as_mut().unwrap();
+            let meta = store.page_meta(a).unwrap().unwrap();
+            store
+                .save_page(&Page {
+                    meta,
+                    blocks: vec![
+                        Block::with_text(1, BlockKind::Paragraph, "antes"),
+                        Block::with_text(2, BlockKind::Paragraph, "depois"),
+                    ],
+                })
+                .unwrap();
+        }
+        app.reload_pages();
+        app.load_page_from_db(a);
+
+        let dir = std::env::temp_dir().join(format!("simion-drop-test-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+
+        let png_bytes = images::encode_png(&[255, 0, 0, 255, 0, 255, 0, 255], 2, 1).unwrap();
+        let mut jpg_cursor = std::io::Cursor::new(Vec::new());
+        image::DynamicImage::ImageRgb8(image::RgbImage::from_fn(3, 2, |x, y| {
+            image::Rgb([(x * 50) as u8, (y * 80) as u8, 200])
+        }))
+        .write_to(&mut jpg_cursor, image::ImageFormat::Jpeg)
+        .unwrap();
+        let jpg_bytes = jpg_cursor.into_inner();
+
+        let png_path = dir.join("primeira.png");
+        let txt_path = dir.join("invalido.txt");
+        let big_path = dir.join("gigante.png");
+        let jpg_path = dir.join("segunda.jpg");
+        let md_path = dir.join("nota-importada.md");
+
+        std::fs::write(&png_path, &png_bytes).unwrap();
+        std::fs::write(&txt_path, b"nao e imagem").unwrap();
+        std::fs::write(&big_path, vec![0u8; images::MAX_IMAGE_BYTES + 1]).unwrap();
+        std::fs::write(&jpg_path, &jpg_bytes).unwrap();
+        std::fs::write(&md_path, b"# Ola\n\nTexto").unwrap();
+
+        // 1. Com foco no primeiro bloco: insere as duas imagens na ordem entre "antes" e "depois",
+        //    pulando o .txt e o arquivo > 10 MB sem abortar o lote.
+        let first_id = app.page.blocks[0].id;
+        app.focus = Focus::Block(first_id);
+        app.handle_dropped_paths(vec![
+            png_path.clone(),
+            txt_path.clone(),
+            big_path.clone(),
+            jpg_path.clone(),
+        ]);
+
+        assert_eq!(
+            app.page
+                .blocks
+                .iter()
+                .map(|block| block.kind)
+                .collect::<Vec<_>>(),
+            vec![
+                BlockKind::Paragraph,
+                BlockKind::Image,
+                BlockKind::Image,
+                BlockKind::Paragraph,
+            ]
+        );
+        assert_eq!(app.page.blocks[0].text, "antes");
+        assert_eq!(app.page.blocks[3].text, "depois");
+        let id1: u64 = app.page.blocks[1].text.parse().unwrap();
+        let id2: u64 = app.page.blocks[2].text.parse().unwrap();
+        let asset1 = app.store.as_ref().unwrap().asset(id1).unwrap().unwrap();
+        let asset2 = app.store.as_ref().unwrap().asset(id2).unwrap().unwrap();
+        assert_eq!(asset1.mime, "image/png");
+        assert_eq!(asset1.bytes, png_bytes);
+        assert_eq!((asset1.width, asset1.height), (2, 1));
+        assert_eq!(asset2.mime, "image/jpeg");
+        assert_eq!(asset2.bytes, jpg_bytes);
+        assert_eq!((asset2.width, asset2.height), (3, 2));
+
+        // 2. Arquivo > 10 MB sozinho: mostra toast de limite e nao grava novo asset.
+        let count_before = app.asset_sizes.len();
+        app.handle_dropped_paths(vec![big_path.clone()]);
+        assert_eq!(app.asset_sizes.len(), count_before);
+        assert_eq!(
+            app.toast.as_ref().map(|t| t.text.as_str()),
+            Some("Imagem muito grande (máx. 10 MB)")
+        );
+
+        // 3. Sem bloco focado: acrescenta imagem no fim da pagina atual.
+        app.focus = Focus::None;
+        app.handle_dropped_paths(vec![png_path.clone()]);
+        assert_eq!(
+            app.page
+                .blocks
+                .iter()
+                .map(|block| block.kind)
+                .collect::<Vec<_>>(),
+            vec![
+                BlockKind::Paragraph,
+                BlockKind::Image,
+                BlockKind::Image,
+                BlockKind::Paragraph,
+                BlockKind::Image,
+                BlockKind::Paragraph,
+            ]
+        );
+
+        // 4. .md continua sendo roteado para importacao de pagina.
+        let pages_before = app.pages.len();
+        app.handle_dropped_paths(vec![md_path.clone()]);
+        assert_eq!(app.pages.len(), pages_before + 1);
+        assert_eq!(app.page.meta.title, "nota-importada");
+
+        drop(app);
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_file(&db_path);
     }
     #[test]
     fn search_options_default_off_and_survive_reopening() {
