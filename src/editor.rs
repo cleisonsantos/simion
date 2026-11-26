@@ -1708,7 +1708,17 @@ impl App {
         let width = (text_width - GUTTER).max(40.0);
         let height = self.image_height(asset_id, text_width);
         let (rect, response) = ui.allocate_exact_size(vec2(text_width, height), Sense::click());
-        self.block_context_menu(ui, &response, id, actions);
+        let multi_selected = self
+            .block_selection_range()
+            .is_some_and(|(lo, hi)| lo != hi);
+        if multi_selected {
+            self.block_context_menu(ui, &response, id, actions);
+        } else if response.secondary_clicked() {
+            let pos = response
+                .interact_pointer_pos()
+                .unwrap_or_else(|| rect.center());
+            actions.push(Action::OpenBlockMenu(id, pos));
+        }
 
         let image_rect = Rect::from_min_size(
             pos2(rect.left() + GUTTER, rect.top() + 4.0),
@@ -1756,7 +1766,7 @@ impl App {
 
     /// Loads and caches the texture for `asset_id`. Failed/missing assets are
     /// cached too, so a broken reference costs one decode per page opening.
-    fn ensure_texture(&mut self, ctx: &egui::Context, asset_id: u64) -> bool {
+    pub(crate) fn ensure_texture(&mut self, ctx: &egui::Context, asset_id: u64) -> bool {
         if self.textures.contains_key(&asset_id) {
             return true;
         }
@@ -1834,6 +1844,7 @@ impl App {
             || self.search.open
             || self.shortcuts_open
             || self.markdown_open
+            || self.image_viewer.is_some()
             || self.confirm_delete.is_some();
         if overlays_open {
             return false;

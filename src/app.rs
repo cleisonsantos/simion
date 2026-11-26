@@ -108,6 +108,9 @@ pub enum Action {
     DeleteBlock(u64),
     MoveBlock(u64, i32),
     CopyBlock(u64),
+    CopyImage(u64),
+    OpenImageViewer(u64),
+    StartReplaceImage(u64),
     FocusBlock {
         id: u64,
         range: (usize, usize),
@@ -194,6 +197,13 @@ pub struct App {
     /// Total de blocos no SQLite, recalculado ao abrir as configurações.
     pub settings_block_count: i64,
     pub confirm_delete: Option<PageId>,
+    /// Asset id shown in the full-size image modal viewer.
+    pub image_viewer: Option<u64>,
+    /// Image block id waiting for a `Ctrl+V` paste to replace its asset.
+    pub pending_image_replace: Option<u64>,
+    pub pending_image_replace_until: f64,
+    /// Kept alive so X11 clipboard ownership survives after `set_image`.
+    clipboard: Option<arboard::Clipboard>,
 
     pub toast: Option<Toast>,
     pub update: UpdateState,
@@ -402,6 +412,10 @@ impl App {
             settings_open: false,
             settings_block_count: 0,
             confirm_delete: None,
+            image_viewer: None,
+            pending_image_replace: None,
+            pending_image_replace_until: 0.0,
+            clipboard: None,
             toast: None,
             update: UpdateState::default(),
             update_rx: None,
@@ -644,6 +658,9 @@ impl App {
         self.block_menu = None;
         self.code_lang_menu = None;
         self.page_menu = None;
+        self.image_viewer = None;
+        self.pending_image_replace = None;
+        self.pending_image_replace_until = 0.0;
         self.close_emoji_picker();
         self.focus = Focus::None;
         self.pending = None;
@@ -1968,6 +1985,43 @@ impl App {
                     self.block_menu = None;
                 }
             }
+            Action::CopyImage(id) => {
+                self.block_menu = None;
+                self.copy_image(id);
+            }
+            Action::OpenImageViewer(id) => {
+                self.block_menu = None;
+                if let Some(asset_id) = self.image_asset_id(id) {
+                    self.image_viewer = Some(asset_id);
+                    ctx.memory_mut(|memory| {
+                        if let Some(focused) = memory.focused() {
+                            memory.surrender_focus(focused);
+                        }
+                    });
+                } else {
+                    self.toast("Imagem indisponível");
+                }
+            }
+            Action::StartReplaceImage(id) => {
+                self.block_menu = None;
+                if self
+                    .index_of(id)
+                    .is_some_and(|index| self.page.blocks[index].kind == BlockKind::Image)
+                {
+                    self.pending_image_replace = Some(id);
+                    self.pending_image_replace_until = self.now + IMAGE_REPLACE_TIMEOUT_SECS;
+                    self.block_selection = None;
+                    self.text_span = None;
+                    self.pending = None;
+                    self.focus = Focus::Block(id);
+                    ctx.memory_mut(|memory| {
+                        if let Some(focused) = memory.focused() {
+                            memory.surrender_focus(focused);
+                        }
+                    });
+                    self.toast("Cole a nova imagem (Ctrl+V)");
+                }
+            }
             Action::FocusBlock { id, range } => {
                 self.pending = Some(PendingFocus {
                     target: Focus::Block(id),
@@ -2107,6 +2161,12 @@ impl App {
             }
             return;
         }
+        if self.image_viewer.is_some() {
+            if self.consume(ctx, Key::Escape, Modifiers::NONE) {
+                self.image_viewer = None;
+            }
+            return;
+        }
         if self.settings_open {
             if self.consume(ctx, Key::Escape, Modifiers::NONE)
                 || self.consume(ctx, Key::Comma, Modifiers::COMMAND)
@@ -2152,6 +2212,14 @@ impl App {
                 self.page_menu = None;
             }
             return;
+        }
+        if self.pending_image_replace.is_some() {
+            if self.now > self.pending_image_replace_until {
+                self.pending_image_replace = None;
+            } else if self.consume(ctx, Key::Escape, Modifiers::NONE) {
+                self.pending_image_replace = None;
+                return;
+            }
         }
 
         if self.consume(ctx, Key::K, Modifiers::COMMAND) {
@@ -2369,8 +2437,34 @@ fn insert_image_block(
     (image_index, focus)
 }
 
+pub(crate) const IMAGE_REPLACE_TIMEOUT_SECS: f64 = 15.0;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ImagePasteTarget {
+    Replace(u64),
+    Insert(u64),
+}
+
+pub(crate) fn resolve_image_paste_target(
+    focus: Focus,
+    pending_replace: Option<u64>,
+    expired: bool,
+) -> Option<ImagePasteTarget> {
+    let Focus::Block(block_id) = focus else {
+        return None;
+    };
+    if !expired && pending_replace == Some(block_id) {
+        Some(ImagePasteTarget::Replace(block_id))
+    } else {
+        Some(ImagePasteTarget::Insert(block_id))
+    }
+}
+
 impl App {
     pub(crate) fn handle_paste(&mut self, ctx: &Context) {
+        if self.pending_image_replace.is_some() && self.now > self.pending_image_replace_until {
+            self.pending_image_replace = None;
+        }
         if self.plain_paste_pending {
             if self.now > self.plain_paste_until {
                 self.plain_paste_pending = false;
@@ -2393,6 +2487,7 @@ impl App {
             || self.shortcuts_open
             || self.markdown_open
             || self.settings_open
+            || self.image_viewer.is_some()
             || self.block_menu.is_some()
             || self.code_lang_menu.is_some()
             || self.page_menu.is_some()
@@ -2418,10 +2513,35 @@ impl App {
         });
         if let Some(image) = pasted_image
             && self.block_selection_range().is_none()
-            && let Focus::Block(block_id) = self.focus
+            && let Some(target) = resolve_image_paste_target(
+                self.focus,
+                self.pending_image_replace,
+                self.now > self.pending_image_replace_until,
+            )
         {
-            self.paste_image(&image, block_id);
+            self.pending_image_replace = None;
+            match target {
+                ImagePasteTarget::Replace(block_id) => self.replace_image(&image, block_id),
+                ImagePasteTarget::Insert(block_id) => self.paste_image(&image, block_id),
+            }
             return;
+        }
+        if self.pending_image_replace.is_some() {
+            let mut discarded_text_paste = false;
+            ctx.input_mut(|input| {
+                input.events.retain(|event| {
+                    if matches!(event, egui::Event::Paste(_)) {
+                        discarded_text_paste = true;
+                        false
+                    } else {
+                        true
+                    }
+                })
+            });
+            if discarded_text_paste {
+                self.pending_image_replace = None;
+                return;
+            }
         }
         if self.block_selection_range().is_some() {
             let mut pasted = None;
@@ -2443,6 +2563,12 @@ impl App {
         let Focus::Block(block_id) = self.focus else {
             return;
         };
+        if self
+            .index_of(block_id)
+            .is_some_and(|index| !self.page.blocks[index].kind.accepts_text())
+        {
+            return;
+        }
         // Preserve line breaks and the caret; the editor owns block splitting.
         ctx.input_mut(|input| {
             input.events.retain(|event| {
@@ -2588,6 +2714,114 @@ impl App {
         });
         self.scroll_to = Some(focus_id);
         Some(image_index)
+    }
+
+    fn image_asset_id(&self, block_id: u64) -> Option<u64> {
+        let index = self.index_of(block_id)?;
+        let block = &self.page.blocks[index];
+        if block.kind != BlockKind::Image {
+            return None;
+        }
+        block.text.parse::<u64>().ok()
+    }
+
+    fn copy_image(&mut self, block_id: u64) {
+        match self.copy_image_inner(block_id) {
+            Ok(()) => self.toast("Imagem copiada"),
+            Err(err) => self.toast(format!("Não foi possível copiar a imagem: {err}")),
+        }
+    }
+
+    fn copy_image_inner(&mut self, block_id: u64) -> Result<(), String> {
+        let asset_id = self
+            .image_asset_id(block_id)
+            .ok_or_else(|| "imagem indisponível".to_owned())?;
+        let asset = self
+            .store
+            .as_ref()
+            .ok_or_else(|| "banco indisponível".to_owned())?
+            .asset(asset_id)
+            .map_err(|err| err.to_string())?
+            .ok_or_else(|| "asset não encontrado".to_owned())?;
+        let (rgba, width, height) = images::decode(&asset.bytes)?;
+        let image = arboard::ImageData {
+            width: width as usize,
+            height: height as usize,
+            bytes: std::borrow::Cow::Owned(rgba),
+        };
+        if self.clipboard.is_none() {
+            let clipboard = arboard::Clipboard::new().map_err(|err| err.to_string())?;
+            self.clipboard = Some(clipboard);
+        }
+        let result = self
+            .clipboard
+            .as_mut()
+            .expect("clipboard initialized")
+            .set_image(image);
+        if let Err(err) = result {
+            self.clipboard = None;
+            return Err(err.to_string());
+        }
+        Ok(())
+    }
+
+    fn replace_image(&mut self, image: &egui::ColorImage, block_id: u64) {
+        let Some(index) = self
+            .index_of(block_id)
+            .filter(|&i| self.page.blocks[i].kind == BlockKind::Image)
+        else {
+            return;
+        };
+        let (png, width, height) = match images::color_image_to_png(image) {
+            Ok(encoded) => encoded,
+            Err(_) => {
+                self.toast("Não foi possível substituir a imagem");
+                return;
+            }
+        };
+        if let Err(err) = images::check_size(png.len()) {
+            self.toast(err);
+            return;
+        }
+        let Some(page_id) = self.current else {
+            self.toast("Não foi possível substituir a imagem");
+            return;
+        };
+        let page_exists = self
+            .store
+            .as_ref()
+            .and_then(|store| store.page_meta(page_id).ok().flatten())
+            .is_some();
+        if !page_exists {
+            self.toast("Não foi possível substituir a imagem");
+            return;
+        }
+
+        self.begin_change();
+        let asset = {
+            let Some(store) = self.store.as_ref() else {
+                return;
+            };
+            store.insert_asset(page_id, "image/png", &png, width, height)
+        };
+        let new_asset_id = match asset {
+            Ok(id) => id,
+            Err(err) => {
+                self.toast(format!("Erro ao salvar imagem: {err}"));
+                return;
+            }
+        };
+        let old_asset_id = self.page.blocks[index].text.parse::<u64>().ok();
+        self.page.blocks[index].text = new_asset_id.to_string();
+        self.end_change();
+
+        self.asset_sizes.insert(new_asset_id, (width, height));
+        self.block_heights.remove(&block_id);
+        if let Some(old_id) = old_asset_id {
+            self.textures.remove(&old_id);
+            self.broken_assets.remove(&old_id);
+        }
+        self.toast("Imagem substituída");
     }
 
     fn paste_image(&mut self, image: &egui::ColorImage, block_id: u64) {
@@ -3902,5 +4136,376 @@ mod tests {
 
         drop(app);
         let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn resolve_image_paste_target_routes_replace_without_affecting_normal_paste() {
+        // Ctrl+V comum sem pendente insere bloco normalmente.
+        assert_eq!(
+            resolve_image_paste_target(Focus::Block(10), None, false),
+            Some(ImagePasteTarget::Insert(10))
+        );
+        // Pendente para outro bloco nao interfere no Ctrl+V no bloco focado.
+        assert_eq!(
+            resolve_image_paste_target(Focus::Block(10), Some(20), false),
+            Some(ImagePasteTarget::Insert(10))
+        );
+        // Foco casando com pendente ativo roteia para substituicao.
+        assert_eq!(
+            resolve_image_paste_target(Focus::Block(20), Some(20), false),
+            Some(ImagePasteTarget::Replace(20))
+        );
+        // Pendente expirado cai de volta para insercao normal.
+        assert_eq!(
+            resolve_image_paste_target(Focus::Block(20), Some(20), true),
+            Some(ImagePasteTarget::Insert(20))
+        );
+        // Sem bloco focado nao cola imagem.
+        assert_eq!(
+            resolve_image_paste_target(Focus::None, Some(20), false),
+            None
+        );
+        assert_eq!(
+            resolve_image_paste_target(Focus::Title, Some(20), false),
+            None
+        );
+    }
+
+    fn sample_color_image(w: usize, h: usize, color: egui::Color32) -> Arc<egui::ColorImage> {
+        Arc::new(egui::ColorImage::new([w, h], vec![color; w * h]))
+    }
+
+    #[test]
+    fn replace_image_swaps_asset_without_inserting_block_and_preserves_normal_paste() {
+        let (mut app, db_path, a, b, _c) = seeded_root_app("replace-image");
+        let old_png = images::encode_png(&[255, 0, 0, 255, 255, 0, 0, 255], 2, 1).unwrap();
+        let old_asset_id = {
+            let store = app.store.as_mut().unwrap();
+            let asset_id = store.insert_asset(a, "image/png", &old_png, 2, 1).unwrap();
+            let meta = store.page_meta(a).unwrap().unwrap();
+            store
+                .save_page(&Page {
+                    meta,
+                    blocks: vec![
+                        Block::with_text(1, BlockKind::Paragraph, "antes"),
+                        Block::with_text(2, BlockKind::Image, asset_id.to_string()),
+                        Block::with_text(3, BlockKind::Paragraph, "depois"),
+                    ],
+                })
+                .unwrap();
+            asset_id
+        };
+        app.reload_pages();
+        app.load_page_from_db(a);
+
+        let ctx = Context::default();
+        crate::theme::install_fonts(&ctx);
+        let para_id = app.page.blocks[0].id;
+        let img_id = app.page.blocks[1].id;
+
+        // Pre-popula textura e marca no cache de broken para confirmar limpeza na troca.
+        assert!(app.ensure_texture(&ctx, old_asset_id));
+        assert!(app.textures.contains_key(&old_asset_id));
+        app.broken_assets.insert(old_asset_id);
+
+        // 1. Iniciar substituicao foca o bloco de imagem e mostra o toast esperado.
+        app.apply_action(Action::StartReplaceImage(img_id), &ctx);
+        assert_eq!(app.pending_image_replace, Some(img_id));
+        assert_eq!(app.focus, Focus::Block(img_id));
+        assert_eq!(
+            app.toast.as_ref().map(|t| t.text.as_str()),
+            Some("Cole a nova imagem (Ctrl+V)")
+        );
+
+        // 2. Se o clipboard trouxer texto em vez de imagem, nada muda e o pending limpa.
+        real_ui_frame(&ctx, &mut app, vec![egui::Event::Paste("texto".to_owned())]);
+        assert_eq!(app.pending_image_replace, None);
+        assert_eq!(app.page.blocks.len(), 3);
+        assert_eq!(app.page.blocks[1].text, old_asset_id.to_string());
+
+        // 3. Escape tambem cancela o pending sem alterar o bloco.
+        app.apply_action(Action::StartReplaceImage(img_id), &ctx);
+        assert_eq!(app.pending_image_replace, Some(img_id));
+        real_ui_frame(
+            &ctx,
+            &mut app,
+            vec![egui::Event::Key {
+                key: Key::Escape,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: Modifiers::NONE,
+            }],
+        );
+        assert_eq!(app.pending_image_replace, None);
+        assert_eq!(app.page.blocks[1].text, old_asset_id.to_string());
+
+        // 4. Colar imagem com pending ativo substitui no mesmo bloco (nao insere bloco novo).
+        app.apply_action(Action::StartReplaceImage(img_id), &ctx);
+        let new_img = sample_color_image(4, 3, egui::Color32::from_rgb(0, 128, 255));
+        real_ui_frame(&ctx, &mut app, vec![egui::Event::PasteImage(new_img)]);
+
+        assert_eq!(app.pending_image_replace, None);
+        assert_eq!(app.page.blocks.len(), 3, "nao deve inserir bloco novo");
+        assert_eq!(app.page.blocks[1].kind, BlockKind::Image);
+        let new_asset_id: u64 = app.page.blocks[1].text.parse().unwrap();
+        assert_ne!(new_asset_id, old_asset_id);
+        assert_eq!(app.asset_sizes.get(&new_asset_id), Some(&(4, 3)));
+        assert!(!app.textures.contains_key(&old_asset_id));
+        assert!(!app.broken_assets.contains(&old_asset_id));
+        let stored = app
+            .store
+            .as_ref()
+            .unwrap()
+            .asset(new_asset_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(stored.mime, "image/png");
+        assert_eq!((stored.width, stored.height), (4, 3));
+
+        // 5. Undo restaura o asset antigo (troca ocorreu dentro de begin_change/end_change).
+        app.undo();
+        assert_eq!(app.page.blocks[1].text, old_asset_id.to_string());
+        app.redo();
+        assert_eq!(app.page.blocks[1].text, new_asset_id.to_string());
+
+        // 6. Ctrl+V normal em um paragrafo continua inserindo um novo bloco de imagem.
+        app.focus = Focus::Block(para_id);
+        let extra_img = sample_color_image(5, 2, egui::Color32::from_rgb(10, 200, 30));
+        real_ui_frame(&ctx, &mut app, vec![egui::Event::PasteImage(extra_img)]);
+        assert_eq!(app.page.blocks.len(), 5);
+        assert_eq!(app.page.blocks[1].kind, BlockKind::Image);
+        assert_eq!(app.page.blocks[2].kind, BlockKind::Paragraph);
+        assert_eq!(app.page.blocks[3].kind, BlockKind::Image);
+        assert_eq!(app.page.blocks[3].text, new_asset_id.to_string());
+
+        // 7. Trocar de pagina limpa pending_image_replace.
+        let kept_img_id = app.page.blocks[3].id;
+        app.apply_action(Action::StartReplaceImage(kept_img_id), &ctx);
+        assert_eq!(app.pending_image_replace, Some(kept_img_id));
+        app.open_page(b);
+        assert_eq!(app.pending_image_replace, None);
+
+        drop(app);
+        let _ = std::fs::remove_file(db_path);
+    }
+
+    #[test]
+    fn image_viewer_modal_caches_texture_blocks_editor_keys_and_closes() {
+        let (mut app, db_path, a, b, _c) = seeded_root_app("image-viewer");
+        let rgba = [20u8, 40, 60, 255].repeat(6);
+        let png = images::encode_png(&rgba, 3, 2).unwrap();
+        let asset_id = {
+            let store = app.store.as_mut().unwrap();
+            let asset_id = store.insert_asset(a, "image/png", &png, 3, 2).unwrap();
+            let meta = store.page_meta(a).unwrap().unwrap();
+            store
+                .save_page(&Page {
+                    meta,
+                    blocks: vec![
+                        Block::with_text(1, BlockKind::Paragraph, "ola"),
+                        Block::with_text(2, BlockKind::Image, asset_id.to_string()),
+                    ],
+                })
+                .unwrap();
+            asset_id
+        };
+        app.reload_pages();
+        app.load_page_from_db(a);
+
+        let ctx = Context::default();
+        crate::theme::install_fonts(&ctx);
+        let img_block_id = app.page.blocks[1].id;
+
+        assert!(app.textures.is_empty());
+        app.apply_action(Action::OpenImageViewer(img_block_id), &ctx);
+        assert_eq!(app.image_viewer, Some(asset_id));
+
+        // Renderiza o modal: deve carregar e guardar a textura no cache.
+        real_ui_frame(&ctx, &mut app, Vec::new());
+        assert_eq!(app.image_viewer, Some(asset_id));
+        let tex_id = app.textures.get(&asset_id).expect("textura carregada").id();
+
+        // Segundo frame reutiliza a mesma textura e nao deixa teclas vazarem para o editor.
+        real_ui_frame(
+            &ctx,
+            &mut app,
+            vec![
+                egui::Event::Text("x".to_owned()),
+                egui::Event::Key {
+                    key: Key::K,
+                    physical_key: None,
+                    pressed: true,
+                    repeat: false,
+                    modifiers: Modifiers::COMMAND,
+                },
+            ],
+        );
+        assert_eq!(app.textures.get(&asset_id).unwrap().id(), tex_id);
+        assert!(!app.search.open, "atalho nao deve vazar com modal aberto");
+        assert_eq!(app.page.blocks[0].text, "ola");
+
+        // Escape fecha o visualizador.
+        real_ui_frame(
+            &ctx,
+            &mut app,
+            vec![egui::Event::Key {
+                key: Key::Escape,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: Modifiers::NONE,
+            }],
+        );
+        assert_eq!(app.image_viewer, None);
+
+        // Trocar de pagina tambem fecha o visualizador.
+        app.apply_action(Action::OpenImageViewer(img_block_id), &ctx);
+        assert_eq!(app.image_viewer, Some(asset_id));
+        app.open_page(b);
+        assert_eq!(app.image_viewer, None);
+
+        drop(app);
+        let _ = std::fs::remove_file(db_path);
+    }
+
+    #[test]
+    fn copy_image_error_toasts_without_touching_text_clipboard() {
+        let (mut app, db_path, a, _b, _c) = seeded_root_app("copy-image-err");
+        {
+            let store = app.store.as_mut().unwrap();
+            let meta = store.page_meta(a).unwrap().unwrap();
+            store
+                .save_page(&Page {
+                    meta,
+                    blocks: vec![Block::with_text(1, BlockKind::Image, "999999")],
+                })
+                .unwrap();
+        }
+        app.reload_pages();
+        app.load_page_from_db(a);
+
+        let ctx = Context::default();
+        let img_block_id = app.page.blocks[0].id;
+        app.apply_action(Action::CopyImage(img_block_id), &ctx);
+        let toast = app.toast.as_ref().map(|t| t.text.as_str()).unwrap_or("");
+        assert!(
+            toast.starts_with("Não foi possível copiar a imagem: "),
+            "toast inesperado: {toast}"
+        );
+
+        drop(app);
+        let _ = std::fs::remove_file(db_path);
+    }
+
+    fn rendered_texts(shapes: &[egui::epaint::ClippedShape]) -> Vec<String> {
+        let mut out = Vec::new();
+        fn visit(shape: &egui::Shape, out: &mut Vec<String>) {
+            match shape {
+                egui::Shape::Text(text) => out.push(text.galley.text().to_owned()),
+                egui::Shape::Vec(children) => {
+                    for child in children {
+                        visit(child, out);
+                    }
+                }
+                _ => {}
+            }
+        }
+        for clipped in shapes {
+            visit(&clipped.shape, &mut out);
+        }
+        out
+    }
+
+    #[test]
+    fn block_menu_shows_image_items_only_for_image_blocks() {
+        let (mut app, db_path, a, _b, _c) = seeded_root_app("block-menu-image");
+        let rgba = [10u8, 20, 30, 255].repeat(4);
+        let png = images::encode_png(&rgba, 2, 2).unwrap();
+        let asset_id = {
+            let store = app.store.as_mut().unwrap();
+            let asset_id = store.insert_asset(a, "image/png", &png, 2, 2).unwrap();
+            let meta = store.page_meta(a).unwrap().unwrap();
+            store
+                .save_page(&Page {
+                    meta,
+                    blocks: vec![
+                        Block::with_text(1, BlockKind::Paragraph, "texto"),
+                        Block::with_text(2, BlockKind::Image, asset_id.to_string()),
+                    ],
+                })
+                .unwrap();
+            asset_id
+        };
+        app.reload_pages();
+        app.load_page_from_db(a);
+
+        let ctx = Context::default();
+        crate::theme::install_fonts(&ctx);
+        let para_id = app.page.blocks[0].id;
+        let img_id = app.page.blocks[1].id;
+        assert_eq!(app.page.blocks[1].text, asset_id.to_string());
+
+        let render_menu = |app: &mut App, block_id: u64| -> Vec<String> {
+            app.apply_action(
+                Action::OpenBlockMenu(block_id, Pos2::new(260.0, 180.0)),
+                &ctx,
+            );
+            let mut last_texts = Vec::new();
+            for _ in 0..2 {
+                let input = egui::RawInput {
+                    screen_rect: Some(Rect::from_min_size(Pos2::ZERO, egui::vec2(900.0, 700.0))),
+                    ..Default::default()
+                };
+                let mut frame = eframe::Frame::_new_kittest();
+                let mut output = ctx.run_ui(input, |ui| eframe::App::ui(app, ui, &mut frame));
+                output.textures_delta.clear();
+                last_texts = rendered_texts(&output.shapes);
+            }
+            last_texts
+        };
+
+        let img_texts = render_menu(&mut app, img_id);
+        for expected in [
+            "Substituir imagem",
+            "Ctrl+V",
+            "Copiar imagem",
+            "PNG",
+            "Abrir em tamanho real",
+            "Duplicar bloco",
+            "Mover para cima",
+            "Mover para baixo",
+            "Excluir bloco",
+        ] {
+            assert!(
+                img_texts.iter().any(|t| t == expected),
+                "esperava '{expected}' no menu de imagem, veio: {img_texts:?}"
+            );
+        }
+        assert!(
+            !img_texts.iter().any(|t| t == "Copiar texto"),
+            "menu de imagem nao deve mostrar 'Copiar texto'"
+        );
+
+        let para_texts = render_menu(&mut app, para_id);
+        for expected in ["Transformar em", "Copiar texto", "Duplicar bloco"] {
+            assert!(
+                para_texts.iter().any(|t| t == expected),
+                "esperava '{expected}' no menu de paragrafo, veio: {para_texts:?}"
+            );
+        }
+        for unexpected in [
+            "Substituir imagem",
+            "Copiar imagem",
+            "Abrir em tamanho real",
+        ] {
+            assert!(
+                !para_texts.iter().any(|t| t == unexpected),
+                "menu de paragrafo nao deve mostrar '{unexpected}'"
+            );
+        }
+
+        drop(app);
+        let _ = std::fs::remove_file(db_path);
     }
 }
