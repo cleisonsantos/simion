@@ -29,6 +29,7 @@ impl App {
         self.shortcuts_overlay(ctx);
         self.settings_overlay(ctx, &mut actions);
         self.markdown_overlay(ctx, &mut actions);
+        self.image_viewer_overlay(ctx);
         self.delete_overlay(ctx, &mut actions);
         self.toast_overlay(ctx);
         self.drop_overlay(ctx);
@@ -235,9 +236,16 @@ impl App {
             return;
         };
         let current_kind = self.page.blocks[index].kind;
+        let is_image = current_kind == BlockKind::Image;
         let p = self.palette;
-        let transform = self.block_menu_transform;
-        let height = if transform { 402.0 } else { 300.0 };
+        let transform = self.block_menu_transform && !is_image;
+        let height = if transform {
+            402.0
+        } else if is_image {
+            340.0
+        } else {
+            300.0
+        };
         let pos = menu_pos(ctx, pos, 252.0, height);
         let mut close = false;
         let mut open_transform = false;
@@ -284,8 +292,48 @@ impl App {
                             );
                         });
                         ui.add_space(2.0);
-                        if widgets::menu_row(ui, "Transformar em", Some("›"), false, false, &p)
+                        if is_image {
+                            if widgets::menu_row(
+                                ui,
+                                "Substituir imagem",
+                                Some("Ctrl+V"),
+                                false,
+                                false,
+                                &p,
+                            )
                             .clicked()
+                            {
+                                actions.push(Action::StartReplaceImage(id));
+                                close = true;
+                            }
+                            if widgets::menu_row(ui, "Copiar imagem", Some("PNG"), false, false, &p)
+                                .clicked()
+                            {
+                                actions.push(Action::CopyImage(id));
+                                close = true;
+                            }
+                            if widgets::menu_row(
+                                ui,
+                                "Abrir em tamanho real",
+                                None,
+                                false,
+                                false,
+                                &p,
+                            )
+                            .clicked()
+                            {
+                                actions.push(Action::OpenImageViewer(id));
+                                close = true;
+                            }
+                        } else if widgets::menu_row(
+                            ui,
+                            "Transformar em",
+                            Some("›"),
+                            false,
+                            false,
+                            &p,
+                        )
+                        .clicked()
                         {
                             open_transform = true;
                         }
@@ -296,7 +344,10 @@ impl App {
                             actions.push(Action::DuplicateBlock(id));
                             close = true;
                         }
-                        if widgets::menu_row(ui, "Copiar texto", None, false, false, &p).clicked() {
+                        if !is_image
+                            && widgets::menu_row(ui, "Copiar texto", None, false, false, &p)
+                                .clicked()
+                        {
                             actions.push(Action::CopyBlock(id));
                             close = true;
                         }
@@ -1281,6 +1332,112 @@ impl App {
         });
         if close || response.should_close() {
             self.markdown_open = false;
+        }
+    }
+
+    fn image_viewer_overlay(&mut self, ctx: &Context) {
+        let Some(asset_id) = self.image_viewer else {
+            return;
+        };
+        let p = self.palette;
+        let loaded = self.ensure_texture(ctx, asset_id);
+        let texture_info = if loaded {
+            self.textures.get(&asset_id).map(|texture| {
+                let size = self
+                    .asset_sizes
+                    .get(&asset_id)
+                    .map(|&(w, h)| vec2(w as f32, h as f32))
+                    .unwrap_or_else(|| texture.size_vec2());
+                (texture.id(), size)
+            })
+        } else {
+            None
+        };
+
+        let viewport = ctx.content_rect();
+        let max_modal_w = (viewport.width() - 96.0).max(240.0);
+        let max_modal_h = (viewport.height() - 96.0).max(200.0);
+        let modal_w = texture_info
+            .map(|(_, size)| (size.x + 24.0).clamp(320.0_f32.min(max_modal_w), max_modal_w))
+            .unwrap_or_else(|| 360.0_f32.min(max_modal_w));
+        let scroll_w = (modal_w - 16.0).max(120.0);
+        let scroll_h = (max_modal_h - 120.0).max(120.0);
+
+        let mut close = false;
+        let modal = Modal::new(Id::unique("simion-image-viewer"))
+            .backdrop_color(if p.dark {
+                Color32::from_black_alpha(160)
+            } else {
+                Color32::from_black_alpha(50)
+            })
+            .frame(
+                widgets::popup_frame(&p)
+                    .inner_margin(Margin::same(18))
+                    .corner_radius(14),
+            );
+        let response = modal.show(ctx, |ui| {
+            ui.set_width(modal_w);
+            ui.horizontal(|ui| {
+                ui.label(
+                    RichText::new("Imagem em tamanho real")
+                        .size(17.0)
+                        .font(FontId::new(17.0, family(FONT_SEMIBOLD)))
+                        .color(p.text),
+                );
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    widgets::key_hint(ui, "Esc", &p);
+                    if let Some((_, size)) = texture_info {
+                        ui.add_space(6.0);
+                        ui.label(
+                            RichText::new(format!("{} × {}", size.x as u32, size.y as u32))
+                                .size(12.0)
+                                .color(p.muted),
+                        );
+                    }
+                });
+            });
+            ui.add_space(10.0);
+            egui::Frame::new()
+                .fill(p.code_bg)
+                .corner_radius(8)
+                .inner_margin(Margin::same(8))
+                .show(ui, |ui| {
+                    ScrollArea::both()
+                        .id_salt("simion-image-viewer-scroll")
+                        .max_width(scroll_w)
+                        .max_height(scroll_h)
+                        .auto_shrink([true, true])
+                        .show(ui, |ui| {
+                            if let Some((tex_id, native_size)) = texture_info {
+                                let (rect, _) = ui.allocate_exact_size(native_size, Sense::hover());
+                                ui.painter().image(
+                                    tex_id,
+                                    rect,
+                                    Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0)),
+                                    Color32::WHITE,
+                                );
+                            } else {
+                                ui.add_space(24.0);
+                                ui.label(
+                                    RichText::new("Imagem indisponível")
+                                        .size(13.0)
+                                        .color(p.muted),
+                                );
+                                ui.add_space(24.0);
+                            }
+                        });
+                });
+            ui.add_space(12.0);
+            ui.horizontal(|ui| {
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    if widgets::ghost_button(ui, "Fechar", &p).clicked() {
+                        close = true;
+                    }
+                });
+            });
+        });
+        if close || response.should_close() {
+            self.image_viewer = None;
         }
     }
 
