@@ -2088,18 +2088,6 @@ impl App {
             return;
         }
 
-        if ctx.input(|input| {
-            input.events.iter().any(|event| {
-                matches!(event,
-                    egui::Event::Key { key, pressed: true, .. } if *key != Key::A
-                ) || matches!(
-                    event,
-                    egui::Event::Text(_) | egui::Event::PointerButton { pressed: true, .. }
-                )
-            })
-        }) {
-            ctx.data_mut(|data| data.remove::<u64>(Id::unique("ctrl-a-empty")));
-        }
         // Consume duplication before text/selection handlers or TextEdit can
         // interpret Ctrl+D as a native text-editing command on Linux.
         let duplicate_range = self.block_selection_range().or_else(|| match self.focus {
@@ -2115,6 +2103,18 @@ impl App {
             return;
         }
         self.span_pointer(ctx);
+        if self.text_span.is_some() {
+            if self.consume_pub(ctx, Key::A, Modifiers::COMMAND) {
+                self.select_all_text(ctx);
+                return;
+            }
+            for (key, last) in [(Key::Home, false), (Key::End, true)] {
+                if self.consume_pub(ctx, key, Modifiers::COMMAND | Modifiers::SHIFT) {
+                    self.select_to_document_edge(ctx, last, None);
+                    return;
+                }
+            }
+        }
         if self.span_keys(ctx) {
             return;
         }
@@ -2275,6 +2275,74 @@ impl App {
         }
     }
 
+    fn select_all_text(&mut self, ctx: &egui::Context) {
+        let Some((last_index, last_block)) = self
+            .page
+            .blocks
+            .iter()
+            .enumerate()
+            .rfind(|(_, block)| block.kind.accepts_text())
+        else {
+            return;
+        };
+        let head = (last_index, last_block.text.chars().count());
+        self.activate_span(
+            ctx,
+            TextSpan {
+                anchor: (0, 0),
+                head,
+            },
+        );
+    }
+
+    fn select_to_document_edge(
+        &mut self,
+        ctx: &egui::Context,
+        last: bool,
+        focused: Option<(usize, usize)>,
+    ) {
+        let target = if last {
+            self.page
+                .blocks
+                .iter()
+                .enumerate()
+                .rfind(|(_, block)| block.kind.accepts_text())
+        } else {
+            self.page
+                .blocks
+                .iter()
+                .enumerate()
+                .find(|(_, block)| block.kind.accepts_text())
+        };
+        let Some((target_index, target_block)) = target else {
+            return;
+        };
+        let clamp = |(idx, off): (usize, usize)| {
+            self.page
+                .blocks
+                .get(idx)
+                .map(|block| (idx, off.min(block.text.chars().count())))
+        };
+        let Some(anchor) = self
+            .text_span
+            .map(|span| span.anchor)
+            .and_then(clamp)
+            .or_else(|| self.text_anchor.and_then(clamp))
+            .or_else(|| focused.and_then(clamp))
+        else {
+            return;
+        };
+        let head = (
+            target_index,
+            if last {
+                target_block.text.chars().count()
+            } else {
+                0
+            },
+        );
+        self.activate_span(ctx, TextSpan { anchor, head });
+    }
+
     fn block_keys(&mut self, ctx: &egui::Context, id: u64) {
         let Some(index) = self.index_of(id) else {
             self.focus = Focus::None;
@@ -2286,6 +2354,18 @@ impl App {
             .cursor_range_for(ctx, id)
             .or_else(|| self.cursors.get(&id).copied())
             .unwrap_or((text_len, text_len));
+        for (key, last) in [(Key::Home, false), (Key::End, true)] {
+            if self.consume_pub(ctx, key, Modifiers::COMMAND | Modifiers::SHIFT) {
+                let caret = TextEditState::load(ctx, block_te_id(id))
+                    .and_then(|state| state.cursor.char_range())
+                    .map(|range| range.secondary.index.0)
+                    .or_else(|| self.cursors.get(&id).map(|(_, secondary)| *secondary))
+                    .unwrap_or(selection_end)
+                    .min(text_len);
+                self.select_to_document_edge(ctx, last, Some((index, caret)));
+                return;
+            }
+        }
         for (key, last) in [(Key::Home, false), (Key::End, true)] {
             if self.consume_pub(ctx, key, Modifiers::COMMAND) {
                 let target = if last {
@@ -2300,6 +2380,7 @@ impl App {
                         .find(|block| block.kind.accepts_text())
                 };
                 if let Some(block) = target {
+                    self.text_anchor = None;
                     self.focus_block(block.id, if last { block.text.chars().count() } else { 0 });
                 }
                 return;
@@ -2388,29 +2469,9 @@ impl App {
             self.move_block(id, 1);
             return;
         }
-        // Ctrl+A selects the text; with all of it already selected (or
-        // nothing to select), the next one selects every block.
-        if kind.accepts_text() && self.consume_pub(ctx, Key::A, Modifiers::COMMAND) {
-            let empty_selected =
-                ctx.data(|data| data.get_temp::<u64>(Id::unique("ctrl-a-empty"))) == Some(id);
-            if (text_len == 0 && empty_selected)
-                || (text_len > 0 && selection_start == 0 && selection_end == text_len)
-            {
-                let first = self.page.blocks.first().map(|block| block.id);
-                let last = self.page.blocks.last().map(|block| block.id);
-                if let Some(range) = first.zip(last) {
-                    self.start_block_selection(ctx, id);
-                    ctx.data_mut(|data| data.insert_temp(Id::unique("ctrl-a-origin"), id));
-                    self.block_selection = Some(range);
-                }
-            } else {
-                ctx.data_mut(|data| data.insert_temp(Id::unique("ctrl-a-empty"), id));
-                self.pending = Some(PendingFocus {
-                    target: Focus::Block(id),
-                    range: Some((0, text_len)),
-                    select_all: false,
-                });
-            }
+        // Ctrl+A selects the entire document as a textual span on first press.
+        if self.consume_pub(ctx, Key::A, Modifiers::COMMAND) {
+            self.select_all_text(ctx);
             return;
         }
         // Shift+↑/↓ selects this block when no text is selected, or when the
@@ -3556,17 +3617,7 @@ impl App {
         }
         let extent_kind = self.page.blocks[extent_index].kind;
         if self.consume_pub(ctx, Key::A, Modifiers::COMMAND) {
-            let id = ctx
-                .data(|data| data.get_temp::<u64>(Id::unique("ctrl-a-origin")))
-                .filter(|id| self.index_of(*id).is_some())
-                .unwrap_or(anchor);
-            self.block_selection = None;
-            let length = self.page.blocks[self.index_of(id).unwrap()]
-                .text
-                .chars()
-                .count();
-            self.focus_block(id, 0);
-            self.pending.as_mut().unwrap().range = Some((0, length));
+            self.select_all_text(ctx);
             return true;
         }
 
@@ -6364,17 +6415,21 @@ mod tests {
             for _ in 0..presses {
                 h.key(Key::A, Modifiers::COMMAND);
             }
+            assert_eq!(h.app.block_selection, None);
+            assert_eq!(
+                h.app.text_span,
+                Some(TextSpan {
+                    anchor: (0, 0),
+                    head: (1, 5),
+                })
+            );
             h.app.begin_change();
             let undo_count = h.app.history.undo.len();
             h.type_text("Q");
-            if presses == 2 {
-                assert_eq!(h.app.history.undo.len(), undo_count + 1);
-                assert_eq!(h.texts(), ["Q"]);
-                h.app.undo();
-                assert_eq!(h.texts(), ["alpha", "bravo"]);
-            } else {
-                assert_eq!(h.texts(), ["alpha", "Q"]);
-            }
+            assert_eq!(h.app.history.undo.len(), undo_count + 1);
+            assert_eq!(h.texts(), ["Q"]);
+            h.app.undo();
+            assert_eq!(h.texts(), ["alpha", "bravo"]);
         }
     }
 
@@ -6386,9 +6441,23 @@ mod tests {
         );
         h.caret_in(1, 0);
         h.key(Key::A, Modifiers::COMMAND);
-        assert!(h.app.block_selection.is_none());
+        assert_eq!(h.app.block_selection, None);
+        assert_eq!(
+            h.app.text_span,
+            Some(TextSpan {
+                anchor: (0, 0),
+                head: (1, 0),
+            })
+        );
         h.key(Key::A, Modifiers::COMMAND);
-        assert!(h.app.block_selection.is_some());
+        assert_eq!(h.app.block_selection, None);
+        assert_eq!(
+            h.app.text_span,
+            Some(TextSpan {
+                anchor: (0, 0),
+                head: (1, 0),
+            })
+        );
     }
 
     #[test]
@@ -6403,10 +6472,324 @@ mod tests {
         h.caret_in(1, 2);
         h.key(Key::A, Modifiers::COMMAND);
         assert_eq!(h.app.block_selection, None);
+        assert_eq!(
+            h.app.text_span,
+            Some(TextSpan {
+                anchor: (0, 0),
+                head: (1, 5),
+            })
+        );
         h.key(Key::A, Modifiers::COMMAND);
-        assert_eq!(h.app.block_selection, Some((h.id(0), h.id(1))));
+        assert_eq!(h.app.block_selection, None);
+        assert_eq!(
+            h.app.text_span,
+            Some(TextSpan {
+                anchor: (0, 0),
+                head: (1, 5),
+            })
+        );
         h.key(Key::Backspace, Modifiers::NONE);
         assert_eq!(h.texts(), [""]);
+    }
+
+    #[test]
+    fn ctrl_shift_end_from_middle_of_ten_block_note() {
+        let mut h = Harness::new(
+            "t",
+            &[
+                (BlockKind::Paragraph, "block-0"),
+                (BlockKind::Paragraph, "block-1"),
+                (BlockKind::Paragraph, "block-2"),
+                (BlockKind::Paragraph, "block-3"),
+                (BlockKind::Paragraph, "block-4"),
+                (BlockKind::Paragraph, "block-5"),
+                (BlockKind::Paragraph, "block-6"),
+                (BlockKind::Paragraph, "block-7"),
+                (BlockKind::Paragraph, "block-8"),
+                (BlockKind::Paragraph, "block-9"),
+            ],
+        );
+        h.caret_in(4, 3);
+        h.key(Key::End, Modifiers::COMMAND | Modifiers::SHIFT);
+        assert_eq!(h.app.block_selection, None);
+        assert_eq!(
+            h.app.text_span,
+            Some(TextSpan {
+                anchor: (4, 3),
+                head: (9, 7),
+            })
+        );
+        // Pressing Ctrl+Shift+Home keeps the original anchor and reverses to the start.
+        h.key(Key::Home, Modifiers::COMMAND | Modifiers::SHIFT);
+        assert_eq!(
+            h.app.text_span,
+            Some(TextSpan {
+                anchor: (4, 3),
+                head: (0, 0),
+            })
+        );
+        h.key(Key::End, Modifiers::COMMAND | Modifiers::SHIFT);
+        h.type_text("!");
+        assert_eq!(
+            h.texts(),
+            ["block-0", "block-1", "block-2", "block-3", "blo!"]
+        );
+    }
+
+    #[test]
+    fn ctrl_shift_home_from_middle_and_plain_ctrl_home_end_move_caret() {
+        let mut h = Harness::new(
+            "t",
+            &[
+                (BlockKind::Paragraph, "zero"),
+                (BlockKind::Paragraph, "one"),
+                (BlockKind::Paragraph, "two"),
+                (BlockKind::Paragraph, "three"),
+                (BlockKind::Paragraph, "four"),
+                (BlockKind::Paragraph, "five"),
+                (BlockKind::Paragraph, "six"),
+                (BlockKind::Paragraph, "seven"),
+                (BlockKind::Paragraph, "eight"),
+                (BlockKind::Paragraph, "nine"),
+            ],
+        );
+        h.caret_in(5, 2);
+        h.key(Key::Home, Modifiers::COMMAND | Modifiers::SHIFT);
+        assert_eq!(h.app.block_selection, None);
+        assert_eq!(
+            h.app.text_span,
+            Some(TextSpan {
+                anchor: (5, 2),
+                head: (0, 0),
+            })
+        );
+        h.type_text("X");
+        assert_eq!(h.texts(), ["Xve", "six", "seven", "eight", "nine"]);
+
+        // Plain Ctrl+End and Ctrl+Home still only move the caret without creating a span.
+        h.key(Key::End, Modifiers::COMMAND);
+        assert_eq!(h.app.text_span, None);
+        assert_eq!(h.app.focus, Focus::Block(h.id(4)));
+        assert_eq!(h.app.cursor_range_for(&h.ctx, h.id(4)), Some((4, 4)));
+        h.key(Key::Home, Modifiers::COMMAND);
+        assert_eq!(h.app.text_span, None);
+        assert_eq!(h.app.focus, Focus::Block(h.id(0)));
+        assert_eq!(h.app.cursor_range_for(&h.ctx, h.id(0)), Some((0, 0)));
+    }
+
+    #[test]
+    fn ctrl_shift_home_end_coexist_with_ctrl_shift_arrows() {
+        let mut h = Harness::new(
+            "t",
+            &[
+                (BlockKind::Paragraph, "first"),
+                (BlockKind::Paragraph, "second"),
+                (BlockKind::Paragraph, "third"),
+            ],
+        );
+        h.caret_in(1, 3);
+        h.key(Key::ArrowUp, Modifiers::COMMAND | Modifiers::SHIFT);
+        assert_eq!(h.texts(), ["second", "first", "third"]);
+        assert_eq!(h.app.text_span, None);
+        h.key(Key::ArrowDown, Modifiers::COMMAND | Modifiers::SHIFT);
+        assert_eq!(h.texts(), ["first", "second", "third"]);
+        assert_eq!(h.app.text_span, None);
+
+        h.caret_in(1, 3);
+        h.key(Key::End, Modifiers::COMMAND | Modifiers::SHIFT);
+        assert_eq!(
+            h.app.text_span,
+            Some(TextSpan {
+                anchor: (1, 3),
+                head: (2, 5),
+            })
+        );
+    }
+
+    #[test]
+    fn selection_keys_skip_non_text_edge_blocks() {
+        let mut h = Harness::new(
+            "t",
+            &[
+                (BlockKind::Divider, ""),
+                (BlockKind::Paragraph, "alpha"),
+                (BlockKind::Code, "let x = 1;"),
+                (BlockKind::Image, ""),
+                (BlockKind::Divider, ""),
+            ],
+        );
+        h.caret_in(1, 2);
+        h.key(Key::End, Modifiers::COMMAND | Modifiers::SHIFT);
+        assert_eq!(
+            h.app.text_span,
+            Some(TextSpan {
+                anchor: (1, 2),
+                head: (2, 10),
+            })
+        );
+        h.key(Key::Home, Modifiers::COMMAND | Modifiers::SHIFT);
+        assert_eq!(
+            h.app.text_span,
+            Some(TextSpan {
+                anchor: (1, 2),
+                head: (1, 0),
+            })
+        );
+        h.key(Key::A, Modifiers::COMMAND);
+        assert_eq!(h.app.block_selection, None);
+        assert_eq!(
+            h.app.text_span,
+            Some(TextSpan {
+                anchor: (0, 0),
+                head: (2, 10),
+            })
+        );
+    }
+
+    #[test]
+    fn selection_keys_are_safe_noops_without_text_blocks() {
+        let mut h = Harness::new("t", &[(BlockKind::Divider, ""), (BlockKind::Image, "")]);
+        let focus = Focus::Block(h.id(0));
+        h.app.focus = focus;
+        h.key(Key::End, Modifiers::COMMAND | Modifiers::SHIFT);
+        assert_eq!(h.app.text_span, None);
+        assert_eq!(h.app.block_selection, None);
+        assert_eq!(h.app.focus, focus);
+
+        h.key(Key::Home, Modifiers::COMMAND | Modifiers::SHIFT);
+        assert_eq!(h.app.text_span, None);
+        assert_eq!(h.app.block_selection, None);
+        assert_eq!(h.app.focus, focus);
+
+        h.key(Key::A, Modifiers::COMMAND);
+        assert_eq!(h.app.text_span, None);
+        assert_eq!(h.app.block_selection, None);
+        assert_eq!(h.app.focus, focus);
+    }
+
+    #[test]
+    fn selection_keys_on_single_block_document() {
+        let mut h = Harness::new("t", &[(BlockKind::Paragraph, "solo block")]);
+        h.caret_in(0, 4);
+        h.key(Key::End, Modifiers::COMMAND | Modifiers::SHIFT);
+        assert_eq!(
+            h.app.text_span,
+            Some(TextSpan {
+                anchor: (0, 4),
+                head: (0, 10),
+            })
+        );
+        h.key(Key::Home, Modifiers::COMMAND | Modifiers::SHIFT);
+        assert_eq!(
+            h.app.text_span,
+            Some(TextSpan {
+                anchor: (0, 4),
+                head: (0, 0),
+            })
+        );
+        h.key(Key::A, Modifiers::COMMAND);
+        assert_eq!(h.app.block_selection, None);
+        assert_eq!(
+            h.app.text_span,
+            Some(TextSpan {
+                anchor: (0, 0),
+                head: (0, 10),
+            })
+        );
+    }
+
+    #[test]
+    fn selection_keys_use_unicode_char_offsets() {
+        let mut h = Harness::new(
+            "t",
+            &[
+                (BlockKind::Paragraph, "áλpha 🎉"),
+                (BlockKind::Paragraph, "café 🚀"),
+            ],
+        );
+        h.caret_in(0, 3);
+        h.key(Key::End, Modifiers::COMMAND | Modifiers::SHIFT);
+        assert_eq!(
+            h.app.text_span,
+            Some(TextSpan {
+                anchor: (0, 3),
+                head: (1, 6),
+            })
+        );
+        h.key(Key::A, Modifiers::COMMAND);
+        assert_eq!(
+            h.app.text_span,
+            Some(TextSpan {
+                anchor: (0, 0),
+                head: (1, 6),
+            })
+        );
+        h.type_text("✓");
+        assert_eq!(h.texts(), ["✓"]);
+    }
+
+    #[test]
+    fn ctrl_a_from_middle_caret_and_ctrl_shift_a_unchanged() {
+        let mut h = Harness::new(
+            "t",
+            &[
+                (BlockKind::Paragraph, "alpha"),
+                (BlockKind::Paragraph, "bravo"),
+                (BlockKind::Paragraph, "charlie"),
+            ],
+        );
+        h.caret_in(1, 3);
+        h.key(Key::A, Modifiers::COMMAND | Modifiers::SHIFT);
+        assert_eq!(h.app.text_span, None);
+        assert_eq!(h.app.block_selection, None);
+
+        h.key(Key::A, Modifiers::COMMAND);
+        assert_eq!(h.app.block_selection, None);
+        assert_eq!(
+            h.app.text_span,
+            Some(TextSpan {
+                anchor: (0, 0),
+                head: (2, 7),
+            })
+        );
+    }
+
+    #[test]
+    fn ctrl_a_typing_and_single_undo_restores_document() {
+        let mut h = Harness::new(
+            "t",
+            &[
+                (BlockKind::Paragraph, "first"),
+                (BlockKind::Paragraph, "second"),
+                (BlockKind::Paragraph, "third"),
+            ],
+        );
+        h.caret_in(1, 2);
+        let undo_count = h.app.history.undo.len();
+        h.key(Key::A, Modifiers::COMMAND);
+        h.type_text("replaced");
+        assert_eq!(h.texts(), ["replaced"]);
+        assert_eq!(h.app.history.undo.len(), undo_count + 1);
+        h.key(Key::Z, Modifiers::COMMAND);
+        assert_eq!(h.texts(), ["first", "second", "third"]);
+    }
+
+    #[test]
+    fn ctrl_a_and_copy_copies_entire_document_as_markdown() {
+        let mut h = Harness::new(
+            "t",
+            &[
+                (BlockKind::Paragraph, "alpha"),
+                (BlockKind::Bullet, "bravo"),
+                (BlockKind::Paragraph, "charlie"),
+            ],
+        );
+        h.caret_in(1, 2);
+        h.key(Key::A, Modifiers::COMMAND);
+        h.event(Event::Copy);
+        let expected = markdown::to_markdown(&h.app.page.blocks);
+        assert!(expected.contains("- bravo"));
+        assert_eq!(h.copied.last(), Some(&expected));
     }
 
     #[test]
