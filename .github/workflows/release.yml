@@ -257,8 +257,24 @@ jobs:
             exit 1
           }
 
-          $proc = Start-Process -FilePath $exe -PassThru
+          $out = Join-Path $env:RUNNER_TEMP 'simion-smoke-out.txt'
+          $err = Join-Path $env:RUNNER_TEMP 'simion-smoke-err.txt'
+          Remove-Item $out, $err -ErrorAction SilentlyContinue
+
+          function Write-SmokeDiagnostics {
+            Write-Host "--- stdout do app ---"
+            Get-Content $out -ErrorAction SilentlyContinue | Write-Host
+            Write-Host "--- stderr do app ---"
+            Get-Content $err -ErrorAction SilentlyContinue | Write-Host
+            Write-Host "--- KnownDLLs ---"
+            try {
+              Get-ItemProperty 'HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager\KnownDLLs' | Format-List | Out-String | Write-Host
+            } catch {}
+          }
+
+          $proc = Start-Process -FilePath $exe -PassThru -RedirectStandardOutput $out -RedirectStandardError $err
           if ($null -eq $proc) {
+            Write-SmokeDiagnostics
             Write-Error "Nao foi possivel iniciar $exe"
             exit 1
           }
@@ -270,6 +286,7 @@ jobs:
           while ((Get-Date) -lt $deadline) {
             $proc.Refresh()
             if ($proc.HasExited) {
+              Write-SmokeDiagnostics
               Write-Error "o app morreu antes de abrir a janela (regressao de runtime) (ExitCode=$($proc.ExitCode))"
               exit 1
             }
@@ -291,6 +308,7 @@ jobs:
             if (-not $exited) {
               Stop-Process -Id $proc.Id -Force -ErrorAction SilentlyContinue
             }
+            Write-SmokeDiagnostics
             Write-Error "Janela com titulo contendo 'Simion' nao abriu em 30s (HasExited=$exited, MainWindowHandle=$handle, MainWindowTitle='$title')"
             exit 1
           }
@@ -302,11 +320,13 @@ jobs:
             $proc.Refresh()
             $exited = $proc.HasExited
             Stop-Process -Id $proc.Id -Force -ErrorAction SilentlyContinue
+            Write-SmokeDiagnostics
             Write-Error "O app nao encerrou graciosamente em 15s apos CloseMainWindow (HasExited=$exited)"
             exit 1
           }
 
           $proc.Refresh()
+          Remove-Item $out, $err -ErrorAction SilentlyContinue
           Write-Host "Smoke de runtime OK: janela '$windowTitle' aberta e encerrada graciosamente (ExitCode=$($proc.ExitCode))."
 
       - uses: actions/upload-artifact@v4
