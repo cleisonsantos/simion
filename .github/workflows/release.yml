@@ -246,6 +246,69 @@ jobs:
           Write-Host "Icone extraido: $($bmp.Width)x$($bmp.Height), alpha centro=$($center.A)"
           if ($center.A -eq 0) { throw "icone do simion.exe saiu transparente no centro" }
 
+      - name: Executar o app e fechar (smoke de runtime)
+        shell: pwsh
+        run: |
+          # Executa o binario instalado pelo MSI para garantir que o app inicia,
+          # abre a janela principal e encerra de forma limpa (#104).
+          $exe = Join-Path $env:ProgramFiles 'Simion\simion.exe'
+          if (-not (Test-Path $exe)) {
+            Write-Error "Executavel instalado nao encontrado em $exe"
+            exit 1
+          }
+
+          $proc = Start-Process -FilePath $exe -PassThru
+          if ($null -eq $proc) {
+            Write-Error "Nao foi possivel iniciar $exe"
+            exit 1
+          }
+
+          $deadline = (Get-Date).AddSeconds(30)
+          $windowReady = $false
+          $windowTitle = ''
+
+          while ((Get-Date) -lt $deadline) {
+            $proc.Refresh()
+            if ($proc.HasExited) {
+              Write-Error "o app morreu antes de abrir a janela (regressao de runtime) (ExitCode=$($proc.ExitCode))"
+              exit 1
+            }
+
+            if ($proc.MainWindowHandle -ne [IntPtr]::Zero -and $proc.MainWindowTitle -like '*Simion*') {
+              $windowReady = $true
+              $windowTitle = $proc.MainWindowTitle
+              break
+            }
+
+            Start-Sleep -Milliseconds 500
+          }
+
+          if (-not $windowReady) {
+            $proc.Refresh()
+            $exited = $proc.HasExited
+            $handle = $proc.MainWindowHandle
+            $title = $proc.MainWindowTitle
+            if (-not $exited) {
+              Stop-Process -Id $proc.Id -Force -ErrorAction SilentlyContinue
+            }
+            Write-Error "Janela com titulo contendo 'Simion' nao abriu em 30s (HasExited=$exited, MainWindowHandle=$handle, MainWindowTitle='$title')"
+            exit 1
+          }
+
+          # Fecha graciosamente pela janela principal e aguarda ate 15s pela saida.
+          $null = $proc.CloseMainWindow()
+          $closed = $proc.WaitForExit(15000)
+          if (-not $closed) {
+            $proc.Refresh()
+            $exited = $proc.HasExited
+            Stop-Process -Id $proc.Id -Force -ErrorAction SilentlyContinue
+            Write-Error "O app nao encerrou graciosamente em 15s apos CloseMainWindow (HasExited=$exited)"
+            exit 1
+          }
+
+          $proc.Refresh()
+          Write-Host "Smoke de runtime OK: janela '$windowTitle' aberta e encerrada graciosamente (ExitCode=$($proc.ExitCode))."
+
       - uses: actions/upload-artifact@v4
         with:
           name: windows
