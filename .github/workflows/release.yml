@@ -246,6 +246,81 @@ jobs:
           Write-Host "Icone extraido: $($bmp.Width)x$($bmp.Height), alpha centro=$($center.A)"
           if ($center.A -eq 0) { throw "icone do simion.exe saiu transparente no centro" }
 
+      - name: OpenGL de software (llvmpipe) para o smoke
+        shell: pwsh
+        run: |
+          # Runner Windows sem GPU oferece apenas OpenGL 1.1 via GDI, mas o
+          # egui_glow exige OpenGL 2.0+. Instalamos a Mesa3D (llvmpipe) via
+          # opengl32.dll ao lado do exe; KnownDLLs nao contem opengl32.dll
+          # (evidencia #104), entao o loader carrega o da pasta do executavel.
+          $dest = Join-Path $env:ProgramFiles 'Simion'
+          $mesa = Join-Path $env:RUNNER_TEMP 'mesa3d.7z'
+          try {
+            Invoke-WebRequest `
+              -Uri 'https://github.com/pal1000/mesa-dist-win/releases/download/26.3.1/mesa3d-26.3.1-release-msvc.7z' `
+              -MaximumRedirection 5 `
+              -OutFile $mesa
+          } catch {
+            Write-Error "Falha ao baixar Mesa3D: $_"
+            exit 1
+          }
+          if (-not (Test-Path $mesa)) {
+            Write-Error "Arquivo da Mesa3D nao encontrado apos download: $mesa"
+            exit 1
+          }
+
+          $extractDir = Join-Path $env:RUNNER_TEMP 'mesa3d'
+          New-Item -ItemType Directory -Force -Path $extractDir | Out-Null
+
+          $extracted = $false
+          try {
+            tar -xf "$mesa" -C "$extractDir"
+            if ($LASTEXITCODE -eq 0) {
+              $extracted = $true
+            }
+          } catch {
+            $extracted = $false
+          }
+          if (-not $extracted) {
+            $sevenZip = 'C:\Program Files\7-Zip\7z.exe'
+            if (Test-Path $sevenZip) {
+              try {
+                & $sevenZip x "$mesa" "-o$extractDir" -y
+                if ($LASTEXITCODE -eq 0) {
+                  $extracted = $true
+                }
+              } catch {
+                $extracted = $false
+              }
+            }
+          }
+          if (-not $extracted) {
+            Write-Error "Falha ao extrair $mesa com tar e 7-Zip"
+            exit 1
+          }
+
+          $x64Dir = Join-Path $extractDir 'x64'
+          $opengl = Join-Path $x64Dir 'opengl32.dll'
+          if (-not (Test-Path $opengl)) {
+            $listing = if (Test-Path $x64Dir) {
+              (Get-ChildItem -Path $x64Dir -Force | Select-Object -ExpandProperty Name) -join ', '
+            } else {
+              "(diretorio $x64Dir inexistente)"
+            }
+            Write-Error "opengl32.dll nao encontrado em $x64Dir apos extracao. Conteudo de ${x64Dir}: $listing"
+            exit 1
+          }
+
+          $copied = @()
+          $copied += Copy-Item -Path $opengl -Destination $dest -Force -PassThru
+          $copied += Copy-Item -Path (Join-Path $x64Dir 'libglapi.dll') -Destination $dest -Force -PassThru -ErrorAction SilentlyContinue
+          $copied += Copy-Item -Path (Join-Path $x64Dir 'libgallium*.dll') -Destination $dest -Force -PassThru -ErrorAction SilentlyContinue
+
+          Write-Host "DLLs OpenGL (Mesa llvmpipe) copiados para ${dest}:"
+          foreach ($dll in $copied | Where-Object { $null -ne $_ }) {
+            Write-Host "  $($dll.Name) ($($dll.Length) bytes)"
+          }
+
       - name: Executar o app e fechar (smoke de runtime)
         shell: pwsh
         run: |
