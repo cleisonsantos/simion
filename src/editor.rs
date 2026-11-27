@@ -3372,7 +3372,8 @@ impl App {
             blocks[hi - lo].text.truncate(end);
             let start = markdown::char_to_byte(&blocks[0].text, a);
             blocks[0].text.drain(..start);
-            ctx.copy_text(markdown::to_markdown(&blocks));
+            let markdown = markdown::to_markdown(&blocks);
+            self.copy_rich_text(ctx, &markdown);
             if cut {
                 self.replace_span("");
             }
