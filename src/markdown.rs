@@ -926,6 +926,357 @@ pub fn page_markdown(title: &str, blocks: &[Block]) -> String {
 }
 
 // ---------------------------------------------------------------------------
+// Markdown → HTML (rich-text clipboard)
+// ---------------------------------------------------------------------------
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum HtmlTag {
+    Link(usize),
+    Strong,
+    Em,
+    Del,
+    Code,
+}
+
+impl HtmlTag {
+    fn rank(self) -> u8 {
+        match self {
+            Self::Link(_) => 0,
+            Self::Strong => 1,
+            Self::Em => 2,
+            Self::Del => 3,
+            Self::Code => 4,
+        }
+    }
+
+    fn write_open(self, links: &[(Range<usize>, String)], out: &mut String) {
+        match self {
+            Self::Link(idx) => {
+                out.push_str("<a href=\"");
+                escape_html(out, &links[idx].1);
+                out.push_str("\">");
+            }
+            Self::Strong => out.push_str("<strong>"),
+            Self::Em => out.push_str("<em>"),
+            Self::Del => out.push_str("<del>"),
+            Self::Code => out.push_str("<code>"),
+        }
+    }
+
+    fn write_close(self, out: &mut String) {
+        match self {
+            Self::Link(_) => out.push_str("</a>"),
+            Self::Strong => out.push_str("</strong>"),
+            Self::Em => out.push_str("</em>"),
+            Self::Del => out.push_str("</del>"),
+            Self::Code => out.push_str("</code>"),
+        }
+    }
+
+    fn matches_style(self, style: InlineStyle) -> bool {
+        match self {
+            Self::Link(_) => style.link,
+            Self::Strong => style.bold,
+            Self::Em => style.italic,
+            Self::Del => style.strike,
+            Self::Code => style.code,
+        }
+    }
+}
+
+fn escape_html(out: &mut String, text: &str) {
+    for ch in text.chars() {
+        match ch {
+            '&' => out.push_str("&amp;"),
+            '<' => out.push_str("&lt;"),
+            '>' => out.push_str("&gt;"),
+            '"' => out.push_str("&quot;"),
+            '\'' => out.push_str("&#39;"),
+            _ => out.push(ch),
+        }
+    }
+}
+
+fn span_len_for_tag(layout: &InlineLayout, piece_range: &Range<usize>, tag: HtmlTag) -> usize {
+    if let HtmlTag::Link(idx) = tag {
+        return layout.links[idx].0.len();
+    }
+    layout
+        .styles
+        .iter()
+        .filter(|(range, style)| {
+            range.start <= piece_range.start
+                && piece_range.end <= range.end
+                && tag.matches_style(*style)
+        })
+        .map(|(range, _)| range.len())
+        .max()
+        .unwrap_or(piece_range.len())
+}
+
+fn render_inline_html(text: &str, out: &mut String) {
+    let layout = parse_inline(text);
+    let mut stack: Vec<HtmlTag> = Vec::new();
+
+    for piece in &layout.pieces {
+        if piece.marker {
+            continue;
+        }
+        let link_idx = if piece.style.link {
+            layout.links.iter().position(|(range, _)| {
+                range.start <= piece.range.start && piece.range.end <= range.end
+            })
+        } else {
+            None
+        };
+
+        let mut desired: Vec<HtmlTag> = Vec::with_capacity(5);
+        if let Some(idx) = link_idx {
+            desired.push(HtmlTag::Link(idx));
+        }
+        if piece.style.bold {
+            desired.push(HtmlTag::Strong);
+        }
+        if piece.style.italic {
+            desired.push(HtmlTag::Em);
+        }
+        if piece.style.strike {
+            desired.push(HtmlTag::Del);
+        }
+        if piece.style.code {
+            desired.push(HtmlTag::Code);
+        }
+
+        if let Some(close_from) = stack.iter().position(|tag| !desired.contains(tag)) {
+            while stack.len() > close_from {
+                if let Some(tag) = stack.pop() {
+                    tag.write_close(out);
+                }
+            }
+        }
+
+        let mut to_open: Vec<HtmlTag> = desired
+            .into_iter()
+            .filter(|tag| !stack.contains(tag))
+            .collect();
+        to_open.sort_by(|a, b| {
+            span_len_for_tag(&layout, &piece.range, *b)
+                .cmp(&span_len_for_tag(&layout, &piece.range, *a))
+                .then_with(|| a.rank().cmp(&b.rank()))
+        });
+        for tag in to_open {
+            tag.write_open(&layout.links, out);
+            stack.push(tag);
+        }
+
+        escape_html(out, &text[piece.range.clone()]);
+    }
+
+    while let Some(tag) = stack.pop() {
+        tag.write_close(out);
+    }
+}
+
+/// Converts Markdown into clean HTML for rich-text clipboard targets, reusing
+/// [`parse_block_line`] and [`parse_inline`].
+pub fn markdown_to_html(markdown: &str) -> String {
+    enum HtmlBlock {
+        Paragraph(Vec<String>),
+        Heading(u8, String),
+        BulletList(Vec<(Option<&'static str>, String)>),
+        NumberedList(Vec<String>),
+        Quote(Vec<String>),
+        Code(String),
+        Divider,
+    }
+
+    let normalized = markdown.replace("\r\n", "\n").replace('\r', "\n");
+    let lines: Vec<&str> = normalized.split('\n').collect();
+    let mut blocks: Vec<HtmlBlock> = Vec::new();
+    let mut i = 0;
+    let mut after_blank = true;
+
+    while i < lines.len() {
+        let line = lines[i];
+        let (_, content) = split_indent(line);
+        let content_trimmed = content.trim_end();
+
+        // Fenced code block.
+        if content_trimmed.starts_with("```") || content_trimmed.starts_with("~~~") {
+            let fence = content_trimmed.chars().next().unwrap_or('`');
+            let fence_len = content_trimmed
+                .chars()
+                .take_while(|&c| c == fence)
+                .count()
+                .max(3);
+            let mut code_lines: Vec<&str> = Vec::new();
+            i += 1;
+            while i < lines.len() {
+                let (_, raw) = split_indent(lines[i]);
+                let trimmed = raw.trim_end();
+                let is_fence_close = !trimmed.is_empty()
+                    && trimmed.len() >= fence_len
+                    && trimmed.chars().all(|c| c == fence);
+                if is_fence_close {
+                    i += 1;
+                    break;
+                }
+                code_lines.push(lines[i]);
+                i += 1;
+            }
+            blocks.push(HtmlBlock::Code(code_lines.join("\n")));
+            after_blank = true;
+            continue;
+        }
+
+        if content_trimmed.trim().is_empty() {
+            after_blank = true;
+            i += 1;
+            continue;
+        }
+
+        if let Some((kind, mut text)) = parse_block_line(line) {
+            match kind {
+                BlockKind::Heading1 => blocks.push(HtmlBlock::Heading(1, text)),
+                BlockKind::Heading2 => blocks.push(HtmlBlock::Heading(2, text)),
+                BlockKind::Heading3 => blocks.push(HtmlBlock::Heading(3, text)),
+                BlockKind::Bullet => {
+                    if let Some(HtmlBlock::BulletList(items)) = blocks.last_mut() {
+                        items.push((None, text));
+                    } else {
+                        blocks.push(HtmlBlock::BulletList(vec![(None, text)]));
+                    }
+                }
+                BlockKind::Todo => {
+                    let checked = text.starts_with('\u{0}');
+                    if checked {
+                        text.remove(0);
+                    }
+                    let prefix = Some(if checked { "☑ " } else { "☐ " });
+                    if let Some(HtmlBlock::BulletList(items)) = blocks.last_mut() {
+                        items.push((prefix, text));
+                    } else {
+                        blocks.push(HtmlBlock::BulletList(vec![(prefix, text)]));
+                    }
+                }
+                BlockKind::Numbered => {
+                    if let Some(HtmlBlock::NumberedList(items)) = blocks.last_mut() {
+                        items.push(text);
+                    } else {
+                        blocks.push(HtmlBlock::NumberedList(vec![text]));
+                    }
+                }
+                BlockKind::Quote | BlockKind::Callout => {
+                    if !after_blank {
+                        if let Some(HtmlBlock::Quote(qlines)) = blocks.last_mut() {
+                            qlines.push(text);
+                            i += 1;
+                            continue;
+                        }
+                    }
+                    blocks.push(HtmlBlock::Quote(vec![text]));
+                }
+                BlockKind::Divider => blocks.push(HtmlBlock::Divider),
+                _ => blocks.push(HtmlBlock::Paragraph(vec![text])),
+            }
+            after_blank = false;
+            i += 1;
+            continue;
+        }
+
+        let text = content_trimmed.to_string();
+        if !after_blank {
+            if let Some(HtmlBlock::Paragraph(plines)) = blocks.last_mut() {
+                plines.push(text);
+                i += 1;
+                continue;
+            }
+        }
+        blocks.push(HtmlBlock::Paragraph(vec![text]));
+        after_blank = false;
+        i += 1;
+    }
+
+    let mut out = String::new();
+    let single_inline_paragraph =
+        blocks.len() == 1 && matches!(&blocks[0], HtmlBlock::Paragraph(lines) if lines.len() == 1);
+
+    for block in blocks {
+        match block {
+            HtmlBlock::Paragraph(lines) => {
+                if single_inline_paragraph {
+                    render_inline_html(&lines[0], &mut out);
+                } else {
+                    out.push_str("<p>");
+                    for (idx, line) in lines.iter().enumerate() {
+                        if idx > 0 {
+                            out.push_str("<br>");
+                        }
+                        render_inline_html(line, &mut out);
+                    }
+                    out.push_str("</p>");
+                }
+            }
+            HtmlBlock::Heading(level, text) => {
+                let tag = match level {
+                    1 => "h1",
+                    2 => "h2",
+                    _ => "h3",
+                };
+                out.push('<');
+                out.push_str(tag);
+                out.push('>');
+                render_inline_html(&text, &mut out);
+                out.push_str("</");
+                out.push_str(tag);
+                out.push('>');
+            }
+            HtmlBlock::BulletList(items) => {
+                out.push_str("<ul>");
+                for (prefix, item) in items {
+                    out.push_str("<li>");
+                    if let Some(prefix) = prefix {
+                        out.push_str(prefix);
+                    }
+                    render_inline_html(&item, &mut out);
+                    out.push_str("</li>");
+                }
+                out.push_str("</ul>");
+            }
+            HtmlBlock::NumberedList(items) => {
+                out.push_str("<ol>");
+                for item in items {
+                    out.push_str("<li>");
+                    render_inline_html(&item, &mut out);
+                    out.push_str("</li>");
+                }
+                out.push_str("</ol>");
+            }
+            HtmlBlock::Quote(lines) => {
+                out.push_str("<blockquote>");
+                for (idx, line) in lines.iter().enumerate() {
+                    if idx > 0 {
+                        out.push_str("<br>");
+                    }
+                    render_inline_html(line, &mut out);
+                }
+                out.push_str("</blockquote>");
+            }
+            HtmlBlock::Code(code) => {
+                out.push_str("<pre><code>");
+                escape_html(&mut out, &code);
+                out.push_str("</code></pre>");
+            }
+            HtmlBlock::Divider => {
+                out.push_str("<hr>");
+            }
+        }
+    }
+
+    out
+}
+
+// ---------------------------------------------------------------------------
 // Block-kind shortcuts
 // ---------------------------------------------------------------------------
 
@@ -1243,5 +1594,107 @@ mod tests {
         let markdown = to_markdown(&blocks);
         assert!(markdown.contains("![imagem](simion-asset:42)"));
         assert_eq!(markdown.matches("simion-asset:42").count(), 1);
+    }
+
+    #[test]
+    fn markdown_to_html_basic_inline_styles() {
+        assert_eq!(markdown_to_html("**a**"), "<strong>a</strong>");
+        assert_eq!(markdown_to_html("*b*"), "<em>b</em>");
+        assert_eq!(markdown_to_html("~~c~~"), "<del>c</del>");
+        assert_eq!(markdown_to_html("`d`"), "<code>d</code>");
+        assert_eq!(markdown_to_html("**a**\n"), "<strong>a</strong>");
+    }
+
+    #[test]
+    fn markdown_to_html_lists_and_todos() {
+        assert_eq!(markdown_to_html("- item"), "<ul><li>item</li></ul>");
+        assert_eq!(
+            markdown_to_html("- um\n- **dois**"),
+            "<ul><li>um</li><li><strong>dois</strong></li></ul>"
+        );
+        assert_eq!(
+            markdown_to_html("1. primeiro\n2. segundo"),
+            "<ol><li>primeiro</li><li>segundo</li></ol>"
+        );
+        assert_eq!(
+            markdown_to_html("- [ ] pendente\n- [x] feito"),
+            "<ul><li>☐ pendente</li><li>☑ feito</li></ul>"
+        );
+    }
+
+    #[test]
+    fn markdown_to_html_headings_quotes_code_and_paragraphs() {
+        assert_eq!(markdown_to_html("# Título"), "<h1>Título</h1>");
+        assert_eq!(markdown_to_html("## Seção"), "<h2>Seção</h2>");
+        assert_eq!(
+            markdown_to_html("### Sub *itálico*"),
+            "<h3>Sub <em>itálico</em></h3>"
+        );
+        assert_eq!(
+            markdown_to_html("> citação"),
+            "<blockquote>citação</blockquote>"
+        );
+        assert_eq!(
+            markdown_to_html("> linha 1\n> linha 2"),
+            "<blockquote>linha 1<br>linha 2</blockquote>"
+        );
+        assert_eq!(
+            markdown_to_html("```rust\nlet x = a < b && **raw**;\n```"),
+            "<pre><code>let x = a &lt; b &amp;&amp; **raw**;</code></pre>"
+        );
+        assert_eq!(
+            markdown_to_html("# Título\n\nPrimeiro\n\nSegundo\n\n---"),
+            "<h1>Título</h1><p>Primeiro</p><p>Segundo</p><hr>"
+        );
+    }
+
+    #[test]
+    fn markdown_to_html_escapes_text_and_link_href() {
+        assert_eq!(
+            markdown_to_html(r#"a < b & c > "d" 'e'"#),
+            "a &lt; b &amp; c &gt; &quot;d&quot; &#39;e&#39;"
+        );
+        assert_eq!(
+            markdown_to_html(r#"[clique & veja](https://ex.com/?a=1&b="2"<3>)"#),
+            r#"<a href="https://ex.com/?a=1&amp;b=&quot;2&quot;&lt;3&gt;">clique &amp; veja</a>"#
+        );
+    }
+
+    #[test]
+    fn markdown_to_html_nested_styles_are_balanced() {
+        assert_eq!(
+            markdown_to_html("**negrito com *itálico***"),
+            "<strong>negrito com <em>itálico</em></strong>"
+        );
+        assert_eq!(
+            markdown_to_html("**a *b* c**"),
+            "<strong>a <em>b</em> c</strong>"
+        );
+        assert_eq!(
+            markdown_to_html("***ambos***"),
+            "<strong><em>ambos</em></strong>"
+        );
+        assert_eq!(
+            markdown_to_html("[**negrito** normal](https://exemplo.com)"),
+            r#"<a href="https://exemplo.com"><strong>negrito</strong> normal</a>"#
+        );
+        assert_eq!(
+            markdown_to_html("**[link](https://exemplo.com) resto**"),
+            r#"<strong><a href="https://exemplo.com">link</a> resto</strong>"#
+        );
+        assert_eq!(
+            markdown_to_html("[a](https://a.test)[b](https://b.test)"),
+            r#"<a href="https://a.test">a</a><a href="https://b.test">b</a>"#
+        );
+    }
+
+    #[test]
+    fn markdown_to_html_does_not_modify_input() {
+        let input = String::from("# Título\n\n**negrito** e [link](https://ex.com?a=1&b=2)\n");
+        let snapshot = input.clone();
+        let html = markdown_to_html(&input);
+        assert_eq!(input, snapshot);
+        assert!(html.contains("<h1>Título</h1>"));
+        assert!(html.contains("<strong>negrito</strong>"));
     }
 }

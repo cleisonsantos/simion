@@ -202,7 +202,7 @@ pub struct App {
     /// Image block id waiting for a `Ctrl+V` paste to replace its asset.
     pub pending_image_replace: Option<u64>,
     pub pending_image_replace_until: f64,
-    /// Kept alive so X11 clipboard ownership survives after `set_image`.
+    /// Kept alive so X11 clipboard ownership survives after `set_image` / `set_html`.
     clipboard: Option<arboard::Clipboard>,
 
     pub toast: Option<Toast>,
@@ -1654,8 +1654,35 @@ impl App {
             self.toast("Esta página está vazia");
             return;
         }
-        ctx.copy_text(markdown_text);
+        self.copy_rich_text(ctx, &markdown_text);
         self.toast("Markdown copiado");
+    }
+
+    pub(crate) fn copy_rich_text(&mut self, ctx: &Context, markdown: &str) {
+        copy_rich_text_with(ctx, markdown, |html, plain| {
+            // Avoid mutating the host OS clipboard during `cargo test`, keeping
+            // harness tests deterministic on both headless and desktop machines.
+            if cfg!(test) {
+                let _ = (html, plain);
+                return false;
+            }
+            if self.clipboard.is_none() {
+                let Ok(clipboard) = arboard::Clipboard::new() else {
+                    return false;
+                };
+                self.clipboard = Some(clipboard);
+            }
+            let result = self
+                .clipboard
+                .as_mut()
+                .expect("clipboard initialized")
+                .set_html(html, Some(plain));
+            if result.is_err() {
+                self.clipboard = None;
+                return false;
+            }
+            true
+        });
     }
 
     fn import_markdown(&mut self, path: PathBuf) {
@@ -3222,6 +3249,17 @@ fn banner_dismiss(ui: &mut Ui, p: &Palette) -> bool {
         .clicked()
 }
 
+fn copy_rich_text_with(
+    ctx: &Context,
+    markdown: &str,
+    try_html: impl FnOnce(String, String) -> bool,
+) {
+    let html = markdown::markdown_to_html(markdown);
+    if !try_html(html, markdown.to_owned()) {
+        ctx.copy_text(markdown.to_owned());
+    }
+}
+
 fn slugify(title: &str) -> String {
     let mut out = String::new();
     let mut last_dash = false;
@@ -4504,6 +4542,91 @@ mod tests {
                 "menu de paragrafo nao deve mostrar '{unexpected}'"
             );
         }
+
+        drop(app);
+        let _ = std::fs::remove_file(db_path);
+    }
+
+    #[test]
+    fn copy_rich_text_falls_back_silently_to_egui_copy_text_without_clipboard() {
+        let ctx = Context::default();
+        let markdown = "**negrito** e *itálico*";
+        let mut received: Option<(String, String)> = None;
+
+        let mut output = ctx.run_ui(egui::RawInput::default(), |ui| {
+            copy_rich_text_with(ui.ctx(), markdown, |html, plain| {
+                received = Some((html, plain));
+                false
+            });
+        });
+        output.textures_delta.clear();
+
+        assert_eq!(
+            received,
+            Some((
+                "<strong>negrito</strong> e <em>itálico</em>".to_owned(),
+                markdown.to_owned(),
+            ))
+        );
+        assert!(
+            output
+                .platform_output
+                .commands
+                .iter()
+                .any(|cmd| matches!(cmd, egui::OutputCommand::CopyText(t) if t == markdown)),
+            "esperava fallback para OutputCommand::CopyText, veio: {:?}",
+            output.platform_output.commands
+        );
+    }
+
+    #[test]
+    fn copy_rich_text_skips_egui_copy_text_when_html_clipboard_succeeds() {
+        let ctx = Context::default();
+        let markdown = "- item";
+        let mut received: Option<(String, String)> = None;
+
+        let mut output = ctx.run_ui(egui::RawInput::default(), |ui| {
+            copy_rich_text_with(ui.ctx(), markdown, |html, plain| {
+                received = Some((html, plain));
+                true
+            });
+        });
+        output.textures_delta.clear();
+
+        assert_eq!(
+            received,
+            Some(("<ul><li>item</li></ul>".to_owned(), markdown.to_owned()))
+        );
+        assert!(
+            !output
+                .platform_output
+                .commands
+                .iter()
+                .any(|cmd| matches!(cmd, egui::OutputCommand::CopyText(_))),
+            "não deve sobrescrever o clipboard rico com CopyText quando set_html teve sucesso"
+        );
+    }
+
+    #[test]
+    fn app_copy_rich_text_fallback_leaves_no_toast_and_keeps_clipboard_none() {
+        let (mut app, db_path, _a, _b, _c) = seeded_root_app("copy-rich-fallback");
+        let ctx = Context::default();
+        let markdown = "**oi**";
+
+        let mut output = ctx.run_ui(egui::RawInput::default(), |ui| {
+            app.copy_rich_text(ui.ctx(), markdown);
+        });
+        output.textures_delta.clear();
+
+        assert!(app.toast.is_none(), "fallback deve ser silencioso");
+        assert!(app.clipboard.is_none());
+        assert!(
+            output
+                .platform_output
+                .commands
+                .iter()
+                .any(|cmd| matches!(cmd, egui::OutputCommand::CopyText(t) if t == markdown))
+        );
 
         drop(app);
         let _ = std::fs::remove_file(db_path);
