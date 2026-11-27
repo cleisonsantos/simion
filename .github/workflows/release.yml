@@ -321,6 +321,16 @@ jobs:
             Write-Host "  $($dll.Name) ($($dll.Length) bytes)"
           }
 
+          # Forca o driver llvmpipe e ativa logs de depuracao da Mesa para o step do smoke.
+          $mesaEnv = @(
+            'GALLIUM_DRIVER=llvmpipe'
+            'MESA_DEBUG=1'
+            'LIBGL_DEBUG=verbose'
+            'WGL_LOG=verbose'
+          )
+          $mesaEnv | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          Write-Host "Variaveis da Mesa exportadas via GITHUB_ENV: $($mesaEnv -join ', ')"
+
       - name: Executar o app e fechar (smoke de runtime)
         shell: pwsh
         run: |
@@ -345,8 +355,15 @@ jobs:
             try {
               Get-ItemProperty 'HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager\KnownDLLs' | Format-List | Out-String | Write-Host
             } catch {}
+            Write-Host "--- Event Log (Application, ultimos 3 min) ---"
+            try {
+              Get-WinEvent -FilterHashtable @{ LogName = 'Application'; StartTime = (Get-Date).AddMinutes(-3) } -ErrorAction SilentlyContinue |
+                Where-Object { $_.ProviderName -in @('Application Error','Windows Error Reporting','.NET Runtime') } |
+                ForEach-Object { Write-Host ("[{0}] {1}: {2}" -f $_.TimeCreated, $_.ProviderName, $_.Message) }
+            } catch {}
           }
 
+          $env:RUST_BACKTRACE = 'full'
           $proc = Start-Process -FilePath $exe -PassThru -RedirectStandardOutput $out -RedirectStandardError $err
           if ($null -eq $proc) {
             Write-SmokeDiagnostics
